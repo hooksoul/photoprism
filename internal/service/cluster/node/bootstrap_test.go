@@ -1,0 +1,1591 @@
+package node
+
+import (
+	"archive/zip"
+	"bytes"
+	"context"
+	"encoding/base64"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/sirupsen/logrus"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"gopkg.in/yaml.v2"
+
+	"github.com/photoprism/photoprism/internal/config"
+	"github.com/photoprism/photoprism/internal/event"
+	"github.com/photoprism/photoprism/internal/service/cluster"
+	"github.com/photoprism/photoprism/pkg/dsn"
+	"github.com/photoprism/photoprism/pkg/fs"
+	"github.com/photoprism/photoprism/pkg/rnd"
+)
+
+// newBootstrapTestConfig creates a minimal test config for the start command and closes its database on test cleanup.
+func newBootstrapTestConfig(t *testing.T, name string) *config.Config {
+	t.Helper()
+	c := config.NewMinimalTestConfigWithDb(name, t.TempDir())
+	c.SetStarting(true)
+	t.Cleanup(func() {
+		assert.NoError(t, c.CloseDb())
+	})
+
+	return c
+}
+
+func TestInitConfig_NoPortal_NoOp(t *testing.T) {
+	c := newBootstrapTestConfig(t, "bootstrap")
+
+	// Default NodeRole() resolves to instance; no Portal configured.
+	assert.Equal(t, cluster.RoleInstance, c.NodeRole())
+	assert.NoError(t, InitConfig(c))
+}
+
+func TestInitConfig_ServiceRole(t *testing.T) {
+	c := newBootstrapTestConfig(t, "bootstrap-service")
+
+	c.Options().NodeRole = cluster.RoleService
+
+	assert.NoError(t, InitConfig(c))
+}
+
+func TestInitConfig_ClusterOIDCWithoutBootstrap(t *testing.T) {
+	// A registered instance must wire its OIDC RP from the persisted node credentials
+	// even when both bootstrap toggles are disabled, since OIDC derivation is not a
+	// bootstrap-policy concern.
+	origJoin, origTheme := cluster.BootstrapAutoJoinEnabled, cluster.BootstrapAutoThemeEnabled
+	cluster.BootstrapAutoJoinEnabled = false
+	cluster.BootstrapAutoThemeEnabled = false
+	t.Cleanup(func() {
+		cluster.BootstrapAutoJoinEnabled = origJoin
+		cluster.BootstrapAutoThemeEnabled = origTheme
+	})
+
+	c := newBootstrapTestConfig(t, "init-cluster-oidc")
+	c.Options().NodeRole = cluster.RoleInstance
+	c.Options().ClusterOIDC = true
+	c.Options().SiteUrl = "https://app.localssl.dev/i/pro-1/"
+	c.Options().NodeClientID = cluster.ExampleClientID
+	c.Options().NodeClientSecret = cluster.ExampleClientSecret
+
+	assert.NoError(t, InitConfig(c))
+	assert.Equal(t, cluster.ExampleClientID, c.OIDCClient())
+	assert.Equal(t, cluster.ExampleClientSecret, c.OIDCSecret())
+	assert.Equal(t, "https://app.localssl.dev/", c.OIDCUri().String())
+}
+
+func TestBootstrapClusterNode(t *testing.T) {
+	t.Run("NoConfig", func(t *testing.T) {
+		c := newBootstrapTestConfig(t, "bootstrap-node-noconfig")
+		// No Portal URL / join token configured → no-op, no panic.
+		assert.NotPanics(t, func() { bootstrapClusterNode(c) })
+	})
+	t.Run("InvalidPortalURL", func(t *testing.T) {
+		c := newBootstrapTestConfig(t, "bootstrap-node-badurl")
+		c.Options().PortalUrl = "://nope"
+		c.Options().JoinToken = cluster.ExampleJoinToken
+		assert.NotPanics(t, func() { bootstrapClusterNode(c) })
+	})
+}
+
+func TestRegister_PersistSecretAndDB(t *testing.T) {
+	// Fake Portal server.
+	var jwksURL string
+	var portalLoginURL string
+	expectedSite := "https://public.example.test/"
+	var expectedAppName string
+	var expectedAppVersion string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v1/cluster/nodes/register":
+			var req cluster.RegisterRequest
+			assert.NoError(t, json.NewDecoder(r.Body).Decode(&req))
+			assert.Equal(t, expectedSite, req.SiteUrl)
+			assert.Equal(t, expectedAppName, req.AppName)
+			assert.Equal(t, expectedAppVersion, req.AppVersion)
+			// Minimal successful registration with secrets + DSN.
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusCreated)
+			resp := cluster.RegisterResponse{
+				Node:           cluster.Node{Name: "pp-node-01"},
+				UUID:           rnd.UUID(),
+				ClusterCIDR:    "192.0.2.0/24",
+				Secrets:        &cluster.RegisterSecrets{ClientSecret: cluster.ExampleClientSecret},
+				JWKSUrl:        jwksURL,
+				PortalLoginUrl: portalLoginURL,
+				Database: cluster.RegisterDatabase{
+					Driver:   dsn.DriverMySQL,
+					Host:     "db.local",
+					Port:     3306,
+					Name:     "pp_db",
+					User:     "pp_user",
+					Password: "pp_pw",
+					DSN:      "pp_user:pp_pw@tcp(db.local:3306)/pp_db?charset=utf8mb4&parseTime=true",
+				},
+			}
+			_ = json.NewEncoder(w).Encode(resp)
+		case "/api/v1/cluster/theme":
+			// No theme for this test.
+			http.NotFound(w, r)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	jwksURL = srv.URL + "/.well-known/jwks.json"
+	portalLoginURL = srv.URL + "/portal/login"
+	defer srv.Close()
+
+	c := newBootstrapTestConfig(t, "bootstrap-reg")
+
+	// Configure Portal.
+	c.Options().PortalUrl = srv.URL
+	c.Options().JoinToken = cluster.ExampleJoinToken
+	c.Options().SiteUrl = expectedSite
+	c.Options().AdvertiseUrl = expectedSite
+	expectedAppName = c.About()
+	expectedAppVersion = c.Version()
+	// Gate rotate=true: driver mysql and no DSN/fields.
+	c.Options().DatabaseDriver = dsn.DriverMySQL
+	c.Options().DatabaseDSN = ""
+	c.Options().DatabaseName = ""
+	c.Options().DatabaseUser = ""
+	c.Options().DatabasePassword = ""
+
+	// Run bootstrap.
+	assert.NoError(t, InitConfig(c))
+
+	// Options should be reloaded; check values.
+	assert.Equal(t, cluster.ExampleClientSecret, c.NodeClientSecret())
+	// The separate settings are saved instead of the DSN sent with them.
+	assert.Equal(t, "", c.Options().DatabaseDSN)
+	assert.Equal(t, "db.local:3306", c.Options().DatabaseServer)
+	assert.Contains(t, c.DatabaseDSN(), "pp_user:pp_pw@tcp(db.local:3306)/pp_db")
+	assert.Equal(t, dsn.DriverMySQL, c.Options().DatabaseDriver)
+	assert.Equal(t, srv.URL+"/.well-known/jwks.json", c.JWKSUrl())
+	assert.Equal(t, srv.URL+"/portal/login", c.PortalLoginUrl())
+	assert.Equal(t, "192.0.2.0/24", c.ClusterCIDR())
+
+	// Secret must be stored in the secret file, not written inline to options.yml.
+	content, readErr := os.ReadFile(c.OptionsYaml())
+	assert.NoError(t, readErr)
+
+	var persisted map[string]any
+	assert.NoError(t, yaml.Unmarshal(content, &persisted))
+	_, hasInlineSecret := persisted["NodeClientSecret"]
+	assert.False(t, hasInlineSecret)
+
+	info, statErr := os.Stat(c.NodeClientSecretFile())
+	assert.NoError(t, statErr)
+	if statErr == nil {
+		assert.Equal(t, fs.ModeSecretFile, info.Mode().Perm())
+	}
+}
+
+func TestResolveNodeOIDCClient(t *testing.T) {
+	// portalInstance returns a config with cluster OIDC enabled, a shared-domain
+	// SiteUrl, and the node registered (client credentials persisted).
+	portalInstance := func(t *testing.T, name string) *config.Config {
+		c := newBootstrapTestConfig(t, name)
+		c.Options().NodeRole = cluster.RoleInstance
+		c.Options().ClusterOIDC = true
+		c.Options().SiteUrl = "https://app.localssl.dev/i/pro-1/"
+		c.Options().NodeClientID = cluster.ExampleClientID
+		c.Options().NodeClientSecret = cluster.ExampleClientSecret
+		return c
+	}
+
+	t.Run("DerivesFromNodeCredentialsAndDefaultsIssuer", func(t *testing.T) {
+		c := portalInstance(t, "oidc-node-derive")
+		resolveNodeOIDCClient(c)
+		assert.Equal(t, cluster.ExampleClientID, c.OIDCClient())
+		assert.Equal(t, cluster.ExampleClientSecret, c.OIDCSecret())
+		// The issuer defaults to the instance's own origin root (the shared-domain
+		// Portal OP), so a single flag suffices.
+		assert.Equal(t, "https://app.localssl.dev/", c.OIDCUri().String())
+	})
+	t.Run("HonorsExplicitIssuer", func(t *testing.T) {
+		c := portalInstance(t, "oidc-node-issuer")
+		c.Options().OIDCUri = "https://portal.example.com/"
+		resolveNodeOIDCClient(c)
+		assert.Equal(t, cluster.ExampleClientID, c.OIDCClient())
+		assert.Equal(t, "https://portal.example.com/", c.OIDCUri().String(), "an explicit issuer must be respected")
+	})
+	t.Run("DisabledIsNoOp", func(t *testing.T) {
+		c := portalInstance(t, "oidc-node-disabled")
+		c.Options().ClusterOIDC = false
+		resolveNodeOIDCClient(c)
+		assert.Equal(t, "", c.OIDCClient())
+		assert.Equal(t, "", c.OIDCSecret())
+	})
+	t.Run("ExplicitClientWins", func(t *testing.T) {
+		c := portalInstance(t, "oidc-node-explicit")
+		c.Options().OIDCClient = "cs5cpu17n6gj2qo5"
+		c.Options().OIDCSecret = "explicit-secret"
+		c.Options().OIDCUri = "https://keycloak.example.com/realms/main"
+		resolveNodeOIDCClient(c)
+		assert.Equal(t, "cs5cpu17n6gj2qo5", c.OIDCClient(), "an explicit client id must not be overwritten")
+		assert.Equal(t, "explicit-secret", c.OIDCSecret())
+	})
+	t.Run("NotRegisteredLeavesClientEmpty", func(t *testing.T) {
+		c := portalInstance(t, "oidc-node-unregistered")
+		c.Options().NodeClientID = ""
+		c.Options().NodeClientSecret = ""
+		resolveNodeOIDCClient(c)
+		assert.Equal(t, "", c.OIDCClient(), "without node credentials nothing is derived")
+		assert.Equal(t, "", c.OIDCSecret())
+	})
+	t.Run("ServiceRoleNotDerived", func(t *testing.T) {
+		c := portalInstance(t, "oidc-node-service")
+		c.Options().NodeRole = cluster.RoleService
+		resolveNodeOIDCClient(c)
+		assert.Equal(t, "", c.OIDCClient())
+	})
+}
+
+func TestRegisterAuthToken_UsesJoinTokenWithoutNodeCredentials(t *testing.T) {
+	c := newBootstrapTestConfig(t, "bootstrap-auth-join")
+	portal, err := url.Parse("https://portal.example.test")
+	assert.NoError(t, err)
+
+	token, err := registerAuthToken(c, portal, cluster.ExampleJoinToken)
+	assert.NoError(t, err)
+	assert.Equal(t, cluster.ExampleJoinToken, token)
+}
+
+func TestRegisterAuthToken_UsesOAuthWithNodeCredentials(t *testing.T) {
+	var tokenCalls int
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v1/oauth/token" {
+			http.NotFound(w, r)
+			return
+		}
+
+		tokenCalls++
+		assert.Equal(t, http.MethodPost, r.Method)
+		assert.Equal(
+			t,
+			"Basic "+base64.StdEncoding.EncodeToString([]byte(cluster.ExampleClientID+":"+cluster.ExampleClientSecret)),
+			r.Header.Get("Authorization"),
+		)
+		assert.NoError(t, r.ParseForm())
+		assert.Equal(t, "client_credentials", r.Form.Get("grant_type"))
+		assert.Equal(t, "cluster", r.Form.Get("scope"))
+
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"access_token":"oauth-node-token","token_type":"Bearer"}`))
+	}))
+	defer srv.Close()
+
+	c := newBootstrapTestConfig(t, "bootstrap-auth-oauth")
+	c.Options().NodeClientID = cluster.ExampleClientID
+	c.Options().NodeClientSecret = cluster.ExampleClientSecret
+
+	portal, err := url.Parse(srv.URL)
+	assert.NoError(t, err)
+
+	token, err := registerAuthToken(c, portal, cluster.ExampleJoinToken)
+	assert.NoError(t, err)
+	assert.Equal(t, "oauth-node-token", token)
+	assert.Equal(t, 1, tokenCalls)
+}
+
+func TestRegisterAuthToken_OAuthFailure(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v1/oauth/token" {
+			http.NotFound(w, r)
+			return
+		}
+
+		w.WriteHeader(http.StatusUnauthorized)
+	}))
+
+	defer srv.Close()
+
+	c := newBootstrapTestConfig(t, "bootstrap-auth-failure")
+	c.Options().NodeClientID = cluster.ExampleClientID
+	c.Options().NodeClientSecret = "stale-secret"
+
+	portal, err := url.Parse(srv.URL)
+	assert.NoError(t, err)
+
+	_, err = registerAuthToken(c, portal, cluster.ExampleJoinToken)
+
+	if assert.Error(t, err) {
+		assert.Contains(t, err.Error(), "portal access token request failed")
+		assert.Contains(t, err.Error(), "401")
+	}
+}
+
+// TestBootstrapClusterNode_ReRegistersWithNodeCredentials verifies an
+// already-joined node (OAuth credentials, no join token) re-registers via OAuth
+// on boot, propagating its declared group config without rotating credentials.
+func TestBootstrapClusterNode_ReRegistersWithNodeCredentials(t *testing.T) {
+	prevTheme := cluster.BootstrapAutoThemeEnabled
+	cluster.BootstrapAutoThemeEnabled = false
+	t.Cleanup(func() { cluster.BootstrapAutoThemeEnabled = prevTheme })
+
+	var tokenCalls, registerCalls int
+	var gotAuth string
+	var gotPayload cluster.RegisterRequest
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v1/oauth/token":
+			tokenCalls++
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"access_token":"oauth-node-token","token_type":"Bearer"}`))
+		case "/api/v1/cluster/nodes/register":
+			registerCalls++
+			gotAuth = r.Header.Get("Authorization")
+			_ = json.NewDecoder(r.Body).Decode(&gotPayload)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			_ = json.NewEncoder(w).Encode(cluster.RegisterResponse{Node: cluster.Node{Name: "pp-node-01"}})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	c := newBootstrapTestConfig(t, "bootstrap-refresh-creds")
+	c.Options().PortalUrl = srv.URL
+	c.Options().NodeName = "pp-node-01"
+	c.Options().NodeRole = cluster.RoleInstance
+	c.Options().SiteUrl = "https://media.example.com/"
+	// Already joined: node OAuth credentials present, join token removed.
+	c.Options().JoinToken = ""
+	c.Options().NodeClientID = cluster.ExampleClientID
+	c.Options().NodeClientSecret = cluster.ExampleClientSecret
+	// Declarative group config that must reach the Portal on this restart.
+	c.Options().ClusterAllowGroupRoles = []string{"photoprism-admins=admin"}
+
+	bootstrapClusterNode(c)
+
+	assert.Equal(t, 1, tokenCalls, "must authenticate the re-registration via OAuth")
+	assert.Equal(t, 1, registerCalls, "an already-joined node must re-register on boot")
+	assert.Equal(t, "Bearer oauth-node-token", gotAuth, "re-registration must use the node OAuth token, not a join token")
+	assert.Equal(t, map[string]string{"photoprism-admins": "admin"}, gotPayload.AllowGroupRoles,
+		"the declared group config must be reported on the boot re-registration")
+	// The refresh must not rotate credentials.
+	assert.False(t, gotPayload.RotateSecret, "a boot refresh must never request a client-secret rotation")
+	assert.False(t, gotPayload.RotateDatabase, "a boot refresh must never request a database rotation when credentials exist")
+	assert.Equal(t, cluster.ExampleClientID, c.NodeClientID(), "the client ID must be unchanged")
+	assert.Equal(t, cluster.ExampleClientSecret, c.NodeClientSecret(), "the client secret must be unchanged")
+}
+
+// TestBootstrapClusterNode_NoCredsNoToken confirms bootstrap is a no-op when a
+// node has neither a join token nor OAuth credentials to authenticate with.
+func TestBootstrapClusterNode_NoCredsNoToken(t *testing.T) {
+	var hits int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hits++
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	c := newBootstrapTestConfig(t, "bootstrap-no-creds")
+	c.Options().PortalUrl = srv.URL
+	c.Options().NodeRole = cluster.RoleInstance
+	c.Options().JoinToken = ""
+	c.Options().NodeClientID = ""
+	c.Options().NodeClientSecret = ""
+
+	bootstrapClusterNode(c)
+	assert.Equal(t, 0, hits, "without credentials or a join token, bootstrap must not contact the Portal")
+}
+
+func TestInitConfig_DoesNotRetryWithJoinTokenAfterOAuthFailure(t *testing.T) {
+	var tokenCalls int
+	var registerCalls int
+
+	prevTheme := cluster.BootstrapAutoThemeEnabled
+	cluster.BootstrapAutoThemeEnabled = false
+	t.Cleanup(func() {
+		cluster.BootstrapAutoThemeEnabled = prevTheme
+	})
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v1/oauth/token":
+			tokenCalls++
+			w.WriteHeader(http.StatusUnauthorized)
+		case "/api/v1/cluster/nodes/register":
+			registerCalls++
+			w.WriteHeader(http.StatusCreated)
+			_ = json.NewEncoder(w).Encode(cluster.RegisterResponse{})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	c := newBootstrapTestConfig(t, "bootstrap-no-refresh-retry")
+	c.Options().PortalUrl = srv.URL
+	c.Options().JoinToken = cluster.ExampleJoinToken
+	c.Options().NodeName = "pp-node-01"
+	c.Options().NodeRole = cluster.RoleInstance
+	c.Options().NodeClientID = cluster.ExampleClientID
+	c.Options().NodeClientSecret = "stale-secret"
+
+	assert.NoError(t, InitConfig(c))
+	assert.Equal(t, 1, tokenCalls)
+	assert.Equal(t, 0, registerCalls)
+}
+
+func TestRegister_AllowsHTTPPortalNonLoopback(t *testing.T) {
+	var hits int
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/v1/cluster/nodes/register" {
+			hits++
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(cluster.RegisterResponse{})
+			return
+		}
+		http.NotFound(w, r)
+	}))
+
+	defer srv.Close()
+
+	origTransport := http.DefaultTransport
+	t.Cleanup(func() { http.DefaultTransport = origTransport })
+
+	baseTransport, ok := origTransport.(*http.Transport)
+
+	if !ok {
+		t.Fatalf("expected http.DefaultTransport to be *http.Transport")
+	}
+
+	transport := baseTransport.Clone()
+	dialer := &net.Dialer{}
+	transport.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+		if strings.HasPrefix(addr, "portal.local:") {
+			addr = srv.Listener.Addr().String()
+		}
+		return dialer.DialContext(ctx, network, addr)
+	}
+	http.DefaultTransport = transport
+
+	prevJoin := cluster.BootstrapAutoJoinEnabled
+	prevTheme := cluster.BootstrapAutoThemeEnabled
+	cluster.BootstrapAutoJoinEnabled = true
+	cluster.BootstrapAutoThemeEnabled = false
+	t.Cleanup(func() {
+		cluster.BootstrapAutoJoinEnabled = prevJoin
+		cluster.BootstrapAutoThemeEnabled = prevTheme
+	})
+
+	c := newBootstrapTestConfig(t, "bootstrap-http")
+
+	u, err := url.Parse(srv.URL)
+	assert.NoError(t, err)
+	c.Options().PortalUrl = "http://portal.local:" + u.Port()
+	c.Options().JoinToken = cluster.ExampleJoinToken
+
+	assert.NoError(t, InitConfig(c))
+	assert.Equal(t, 1, hits)
+}
+
+func TestThemeInstall_Missing(t *testing.T) {
+	// Build a tiny zip in-memory with app.js, version.txt, and style.css.
+	var buf bytes.Buffer
+	zw := zip.NewWriter(&buf)
+	appJS, _ := zw.Create(fs.AppJsFile)
+	_, _ = appJS.Write([]byte("console.log('theme');\n"))
+	versionTxt, _ := zw.Create(fs.VersionTxtFile)
+	_, _ = versionTxt.Write([]byte(" theme-v1 \n"))
+	styleCSS, _ := zw.Create("style.css")
+	_, _ = styleCSS.Write([]byte("body{}\n"))
+	_ = zw.Close()
+
+	// Fake Portal server (register -> oauth token -> theme)
+	clientSecret := cluster.ExampleClientSecret
+	var jwksURL2 string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v1/cluster/nodes/register":
+			w.Header().Set("Content-Type", "application/json")
+			// Return NodeClientID + NodeClientSecret so bootstrap can request OAuth token
+			_ = json.NewEncoder(w).Encode(cluster.RegisterResponse{
+				UUID:        rnd.UUID(),
+				ClusterCIDR: "198.51.100.0/24",
+				Node:        cluster.Node{ClientID: "cs5gfen1bgxz7s9i", Name: "pp-node-01", Theme: "theme-v1"},
+				Secrets:     &cluster.RegisterSecrets{ClientSecret: clientSecret},
+				JWKSUrl:     jwksURL2,
+				Theme:       "theme-v1",
+			})
+		case "/api/v1/oauth/token":
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]string{
+				"access_token": "tok",
+				"token_type":   "Bearer",
+			})
+		case "/api/v1/cluster/theme":
+			w.Header().Set("Content-Type", "application/zip")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(buf.Bytes())
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	jwksURL2 = srv.URL + "/.well-known/jwks.json"
+	defer srv.Close()
+
+	c := newBootstrapTestConfig(t, "bootstrap-theme")
+
+	// Point Portal.
+	c.Options().PortalUrl = srv.URL
+	c.Options().JoinToken = cluster.ExampleJoinToken
+
+	nodeThemeDir := c.NodeThemePath()
+	assert.NoError(t, os.RemoveAll(nodeThemeDir))
+
+	// Run bootstrap.
+	assert.NoError(t, InitConfig(c))
+
+	// Expect theme artifacts to exist in node theme dir and version to match portal hint.
+	assert.FileExists(t, filepath.Join(nodeThemeDir, fs.AppJsFile))
+	assert.FileExists(t, filepath.Join(nodeThemeDir, fs.VersionTxtFile))
+	assert.Equal(t, "theme-v1", c.NodeThemeVersion())
+	assert.Equal(t, nodeThemeDir, c.ThemePath())
+}
+
+func TestThemeInstall_VersionMismatch(t *testing.T) {
+	var buf bytes.Buffer
+	zw := zip.NewWriter(&buf)
+	appJS, _ := zw.Create(fs.AppJsFile)
+	_, _ = appJS.Write([]byte("console.log('theme-v2');\n"))
+	versionTxt, _ := zw.Create(fs.VersionTxtFile)
+	_, _ = versionTxt.Write([]byte(" theme-v2 \n"))
+	_ = zw.Close()
+
+	clientSecret := cluster.ExampleClientSecret
+	var jwksURL string
+	var themeHits int
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v1/cluster/nodes/register":
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(cluster.RegisterResponse{
+				UUID:        rnd.UUID(),
+				ClusterCIDR: "198.51.100.0/24",
+				Node:        cluster.Node{ClientID: "cs5gfen1bgxz7s9i", Name: "pp-node-01"},
+				Secrets:     &cluster.RegisterSecrets{ClientSecret: clientSecret},
+				JWKSUrl:     jwksURL,
+				Theme:       "theme-v2",
+			})
+		case "/api/v1/oauth/token":
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]string{
+				"access_token": "tok",
+				"token_type":   "Bearer",
+			})
+		case "/api/v1/cluster/theme":
+			themeHits++
+			w.Header().Set("Content-Type", "application/zip")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(buf.Bytes())
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	jwksURL = srv.URL + "/.well-known/jwks.json"
+	defer srv.Close()
+
+	c := newBootstrapTestConfig(t, "bootstrap-theme-mismatch")
+
+	c.Options().PortalUrl = srv.URL
+	c.Options().JoinToken = cluster.ExampleJoinToken
+
+	nodeThemeDir := c.NodeThemePath()
+	assert.NoError(t, os.MkdirAll(nodeThemeDir, fs.ModeDir))
+	assert.NoError(t, os.WriteFile(filepath.Join(nodeThemeDir, fs.AppJsFile), []byte("console.log('theme-v1');\n"), fs.ModeFile))
+	assert.NoError(t, os.WriteFile(filepath.Join(nodeThemeDir, fs.VersionTxtFile), []byte("theme-v1"), fs.ModeFile))
+	assert.Equal(t, "theme-v1", c.NodeThemeVersion())
+
+	assert.NoError(t, InitConfig(c))
+
+	assert.Equal(t, "theme-v2", c.NodeThemeVersion())
+	assert.Equal(t, 1, themeHits)
+	assert.Equal(t, nodeThemeDir, c.ThemePath())
+}
+
+func TestRegister_SQLite_NoDBPersist(t *testing.T) {
+	// Portal responds with DB DSN, but local driver is SQLite → must not persist DB.
+	var jwksURL3 string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v1/cluster/nodes/register":
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusCreated)
+			resp := cluster.RegisterResponse{
+				Node:        cluster.Node{Name: "pp-node-01"},
+				Secrets:     &cluster.RegisterSecrets{ClientSecret: cluster.ExampleClientSecret},
+				ClusterCIDR: "203.0.113.0/24",
+				JWKSUrl:     jwksURL3,
+				Database:    cluster.RegisterDatabase{Host: "db.local", Port: 3306, Name: "pp_db", User: "pp_user", Password: "pp_pw", DSN: "pp_user:pp_pw@tcp(db.local:3306)/pp_db?charset=utf8mb4&parseTime=true"},
+			}
+			_ = json.NewEncoder(w).Encode(resp)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	jwksURL3 = srv.URL + "/.well-known/jwks.json"
+	defer srv.Close()
+
+	// Pin the driver, as this test is about nodes that do not run on MySQL.
+	t.Setenv("PHOTOPRISM_TEST_DRIVER", dsn.DriverSQLite3)
+	t.Setenv("PHOTOPRISM_TEST_DSN", filepath.Join(t.TempDir(), "bootstrap-sqlite.db"))
+
+	c := newBootstrapTestConfig(t, "bootstrap-sqlite")
+
+	// SQLite driver by default; set Portal.
+	c.Options().PortalUrl = srv.URL
+	c.Options().JoinToken = cluster.ExampleJoinToken
+	// Remember original DSN so we can ensure it is not changed.
+	origDSN := c.Options().DatabaseDSN
+	t.Cleanup(func() { _ = os.Remove(origDSN) })
+
+	// Run bootstrap.
+	assert.NoError(t, InitConfig(c))
+
+	// NodeClientSecret should persist, but DB should remain SQLite (no DSN update).
+	assert.Equal(t, cluster.ExampleClientSecret, c.NodeClientSecret())
+	assert.Equal(t, dsn.DriverSQLite3, c.DatabaseDriver())
+	assert.Equal(t, origDSN, c.Options().DatabaseDSN)
+	assert.Equal(t, srv.URL+"/.well-known/jwks.json", c.JWKSUrl())
+	assert.Equal(t, "203.0.113.0/24", c.ClusterCIDR())
+}
+
+func TestDefaultClusterDomain(t *testing.T) {
+	t.Run("explicit domain", func(t *testing.T) {
+		c := newBootstrapTestConfig(t, "domain-explicit")
+
+		c.Options().ClusterDomain = "photoprism.example"
+		assert.Equal(t, "photoprism.example", defaultClusterDomain(c))
+	})
+	t.Run("portal host fallback", func(t *testing.T) {
+		c := newBootstrapTestConfig(t, "domain-portal")
+
+		c.Options().PortalUrl = "https://portal.photoprism.example"
+		assert.Equal(t, "photoprism.example", defaultClusterDomain(c))
+	})
+	t.Run("no portal domain", func(t *testing.T) {
+		c := newBootstrapTestConfig(t, "domain-none")
+
+		c.Options().PortalUrl = "https://localhost:8443"
+		assert.Equal(t, "", defaultClusterDomain(c))
+	})
+	t.Run("portal ip fallback empty", func(t *testing.T) {
+		c := newBootstrapTestConfig(t, "domain-ip")
+
+		c.Options().PortalUrl = "https://203.0.113.10"
+		assert.Equal(t, "", defaultClusterDomain(c))
+	})
+	t.Run("invalid Portal URL", func(t *testing.T) {
+		c := newBootstrapTestConfig(t, "domain-invalid")
+
+		c.Options().PortalUrl = "://bad url"
+		assert.Equal(t, "", defaultClusterDomain(c))
+	})
+}
+
+func TestDefaultNodeURL(t *testing.T) {
+	assert.Equal(t, "https://node1.photoprism.example", defaultNodeURL("Node1", "photoprism.example"))
+	assert.Equal(t, "", defaultNodeURL("", "photoprism.example"))
+	assert.Equal(t, "", defaultNodeURL("node1", ""))
+	assert.Equal(t, "https://node-1.photoprism.example", defaultNodeURL("NODE_1", "photoprism.example"))
+}
+
+func TestBuildRegisterPayload_DisplayName(t *testing.T) {
+	c := newBootstrapTestConfig(t, "node-displayname")
+	reset := func() {
+		c.Options().SiteName = ""
+		c.Options().AppName = ""
+		c.Options().SiteTitle = ""
+		c.Options().SiteCaption = ""
+		c.Options().Name = ""
+	}
+	t.Run("PrefersSiteName", func(t *testing.T) {
+		reset()
+		c.Options().SiteName = "Acme Media"
+		c.Options().AppName = "Family Photos"
+		c.Options().SiteTitle = "Our Trip"
+		assert.Equal(t, "Acme Media", buildRegisterPayload(c).DisplayName)
+	})
+	t.Run("PrefersAppName", func(t *testing.T) {
+		reset()
+		c.Options().AppName = "Family Photos"
+		c.Options().SiteTitle = "Our Trip"
+		c.Options().SiteCaption = "Tagline"
+		assert.Equal(t, "Family Photos", buildRegisterPayload(c).DisplayName)
+	})
+	t.Run("FallsBackToSiteTitle", func(t *testing.T) {
+		reset()
+		c.Options().SiteTitle = "Our Trip"
+		assert.Equal(t, "Our Trip", buildRegisterPayload(c).DisplayName)
+	})
+	t.Run("IgnoresSiteCaption", func(t *testing.T) {
+		// SiteCaption is excluded: Plus/Pro default it to the shared marketing
+		// description, so it is not a distinctive per-instance label.
+		reset()
+		c.Options().SiteCaption = "Browse Your Life"
+		assert.Equal(t, "", buildRegisterPayload(c).DisplayName)
+	})
+	t.Run("EmptyWhenUnbranded", func(t *testing.T) {
+		reset()
+		assert.Equal(t, "", buildRegisterPayload(c).DisplayName)
+	})
+	t.Run("AppNameSurvivesNameAliasing", func(t *testing.T) {
+		// The Pro edition aliases Name to AppName; reading the raw AppName option
+		// means DisplayName still reports it instead of treating it as a default.
+		reset()
+		c.Options().AppName = "Studio One"
+		c.Options().Name = "Studio One"
+		assert.Equal(t, "Studio One", buildRegisterPayload(c).DisplayName)
+	})
+}
+
+func TestBuildRegisterPayload_GroupConfig(t *testing.T) {
+	c := newBootstrapTestConfig(t, "node-groupconfig")
+
+	t.Run("Default", func(t *testing.T) {
+		payload := buildRegisterPayload(c)
+		assert.Nil(t, payload.AllowGroups)
+		assert.Nil(t, payload.AllowGroupRoles)
+		assert.False(t, payload.GroupsFullView)
+	})
+	t.Run("DeclaresConfiguredPolicy", func(t *testing.T) {
+		c.Options().ClusterAllowGroups = []string{"Media-Acme-Viewer"}
+		c.Options().ClusterAllowGroupRoles = []string{"Media-Acme-Admin=admin"}
+		c.Options().ClusterGroupsFullView = true
+		defer func() {
+			c.Options().ClusterAllowGroups = nil
+			c.Options().ClusterAllowGroupRoles = nil
+			c.Options().ClusterGroupsFullView = false
+		}()
+
+		payload := buildRegisterPayload(c)
+		assert.Equal(t, []string{"media-acme-viewer", "media-acme-admin"}, payload.AllowGroups,
+			"role-map keys must be admitted too")
+		assert.Equal(t, map[string]string{"media-acme-admin": "admin"}, payload.AllowGroupRoles)
+		assert.True(t, payload.GroupsFullView)
+	})
+}
+
+func TestRegister_404_NoRetry(t *testing.T) {
+	var hits int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/v1/cluster/nodes/register" {
+			hits++
+			http.NotFound(w, r)
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer srv.Close()
+
+	c := newBootstrapTestConfig(t, "bootstrap")
+
+	c.Options().PortalUrl = srv.URL
+	c.Options().JoinToken = cluster.ExampleJoinToken
+
+	// Run bootstrap; registration should attempt once and stop on 404.
+	_ = InitConfig(c)
+
+	assert.Equal(t, 1, hits)
+}
+
+func TestThemeInstall_SkipWhenAppJsExists(t *testing.T) {
+	// Portal returns a valid zip, but theme dir already has app.js → skip.
+	var served int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/v1/cluster/theme" {
+			served++
+			w.Header().Set("Content-Type", "application/zip")
+			w.WriteHeader(http.StatusOK)
+			zw := zip.NewWriter(w)
+			_, _ = zw.Create("style.css")
+			_ = zw.Close()
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer srv.Close()
+
+	c := newBootstrapTestConfig(t, "bootstrap")
+
+	c.Options().PortalUrl = srv.URL
+	c.Options().JoinToken = "t0k3n"
+
+	// Prepare theme dir with app.js
+	tempTheme, err := os.MkdirTemp("", "pp-theme-*")
+	assert.NoError(t, err)
+	defer func() { _ = os.RemoveAll(tempTheme) }()
+	c.SetThemePath(tempTheme)
+	assert.NoError(t, os.WriteFile(filepath.Join(tempTheme, fs.AppJsFile), []byte("// app\n"), fs.ModeFile))
+
+	assert.NoError(t, InitConfig(c))
+	// Should have skipped request because app.js already exists.
+	assert.Equal(t, 0, served)
+	_, statErr := os.Stat(filepath.Join(tempTheme, "style.css"))
+	assert.Error(t, statErr)
+}
+
+// captureBootstrapLog redirects the package logger to a buffer for the duration of the test. The
+// previous writer is restored rather than assumed, since the logger is process-wide.
+func captureBootstrapLog(t *testing.T) *bytes.Buffer {
+	t.Helper()
+
+	l, ok := log.(*logrus.Logger)
+
+	if !ok {
+		t.Fatalf("expected a *logrus.Logger, got %T", log)
+	}
+
+	var out bytes.Buffer
+
+	prev := l.Out
+	l.SetOutput(&out)
+	t.Cleanup(func() { l.SetOutput(prev) })
+
+	return &out
+}
+
+func TestInitConfig_NotStarting(t *testing.T) {
+	// Only the start command joins the cluster, so other commands send no request to the Portal.
+	var requests atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		http.NotFound(w, r)
+	}))
+	defer srv.Close()
+
+	t.Run("NotJoined", func(t *testing.T) {
+		c := newBootstrapTestConfig(t, "bootstrap-not-starting")
+		c.SetStarting(false)
+		c.Options().PortalUrl = srv.URL
+		c.Options().JoinToken = cluster.ExampleJoinToken
+		out := captureBootstrapLog(t)
+
+		require.NoError(t, InitConfig(c))
+		assert.Zero(t, requests.Load())
+		assert.Contains(t, out.String(), "this node has not joined the cluster yet")
+	})
+	t.Run("Joined", func(t *testing.T) {
+		c := newBootstrapTestConfig(t, "bootstrap-not-starting-joined")
+		c.SetStarting(false)
+		c.Options().PortalUrl = srv.URL
+		c.Options().JoinToken = cluster.ExampleJoinToken
+		c.Options().NodeClientID = cluster.ExampleClientID
+		c.Options().NodeClientSecret = cluster.ExampleClientSecret
+		out := captureBootstrapLog(t)
+
+		require.NoError(t, InitConfig(c))
+		assert.Zero(t, requests.Load())
+		assert.NotContains(t, out.String(), "has not joined")
+	})
+	t.Run("StartReport", func(t *testing.T) {
+		c := newBootstrapTestConfig(t, "bootstrap-start-report")
+		c.SetStarting(true)
+		c.SetStartReport(true)
+		c.Options().PortalUrl = srv.URL
+		c.Options().JoinToken = cluster.ExampleJoinToken
+		out := captureBootstrapLog(t)
+
+		require.NoError(t, InitConfig(c))
+		assert.Zero(t, requests.Load())
+		assert.Contains(t, out.String(), "this node has not joined the cluster yet")
+	})
+}
+
+func TestWarnNotJoined(t *testing.T) {
+	t.Run("NotJoined", func(t *testing.T) {
+		c := newBootstrapTestConfig(t, "bootstrap-warn")
+		c.Options().PortalUrl = "https://portal.example.com"
+		c.Options().JoinToken = cluster.ExampleJoinToken
+		out := captureBootstrapLog(t)
+
+		warnNotJoined(c)
+		assert.Contains(t, out.String(), "this node has not joined the cluster yet, start the server first")
+	})
+	t.Run("NotConfigured", func(t *testing.T) {
+		c := newBootstrapTestConfig(t, "bootstrap-warn-none")
+		c.Options().PortalUrl = "https://portal.example.com"
+		c.Options().JoinToken = ""
+		out := captureBootstrapLog(t)
+
+		warnNotJoined(c)
+		assert.NotContains(t, out.String(), "has not joined")
+	})
+	t.Run("Joined", func(t *testing.T) {
+		c := newBootstrapTestConfig(t, "bootstrap-warn-joined")
+		c.Options().PortalUrl = "https://portal.example.com"
+		c.Options().JoinToken = cluster.ExampleJoinToken
+		c.Options().NodeClientID = cluster.ExampleClientID
+		c.Options().NodeClientSecret = cluster.ExampleClientSecret
+		out := captureBootstrapLog(t)
+
+		warnNotJoined(c)
+		assert.NotContains(t, out.String(), "has not joined")
+	})
+}
+
+func TestBootstrapLogging(t *testing.T) {
+	// Bootstrap runs before the database connection, so its lines reach an operator on the console
+	// and must not be published to the channel the log viewer and the errors table read.
+	t.Run("NotPublishedToTheLogChannel", func(t *testing.T) {
+		const sentinel = "bootstrap logging sentinel"
+
+		c := newBootstrapTestConfig(t, "bootstrap-log-channel")
+		c.Options().PortalUrl = "://nope"
+		c.Options().JoinToken = cluster.ExampleJoinToken
+
+		// event.Hook drops an entry repeating the previous message, which would skip the publish
+		// this asserts against and let the test hold for the wrong reason.
+		require.NoError(t, event.LogBuffer.Set("reset by "+t.Name()))
+
+		s := event.Subscribe("log.*")
+		defer event.Unsubscribe(s)
+
+		out := captureBootstrapLog(t)
+
+		bootstrapClusterNode(c)
+		assert.Contains(t, out.String(), "invalid portal URL")
+
+		// Published last, so the receiver is drained to a known end rather than to a timeout.
+		event.Publish("log.warning", event.Data{"message": sentinel})
+
+		for {
+			select {
+			case msg := <-s.Receiver:
+				text, _ := msg.Fields["message"].(string)
+				if text == sentinel {
+					return
+				}
+				assert.NotContains(t, text, "invalid portal URL")
+			case <-time.After(time.Second):
+				t.Fatal("the sentinel was not received")
+			}
+		}
+	})
+	// A value only reaches that warning because no parser accepted it, so the shapes that reach it
+	// are the ones a parser cannot split. Each of these is a plausible misconfiguration.
+	for _, tc := range []struct{ name, portalURL string }{
+		{"NoHost", "https://node:s3cret@"},
+		{"NoScheme", "node:s3cret@portal.example.com"},
+		{"EmptyScheme", "://node:s3cret@portal.example.com"},
+		{"SpaceInCredential", "https://node:pa ss@portal.example.com"},
+		{"TokenInQuery", "htps:/portal.example.com/?access_token=s3cret"},
+		{"ProtocolRelative", "//node:s3cret@portal.example.com"},
+	} {
+		t.Run("PortalUrlCredentialRemoved"+tc.name, func(t *testing.T) {
+			c := newBootstrapTestConfig(t, "bootstrap-log-credential")
+			c.Options().PortalUrl = tc.portalURL
+			c.Options().JoinToken = cluster.ExampleJoinToken
+
+			out := captureBootstrapLog(t)
+
+			bootstrapClusterNode(c)
+			assert.Contains(t, out.String(), "invalid portal URL")
+			assert.NotContains(t, out.String(), "s3cret", "credential rendered for %q", tc.portalURL)
+			assert.NotContains(t, out.String(), "pa ss", "credential rendered for %q", tc.portalURL)
+		})
+	}
+	t.Run("FailureKeepsItsLocation", func(t *testing.T) {
+		prevAttempts, prevDelay := cluster.BootstrapRegisterMaxAttempts, cluster.BootstrapRegisterRetryDelay
+		prevTheme := cluster.BootstrapAutoThemeEnabled
+		cluster.BootstrapRegisterMaxAttempts, cluster.BootstrapRegisterRetryDelay = 1, 0
+		cluster.BootstrapAutoThemeEnabled = false
+		t.Cleanup(func() {
+			cluster.BootstrapRegisterMaxAttempts, cluster.BootstrapRegisterRetryDelay = prevAttempts, prevDelay
+			cluster.BootstrapAutoThemeEnabled = prevTheme
+		})
+
+		// Closed while its port stays known, so the request is refused rather than answered.
+		srv := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, _ *http.Request) {}))
+		portalURL := srv.URL
+		srv.Close()
+
+		c := newBootstrapTestConfig(t, "bootstrap-log-location")
+		c.Options().PortalUrl = portalURL
+		c.Options().JoinToken = cluster.ExampleJoinToken
+		c.Options().NodeRole = cluster.RoleInstance
+
+		out := captureBootstrapLog(t)
+
+		bootstrapClusterNode(c)
+
+		// Asserted on one line, so another site rendering the endpoint cannot satisfy this while
+		// the terminal warning has regressed to the renderer that removes it.
+		for _, line := range strings.Split(out.String(), "\n") {
+			if strings.Contains(line, "failed to join the configured cluster") {
+				assert.Contains(t, line, portalURL+"/api/v1/cluster/nodes/register")
+				return
+			}
+		}
+
+		t.Fatalf("the join failure was not reported: %s", out.String())
+	})
+}
+
+func TestRedactedPortalUrl(t *testing.T) {
+	// Well formed, so url.Parse splits it and the shared helpers apply.
+	t.Run("Userinfo", func(t *testing.T) {
+		assert.Equal(t, "https://node:***@portal.example.com/x", redactedPortalUrl("https://node:s3cret@portal.example.com/x"))
+	})
+	t.Run("QueryParameter", func(t *testing.T) {
+		assert.Equal(t, "https://portal.example.com/x?access_token=***", redactedPortalUrl("https://portal.example.com/x?access_token=s3cret"))
+	})
+	// Malformed, which is the only way this is reached, so the textual removal is what applies.
+	t.Run("NoScheme", func(t *testing.T) {
+		assert.Equal(t, "node:***@portal.example.com", redactedPortalUrl("node:s3cret@portal.example.com"))
+	})
+	t.Run("SpaceInCredential", func(t *testing.T) {
+		assert.Equal(t, "https://node:***@portal.example.com", redactedPortalUrl("https://node:pa ss@portal.example.com"))
+	})
+	t.Run("NoCredential", func(t *testing.T) {
+		assert.Equal(t, "://nope", redactedPortalUrl("://nope"))
+	})
+	t.Run("Empty", func(t *testing.T) {
+		assert.Equal(t, "", redactedPortalUrl(""))
+	})
+}
+
+func TestRedactedUserinfo(t *testing.T) {
+	t.Run("EmptyScheme", func(t *testing.T) {
+		assert.Equal(t, "://***@portal.example.com", redactedUserinfo("://tokenonly@portal.example.com"))
+	})
+	t.Run("AtSignInPath", func(t *testing.T) {
+		// Only the authority is examined, so an at sign further along is not a credential.
+		assert.Equal(t, "https://portal.example.com/a@b", redactedUserinfo("https://portal.example.com/a@b"))
+	})
+	t.Run("SeveralAtSigns", func(t *testing.T) {
+		assert.Equal(t, "https://a:***@portal.example.com", redactedUserinfo("https://a:b@c@portal.example.com"))
+	})
+	t.Run("Idempotent", func(t *testing.T) {
+		once := redactedUserinfo("https://node:s3cret@portal.example.com")
+		assert.Equal(t, once, redactedUserinfo(once))
+	})
+	t.Run("NoAuthority", func(t *testing.T) {
+		assert.Equal(t, "not a url", redactedUserinfo("not a url"))
+	})
+}
+
+func TestRegisterWithPortal_DropsConfiguredQuery(t *testing.T) {
+	// The endpoints take no query, so one configured on the Portal URL stays out of the request.
+	var rawQuery string
+	var hits int
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits++
+		rawQuery = r.URL.RawQuery
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(cluster.RegisterResponse{})
+	}))
+	defer srv.Close()
+
+	prevTheme := cluster.BootstrapAutoThemeEnabled
+	cluster.BootstrapAutoThemeEnabled = false
+	t.Cleanup(func() { cluster.BootstrapAutoThemeEnabled = prevTheme })
+
+	c := newBootstrapTestConfig(t, "bootstrap-portal-query")
+	c.Options().PortalUrl = srv.URL + "/?join_token=" + cluster.ExampleJoinToken
+	c.Options().JoinToken = cluster.ExampleJoinToken
+	c.Options().NodeRole = cluster.RoleInstance
+
+	bootstrapClusterNode(c)
+
+	assert.Equal(t, 1, hits)
+	assert.Empty(t, rawQuery, "the configured query reached the endpoint")
+}
+
+func TestRegisterWithPortal_ServiceUnavailable(t *testing.T) {
+	var hits int
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits++
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = w.Write([]byte(`{"error":"database provisioning failed; check the portal logs"}`))
+	}))
+	defer srv.Close()
+
+	prevAttempts, prevDelay := cluster.BootstrapRegisterMaxAttempts, cluster.BootstrapRegisterRetryDelay
+	cluster.BootstrapRegisterMaxAttempts, cluster.BootstrapRegisterRetryDelay = 2, time.Millisecond
+	t.Cleanup(func() {
+		cluster.BootstrapRegisterMaxAttempts, cluster.BootstrapRegisterRetryDelay = prevAttempts, prevDelay
+	})
+
+	c := newBootstrapTestConfig(t, "bootstrap-reg-unavailable")
+	c.Options().JoinToken = cluster.ExampleJoinToken
+	c.Options().NodeRole = cluster.RoleInstance
+
+	portal, err := url.Parse(srv.URL)
+	require.NoError(t, err)
+
+	resp, err := registerWithPortal(c, portal, cluster.ExampleJoinToken)
+
+	assert.Nil(t, resp)
+	assert.Equal(t, 2, hits, "a 503 must be retried")
+
+	if assert.Error(t, err) {
+		assert.Contains(t, err.Error(), "database provisioning failed")
+		assert.Contains(t, err.Error(), "503")
+	}
+}
+
+func TestRegisterError(t *testing.T) {
+	newResp := func(status int, body string) *http.Response {
+		return &http.Response{
+			StatusCode: status,
+			Status:     fmt.Sprintf("%d %s", status, http.StatusText(status)),
+			Body:       io.NopCloser(strings.NewReader(body)),
+		}
+	}
+
+	t.Run("ReasonFromBody", func(t *testing.T) {
+		err := registerError(newResp(http.StatusConflict, `{"error":"node uuid is already registered"}`))
+
+		if assert.Error(t, err) {
+			assert.Contains(t, err.Error(), "node uuid is already registered")
+			assert.Contains(t, err.Error(), "409")
+		}
+	})
+	t.Run("EmptyBody", func(t *testing.T) {
+		err := registerError(newResp(http.StatusBadRequest, ""))
+
+		if assert.Error(t, err) {
+			assert.Equal(t, "400 Bad Request", err.Error())
+		}
+	})
+	t.Run("BodyWithoutError", func(t *testing.T) {
+		err := registerError(newResp(http.StatusConflict, `{"status":"failed"}`))
+
+		if assert.Error(t, err) {
+			assert.Equal(t, "409 Conflict", err.Error())
+		}
+	})
+	t.Run("Nil", func(t *testing.T) {
+		assert.Error(t, registerError(nil))
+	})
+}
+
+// TestRegister_PersistDBFieldsIPv6 checks that database fields without a DSN are persisted with an
+// IPv6 server address in brackets.
+func TestRegister_PersistDBFieldsIPv6(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v1/cluster/nodes/register" {
+			http.NotFound(w, r)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(cluster.RegisterResponse{
+			Node:    cluster.Node{Name: "pp-node-02"},
+			UUID:    rnd.UUID(),
+			Secrets: &cluster.RegisterSecrets{ClientSecret: cluster.ExampleClientSecret},
+			Database: cluster.RegisterDatabase{
+				Driver:   dsn.DriverMySQL,
+				Host:     "[fd00::10]",
+				Port:     3306,
+				Name:     "pp_db",
+				User:     "pp_user",
+				Password: "pp_pw",
+			},
+		})
+	}))
+	defer srv.Close()
+
+	c := newBootstrapTestConfig(t, "bootstrap-reg-ipv6")
+	c.Options().PortalUrl = srv.URL
+	c.Options().JoinToken = cluster.ExampleJoinToken
+	c.Options().SiteUrl = "https://public.example.test/"
+	c.Options().AdvertiseUrl = "https://public.example.test/"
+	c.Options().DatabaseDriver = dsn.DriverMySQL
+	c.Options().DatabaseDSN = ""
+	c.Options().DatabaseName = ""
+	c.Options().DatabaseUser = ""
+	c.Options().DatabasePassword = ""
+
+	assert.NoError(t, InitConfig(c))
+	assert.Equal(t, "[fd00::10]:3306", c.Options().DatabaseServer)
+	assert.Equal(t, "fd00::10", c.DatabaseHost())
+}
+
+// socketPortalResponse returns a registration response of a Portal whose database is reached over a socket.
+func socketPortalResponse(clusterUUID, nodeUUID string) *cluster.RegisterResponse {
+	return &cluster.RegisterResponse{
+		UUID:    clusterUUID,
+		Node:    cluster.Node{Name: "pp-node-01", ClientID: cluster.ExampleClientID, UUID: nodeUUID},
+		JWKSUrl: "https://portal.example.test/.well-known/jwks.json",
+		Database: cluster.RegisterDatabase{
+			Driver:   dsn.DriverMySQL,
+			Host:     "/run/mysqld/mysqld.sock",
+			Port:     3306,
+			Name:     "pp_db",
+			User:     "pp_user",
+			Password: "pp_pw",
+			DSN:      "pp_user:pp_pw@tcp(/run/mysqld/mysqld.sock:3306)/pp_db?charset=utf8mb4,utf8&collation=utf8mb4_unicode_ci&parseTime=true",
+		},
+	}
+}
+
+// readBootstrapOptions returns the values saved in the options.yml file of a test config.
+func readBootstrapOptions(t *testing.T, c *config.Config) map[string]any {
+	t.Helper()
+
+	content, err := os.ReadFile(c.OptionsYaml())
+	require.NoError(t, err)
+
+	var persisted map[string]any
+	require.NoError(t, yaml.Unmarshal(content, &persisted))
+
+	return persisted
+}
+
+// TestRegister_SocketPortal checks that joining a Portal whose database is reached over a socket saves
+// the registration, so the instance can authenticate on the next start.
+func TestRegister_SocketPortal(t *testing.T) {
+	clusterUUID, nodeUUID := rnd.UUID(), rnd.UUIDv7()
+	out := captureBootstrapLog(t)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v1/cluster/nodes/register":
+			resp := socketPortalResponse(clusterUUID, nodeUUID)
+			resp.Secrets = &cluster.RegisterSecrets{ClientSecret: cluster.ExampleClientSecret}
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusCreated)
+			_ = json.NewEncoder(w).Encode(resp)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	c := newBootstrapTestConfig(t, "bootstrap-reg-socket")
+	c.Options().PortalUrl = srv.URL
+	c.Options().JoinToken = cluster.ExampleJoinToken
+	c.Options().SiteUrl = "https://public.example.test/"
+	c.Options().AdvertiseUrl = "https://public.example.test/"
+	c.Options().DatabaseDriver = dsn.DriverMySQL
+	c.Options().DatabaseDSN = ""
+	c.Options().DatabaseName = ""
+	c.Options().DatabaseUser = ""
+	c.Options().DatabasePassword = ""
+
+	require.NoError(t, InitConfig(c))
+	assert.Equal(t, cluster.ExampleClientID, c.NodeClientID())
+	assert.Equal(t, cluster.ExampleClientSecret, c.NodeClientSecret())
+	assert.Equal(t, clusterUUID, c.ClusterUUID())
+	assert.Equal(t, "", c.Options().DatabaseName)
+	assert.Equal(t, "", c.Options().DatabaseDSN)
+	assert.Contains(t, out.String(), "successfully joined cluster")
+}
+
+// TestPersistRegistration checks which database settings bootstrap saves from a registration response.
+func TestPersistRegistration(t *testing.T) {
+	t.Run("UnusableServer", func(t *testing.T) {
+		// Without a DSN, database settings with a server address the instance cannot use are ignored as a
+		// whole, and the cluster settings are saved.
+		c := newBootstrapTestConfig(t, "bootstrap-persist")
+		clusterUUID := rnd.UUID()
+
+		require.NoError(t, persistRegistration(c, &cluster.RegisterResponse{
+			UUID: clusterUUID,
+			Node: cluster.Node{Name: "pp-node-01"},
+			Database: cluster.RegisterDatabase{
+				Driver:   dsn.DriverMySQL,
+				Host:     "/run/mysqld/mysqld.sock",
+				Port:     3306,
+				Name:     "pp_db",
+				User:     "pp_user",
+				Password: "pp_pw",
+			},
+		}, true))
+
+		content, err := os.ReadFile(c.OptionsYaml())
+		require.NoError(t, err)
+
+		var persisted map[string]any
+		require.NoError(t, yaml.Unmarshal(content, &persisted))
+		assert.Equal(t, clusterUUID, persisted["ClusterUUID"])
+		for _, key := range []string{"DatabaseDriver", "DatabaseName", "DatabaseUser", "DatabasePassword", "DatabaseServer"} {
+			assert.NotContains(t, persisted, key)
+		}
+	})
+	t.Run("SocketPortal", func(t *testing.T) {
+		// A Portal reached over a socket sends an unusable address in the DSN and the separate settings;
+		// the registration is saved without database settings and requires no restart.
+		out := captureBootstrapLog(t)
+		c := newBootstrapTestConfig(t, "bootstrap-persist-socket")
+		clusterUUID, nodeUUID := rnd.UUID(), rnd.UUIDv7()
+
+		require.NoError(t, persistRegistration(c, socketPortalResponse(clusterUUID, nodeUUID), true))
+
+		persisted := readBootstrapOptions(t, c)
+		assert.Equal(t, clusterUUID, persisted["ClusterUUID"])
+		assert.Equal(t, cluster.ExampleClientID, persisted["NodeClientID"])
+		assert.NotEmpty(t, persisted["NodeUUID"])
+		assert.Equal(t, "https://portal.example.test/.well-known/jwks.json", persisted["JWKSUrl"])
+
+		for _, key := range []string{"DatabaseDriver", "DatabaseDSN", "DatabaseName", "DatabaseUser", "DatabasePassword", "DatabaseServer"} {
+			assert.NotContains(t, persisted, key)
+		}
+
+		assert.Contains(t, out.String(), "ignored database settings with unusable server address /run/mysqld/mysqld.sock:3306")
+		assert.NotContains(t, out.String(), "restart required")
+	})
+	t.Run("SocketPortalLocalDatabase", func(t *testing.T) {
+		// Skipped database settings leave the stored ones untouched.
+		c := newBootstrapTestConfig(t, "bootstrap-persist-socket-local")
+		local := config.Values{
+			"DatabaseDriver":   dsn.DriverMySQL,
+			"DatabaseServer":   "db.local:3306",
+			"DatabaseName":     "local_db",
+			"DatabaseUser":     "local_user",
+			"DatabasePassword": "local_pw",
+		}
+		_, err := c.SaveOptionsPatch(local)
+		require.NoError(t, err)
+
+		require.NoError(t, persistRegistration(c, socketPortalResponse(rnd.UUID(), rnd.UUIDv7()), true))
+
+		persisted := readBootstrapOptions(t, c)
+		assert.Equal(t, cluster.ExampleClientID, persisted["NodeClientID"])
+
+		for key, value := range local {
+			assert.Equal(t, value, persisted[key], key)
+		}
+
+		assert.NotContains(t, persisted, "DatabaseDSN")
+	})
+	t.Run("NoHost", func(t *testing.T) {
+		// Database settings without a host are skipped, also when the DSN names one.
+		out := captureBootstrapLog(t)
+		c := newBootstrapTestConfig(t, "bootstrap-persist-nohost")
+		r := socketPortalResponse(rnd.UUID(), rnd.UUIDv7())
+		r.Database.Host = ""
+		r.Database.DSN = "pp_user:pp_pw@tcp(db.local:3306)/pp_db?parseTime=true"
+
+		require.NoError(t, persistRegistration(c, r, true))
+
+		persisted := readBootstrapOptions(t, c)
+		assert.Equal(t, cluster.ExampleClientID, persisted["NodeClientID"])
+
+		for _, key := range []string{"DatabaseDriver", "DatabaseDSN", "DatabaseName", "DatabaseUser", "DatabasePassword", "DatabaseServer"} {
+			assert.NotContains(t, persisted, key)
+		}
+
+		assert.Contains(t, out.String(), "ignored database settings with unusable server address :3306")
+		assert.NotContains(t, out.String(), "restart required")
+	})
+	t.Run("NoHostDSN", func(t *testing.T) {
+		// A DSN without a host is skipped like separate settings without one.
+		out := captureBootstrapLog(t)
+		c := newBootstrapTestConfig(t, "bootstrap-persist-nohost-dsn")
+
+		require.NoError(t, persistRegistration(c, &cluster.RegisterResponse{
+			UUID:     rnd.UUID(),
+			Node:     cluster.Node{ClientID: cluster.ExampleClientID},
+			Database: cluster.RegisterDatabase{Driver: dsn.DriverMySQL, DSN: "pp_user:pp_pw@tcp(:3306)/pp_db?parseTime=true"},
+		}, true))
+
+		persisted := readBootstrapOptions(t, c)
+		assert.Equal(t, cluster.ExampleClientID, persisted["NodeClientID"])
+
+		for _, key := range []string{"DatabaseDriver", "DatabaseDSN", "DatabaseName", "DatabaseUser", "DatabasePassword", "DatabaseServer"} {
+			assert.NotContains(t, persisted, key)
+		}
+
+		assert.Contains(t, out.String(), "ignored database settings (invalid database dsn)")
+	})
+	t.Run("TCPPortal", func(t *testing.T) {
+		// The separate settings are saved instead of the DSN the Portal sends with them.
+		out := captureBootstrapLog(t)
+		c := newBootstrapTestConfig(t, "bootstrap-persist-tcp")
+		c.Options().DatabaseDriver = dsn.DriverMySQL
+		c.Options().DatabaseDSN = ""
+
+		require.NoError(t, persistRegistration(c, &cluster.RegisterResponse{
+			UUID: rnd.UUID(),
+			Node: cluster.Node{ClientID: cluster.ExampleClientID},
+			Database: cluster.RegisterDatabase{Driver: dsn.DriverMySQL, Host: "db.local", Port: 3306, Name: "pp_db", User: "pp_user",
+				Password: "pp_pw", DSN: "pp_user:pp_pw@tcp(db.local:3306)/pp_db?parseTime=true"},
+		}, true))
+
+		persisted := readBootstrapOptions(t, c)
+		assert.Equal(t, cluster.ExampleClientID, persisted["NodeClientID"])
+		assert.Equal(t, dsn.DriverMySQL, persisted["DatabaseDriver"])
+		assert.Equal(t, "db.local:3306", persisted["DatabaseServer"])
+		assert.Equal(t, "pp_db", persisted["DatabaseName"])
+		assert.Equal(t, "pp_user", persisted["DatabaseUser"])
+		assert.Equal(t, "pp_pw", persisted["DatabasePassword"])
+		assert.NotContains(t, persisted, "DatabaseDSN")
+		assert.Contains(t, c.DatabaseDSN(), "pp_user:pp_pw@tcp(db.local:3306)/pp_db")
+		assert.Contains(t, out.String(), "restart required")
+	})
+	t.Run("RefusedDatabase", func(t *testing.T) {
+		// Database settings the config refuses for any reason are skipped as a whole.
+		for _, tc := range []struct {
+			name, reason string
+			db           cluster.RegisterDatabase
+		}{
+			{"Name", "invalid database name", cluster.RegisterDatabase{Driver: dsn.DriverMySQL, Host: "db.local", Port: 3306, Name: "db?x", User: "pp_user", Password: "pp_pw"}},
+			{"User", "invalid database user", cluster.RegisterDatabase{Driver: dsn.DriverMySQL, Host: "db.local", Port: 3306, Name: "pp_db", User: "-x", Password: "pp_pw"}},
+			{"Driver", "invalid database driver", cluster.RegisterDatabase{Driver: dsn.DriverSQLite3, Host: "db.local", Port: 3306, Name: "pp_db", User: "pp_user", Password: "pp_pw"}},
+			{"DSN", "invalid database dsn", cluster.RegisterDatabase{Driver: dsn.DriverMySQL, DSN: "pp_user:pp_pw@tcp(db.local:3306)/pp_db?tls=custom"}},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				out := captureBootstrapLog(t)
+				c := newBootstrapTestConfig(t, "bootstrap-persist-refused-"+strings.ToLower(tc.name))
+				clusterUUID := rnd.UUID()
+
+				require.NoError(t, persistRegistration(c, &cluster.RegisterResponse{
+					UUID:     clusterUUID,
+					Node:     cluster.Node{ClientID: cluster.ExampleClientID, UUID: rnd.UUIDv7()},
+					Database: tc.db,
+				}, true))
+
+				persisted := readBootstrapOptions(t, c)
+				assert.Equal(t, cluster.ExampleClientID, persisted["NodeClientID"])
+				assert.Equal(t, clusterUUID, persisted["ClusterUUID"])
+
+				for _, key := range []string{"DatabaseDriver", "DatabaseDSN", "DatabaseName", "DatabaseUser", "DatabasePassword", "DatabaseServer"} {
+					assert.NotContains(t, persisted, key)
+				}
+
+				// Bootstrap checks the settings itself, so the config does not need to skip them.
+				assert.Contains(t, out.String(), `msg="cluster: ignored database settings (`+tc.reason+`)"`)
+				assert.NotContains(t, out.String(), "config: cluster: ignored database settings")
+				assert.NotContains(t, out.String(), "restart required")
+			})
+		}
+	})
+	t.Run("DSNOnly", func(t *testing.T) {
+		// A response without separate settings may carry a DSN, which is saved if it is usable.
+		c := newBootstrapTestConfig(t, "bootstrap-persist-dsn")
+
+		require.NoError(t, persistRegistration(c, &cluster.RegisterResponse{
+			UUID:     rnd.UUID(),
+			Node:     cluster.Node{ClientID: cluster.ExampleClientID},
+			Database: cluster.RegisterDatabase{DSN: "pp_user:pp_pw@tcp(db.local:3306)/pp_db?parseTime=true"},
+		}, true))
+
+		persisted := readBootstrapOptions(t, c)
+		assert.Equal(t, dsn.DriverMySQL, persisted["DatabaseDriver"])
+		assert.Contains(t, persisted["DatabaseDSN"], "pp_user:pp_pw@tcp(db.local:3306)/pp_db?")
+
+		out := captureBootstrapLog(t)
+		c = newBootstrapTestConfig(t, "bootstrap-persist-dsn-socket")
+
+		require.NoError(t, persistRegistration(c, &cluster.RegisterResponse{
+			UUID:     rnd.UUID(),
+			Node:     cluster.Node{ClientID: cluster.ExampleClientID},
+			Database: cluster.RegisterDatabase{Driver: dsn.DriverMySQL, DSN: "pp_user:pp_pw@tcp(/run/mysqld/mysqld.sock:3306)/pp_db"},
+		}, true))
+
+		persisted = readBootstrapOptions(t, c)
+		assert.Equal(t, cluster.ExampleClientID, persisted["NodeClientID"])
+		assert.NotContains(t, persisted, "DatabaseDSN")
+		assert.NotContains(t, persisted, "DatabaseDriver")
+		assert.Contains(t, out.String(), `msg="cluster: ignored database settings (invalid database server)"`)
+
+		// The DSN of a database that is not fully provisioned is not saved.
+		c = newBootstrapTestConfig(t, "bootstrap-persist-dsn-incomplete")
+
+		require.NoError(t, persistRegistration(c, &cluster.RegisterResponse{
+			UUID: rnd.UUID(),
+			Node: cluster.Node{ClientID: cluster.ExampleClientID},
+			Database: cluster.RegisterDatabase{Driver: dsn.DriverMySQL, DSN: "pp_user:pp_pw@tcp(db.local:3306)/pp_db?parseTime=true",
+				Incomplete: true},
+		}, true))
+
+		persisted = readBootstrapOptions(t, c)
+		assert.Equal(t, cluster.ExampleClientID, persisted["NodeClientID"])
+		assert.NotContains(t, persisted, "DatabaseDSN")
+		assert.NotContains(t, persisted, "DatabaseDriver")
+	})
+	t.Run("NoRotation", func(t *testing.T) {
+		// Without a database request, the response's database settings are not saved.
+		c := newBootstrapTestConfig(t, "bootstrap-persist-norotate")
+
+		require.NoError(t, persistRegistration(c, &cluster.RegisterResponse{
+			UUID: rnd.UUID(),
+			Node: cluster.Node{ClientID: cluster.ExampleClientID},
+			Database: cluster.RegisterDatabase{Driver: dsn.DriverMySQL, Host: "db.local", Port: 3306, Name: "pp_db", User: "pp_user",
+				Password: "pp_pw"},
+		}, false))
+
+		persisted := readBootstrapOptions(t, c)
+		assert.Equal(t, cluster.ExampleClientID, persisted["NodeClientID"])
+
+		for _, key := range []string{"DatabaseDriver", "DatabaseDSN", "DatabaseName", "DatabaseUser", "DatabasePassword", "DatabaseServer"} {
+			assert.NotContains(t, persisted, key)
+		}
+	})
+	t.Run("Server", func(t *testing.T) {
+		c := newBootstrapTestConfig(t, "bootstrap-persist-server")
+
+		require.NoError(t, persistRegistration(c, &cluster.RegisterResponse{
+			UUID: rnd.UUID(),
+			Database: cluster.RegisterDatabase{
+				Driver:   dsn.DriverMySQL,
+				Host:     "db.local",
+				Port:     3306,
+				Name:     "pp_db",
+				User:     "pp_user",
+				Password: "pp_pw",
+			},
+		}, true))
+
+		content, err := os.ReadFile(c.OptionsYaml())
+		require.NoError(t, err)
+
+		var persisted map[string]any
+		require.NoError(t, yaml.Unmarshal(content, &persisted))
+		assert.Equal(t, "db.local:3306", persisted["DatabaseServer"])
+	})
+	t.Run("IncompleteDatabase", func(t *testing.T) {
+		c := newBootstrapTestConfig(t, "bootstrap-persist-incomplete")
+		c.Options().DatabaseDriver = dsn.DriverMySQL
+		c.Options().DatabaseDSN = ""
+		c.Options().DatabaseName = ""
+		c.Options().DatabaseUser = ""
+		c.Options().DatabasePassword = ""
+		clusterUUID := rnd.UUID()
+
+		require.NoError(t, persistRegistration(c, &cluster.RegisterResponse{
+			UUID: clusterUUID,
+			Database: cluster.RegisterDatabase{Driver: dsn.DriverMySQL, Host: "db.local", Port: 3306, Name: "pp_db", User: "pp_user",
+				Password: "pp_pw", Incomplete: true},
+		}, true))
+
+		content, err := os.ReadFile(c.OptionsYaml())
+		require.NoError(t, err)
+
+		var persisted map[string]any
+		require.NoError(t, yaml.Unmarshal(content, &persisted))
+		assert.Equal(t, clusterUUID, persisted["ClusterUUID"])
+
+		for _, key := range []string{"DatabaseDriver", "DatabaseName", "DatabaseUser", "DatabasePassword", "DatabaseServer"} {
+			assert.NotContains(t, persisted, key)
+		}
+
+		assert.True(t, c.ShouldAutoRotateDatabase(), "the next start must request the database again")
+	})
+}

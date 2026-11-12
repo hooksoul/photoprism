@@ -1,0 +1,177 @@
+## API Package Guide
+
+**Last Updated:** October 29, 2026
+
+### Overview
+
+The API package exposes PhotoPrism’s HTTP endpoints via Gin handlers. Each file under `internal/api` contains the handlers, request/response DTOs, and Swagger annotations for a specific feature area. Handlers remain thin: they validate input, enforce security or ACL checks, and delegate domain work to services in `internal/photoprism`, `internal/service`, or other internal packages. Keep exported types aligned with the REST schema and avoid embedding business logic directly in handlers.
+
+The Swagger annotations in this package generate the public API reference. It is generated from source code under continuous development, so it may list fields, parameters, and endpoints that are not part of a release or are reserved for planned features. Only functionality described in the User Guide or the release notes is supported.
+
+### Routing & Wiring
+
+- Register handlers in `internal/server/routes.go` by attaching them to the proper router group (for example, `APIv1 := router.Group(conf.BaseUri("/api/v1"), Api(conf))`).
+- Group endpoints by resource to match existing patterns: sessions, cluster, photos, labels, files, downloads, metadata, and technical routes.
+- Apply middleware stacks (`Api`, `AuthRequired`, `limiter.Auth`, etc.) at the router level to keep handlers focused on request handling.
+- Use `conf.BaseUri()` when constructing route prefixes so configuration overrides propagate consistently.
+- When new endpoints require feature toggles, gate them in the router rather than inside the handler so disabled routes remain undiscoverable.
+
+### Handler Implementation Patterns
+
+- Accept and return JSON using the shared response helpers. Set `header.ContentTypeJSON` and ensure responses include proper cache headers (`no-store` for sensitive payloads).
+- Parse parameters with Gin binding and validate inputs before delegating work. For complex payloads, define dedicated request structs with validation tags.
+- Use the shared download helpers (`safe.Download`, `avatar.SafeDownload`) when calling outward HTTP APIs to inherit timeout, size, and SSRF protections.
+- Query and persist data through the corresponding services or repositories; avoid ad-hoc SQL or GORM usage in handlers when dedicated functions exist elsewhere.
+- Surface pagination consistently with `count`, `offset`, and `limit` following the defaults (100 max 1000). Validate `offset >= 0` and clamp `count` to the allowed range.
+- When responses need role-specific fields, build DTOs that redact sensitive data for non-admin roles so the handler stays deterministic.
+- **JSON field casing:** use **TitleCase** field names (`UUID`, `Name`, `SiteUrl`, `CreatedAt`) for request/response bodies that correspond to a database entity (mirroring the entity/model, e.g. the cluster `Node` and `ClusterInstance` DTOs), and **camelCase** (`storageNamespace`, `redirectUri`) for generated or artificial payloads that do not map to a specific entity — client config, session responses, and action/RPC bodies. A filtered or computed projection of an entity stays TitleCase; an action payload that operates on an entity stays camelCase but MAY TitleCase the single identity field that mirrors the entity (e.g. a `UUID`).
+
+### Security & Middleware
+
+- Stored YAML exports use `File.Exportable` after download and row admission, consistently for by-hash, primary-photo, selection ZIP, and album ZIP downloads. Registered readers and files-only read credentials retain access; visitors and write-only credentials do not. Archive sidecar settings do not override this eligibility.
+- Generated photo YAML requires both `AccessAll` and effective photo-view permission, including credential scope. Row visibility is checked before complete metadata is serialized; export checks do not change stored sidecars.
+- Authenticate requests using the standard middleware (`AuthRequired`) and check roles via helpers in `internal/auth/acl` (`acl.ParseRole`, `acl.ScopePermits`, `acl.ScopeAttrPermits`).
+- Bound request bodies before parsing JSON or multipart payloads. Use `LimitRequestBodyBytes(...)` with a route-appropriate cap before `BindJSON(...)` / `ShouldBindJSON(...)`, detect `IsRequestBodyTooLarge(err)`, and return `413 Request Entity Too Large` via `AbortRequestTooLarge(...)`.
+- Keep new JSON binding sites on the shared request-limit path by running `make check-api-request-limits` (also included in `make lint`) after adding or refactoring API handlers in the root repo or private overlays.
+- List `413` in the `@Failure` annotation of every handler that can answer it; `make check-api-failure-codes` (also included in `make lint`) reports a Swagger-documented handler that does not.
+- Never log secrets or tokens. Prefer structured logging through `event.Log` and redact sensitive values before logging.
+- Enforce rate limiting with the shared limiters (`limiter.Auth`, `limiter.Login`, and `limiter.Authorize` for the OAuth authorize endpoint, client metadata fetches, the token endpoint's client checks, and refresh tokens whose grant no longer exists at the token and revoke endpoints) and respond with `limiter.AbortJSON` to maintain consistent 429 JSON payloads.
+- Derive client IPs through `api.ClientIP` and extract bearer tokens with `header.BearerToken` or the helper setters. Use constant-time comparison for tokens and secrets.
+- For downloads or proxy endpoints, validate URLs against allowed schemes (`http`, `https`) and reject private or loopback addresses unless explicitly required.
+- **Upload file checks (`UploadCheckFile`)** — every saved upload, including files extracted from ZIP archives, is checked for a supported type and extension, the RAW setting, the total upload size, and the resolution limit: images whose dimensions exceed `PHOTOPRISM_RESOLUTION_LIMIT` are rejected and removed before screening. The dimensions are read from the file header of the image format detected from the content, so they cost no pixel decoding; formats whose dimensions cannot be read from such a header are not checked against the limit at upload.
+- **Upload-time NSFW screening (`users_upload.go`)** — when `PHOTOPRISM_UPLOAD_NSFW=false` (the default), the upload handler runs `vision.DetectNSFWUpload` against every supported visual file (using a temporary preview for supported non-decodable media, created within `photoprism.UploadPreviewTimeout`, i.e. 1 minute or a shorter positive `PHOTOPRISM_CONVERT_TIMEOUT`; a preview that cannot be created in time leaves the file undecided) and deletes the temporary batch before it reaches `originals/` only when a file is unsafe (`403`). If an enabled detector cannot decide, the handler logs a warning and admits the upload. The check is skipped entirely when `PHOTOPRISM_UPLOAD_NSFW=true` or no detector is configured, including `PHOTOPRISM_NSFW_MODEL=none` and `PHOTOPRISM_NSFW_MODEL=labels`. See [`internal/ai/nsfw/README.md`](../ai/nsfw/README.md) for the full NSFW call graph and flag matrix.
+
+### Photo Label Updates
+
+`PUT /api/v1/photos/{uid}/label/{id}` accepts optional `Uncertainty` and optional nested `Label.Name`.
+The route selects the assignment; other submitted fields are ignored. Omitted or null uncertainty
+keeps both the stored uncertainty and source unchanged. Explicit uncertainty must be an integer
+from 0 through 100; out-of-range values return 400 before name or assignment writes. Explicit
+acceptance (`Uncertainty: 0`) sets the manual source; other values preserve the source.
+
+Assignment edits require photo-update authority and photo visibility. Supplying a name additionally
+requires label-update authority, including credential scope, before any data is written. Name
+validation and derived slugs follow the shared label naming rules. Renaming does not merge label
+IDs or move assignments, and an existing canonical slug stays stable.
+
+Assignment writes and name writes are separate operations. Photo metadata refreshes keep loaded
+label assignments available for the response without saving those assignments again. Write errors
+are logged and returned through generic error responses.
+
+### Web Upload Formats
+
+Web uploads accept supported media and enabled ZIP archives. The permitted sidecar types
+are XMP, plain text (`.txt`), and Markdown (`.md`, `.markdown`). Text and Markdown can be
+indexed as associated files, but their contents do not supply photo metadata. YAML, JSON,
+XML, AAE, and NFO sidecars are not accepted through this endpoint, including for admins.
+`UploadAllow` may narrow this policy but cannot enable other sidecars.
+
+The same policy applies before direct writes, before archive extraction, during saved-file
+validation, and before importing a staged batch. Processing removes disallowed staged
+sidecars; traversal or removal errors return 400 before import starts. Staged symbolic
+links are not supported: a batch that contains one is rejected and its staging folder removed,
+while other preparation errors keep the batch so that processing can be retried. Upload paths exclude the administrative names documented in [pkg/fs](../../pkg/fs/README.md),
+including `.github`, `.forgejo`, `.local`, and `_netrc`, at any depth, matched case-insensitively, along with
+the suffixes in `pkg/fs.ReservedPathSuffixes`. ZIP entry checks
+apply to files and directories before extraction. Files and ZIP entries with a file or folder name that
+`clean.PortableName` rejects or that `fs.FileNameHidden` reports as hidden are also refused, with backslashes in entry
+names treated as separators; the other files of the upload are still accepted. Other import sources and WebDAV retain their format policies.
+
+Staged batches are eligible for cleanup once the batch directory and every entry in it
+have been unchanged for longer than `upload-maxage` (7 days by default, from one day to 100 years; `-1`
+keeps them), including batches awaiting a processing retry. Age is measured with the storage's own
+clock, read from the `.upload-purge` file that each cleanup run creates anew in the users storage folder.
+Upload-batch removal is deferred while upload or processing requests are active, and a batch is
+checked again when a request for it ran since the cleanup scan; removal logs a warning with the number of
+staged files removed with them, and a batch whose removal has been delayed by requests for more than a day
+is reported in a warning at most once a day. Uploads and their processing do not wait for indexing or other imports, but processing answers 503 while a running index is being canceled.
+Files directly in the upload root, including avatar staging, are not batch cleanup targets.
+
+Processing a batch adds its files to at most 100 requested albums: titles resolve among the user's
+own albums or create a new one, and album UIDs must name regular albums the session can see.
+When the import cannot run, refuses files, or cannot move some of them to the originals folder,
+processing answers 503 (busy, e.g. while indexing is being canceled or a faces migration runs), 507
+(insufficient storage), or 500 instead of success and keeps the files that were not imported staged,
+so the same session can retry with the same token.
+Processing only looks up an existing batch and never creates it; it answers 404 if there is none,
+for example after cleanup removed it or a previous request imported it.
+
+### Audit Logging
+
+- Emit security events via `event.Audit*` (`AuditInfo`, `AuditWarn`, `AuditErr`, `AuditDebug`) and always build the slice as **Who → What → Outcome**.  
+  - **Who:** `ClientIP(c)` followed by the most specific actor context (`"session %s"`, `"client %s"`, `"user %s"`).  
+  - **What:** Resource constant plus action segments (for example, `string(acl.ResourceCluster)`, `"node", "%s"`). Place extra context such as counts or error placeholders in separate segments before the outcome.  
+  - **Outcome:** End with a single token such as `status.Succeeded`, `status.Failed`, `status.Denied`, or `status.Error(err)` when the sanitized error message should be the outcome; nothing comes after it.
+- Prefer existing helpers (`ClientIP`, `clean.Log`, `clean.LogQuote`, `clean.Error`) instead of formatting values manually, and avoid inline `=` expressions.
+- Example patterns:
+  ```go
+  event.AuditInfo([]string{
+      ClientIP(c),
+      "session %s",
+      string(acl.ResourceCluster),
+      "node", "%s",
+      status.Deleted,
+  }, s.RefID, uuid)
+
+  event.AuditErr([]string{
+      clientIp,
+      "session %s",
+      string(acl.ResourceCluster),
+      "download theme",
+      status.Error(err),
+  }, refID)
+  ```
+
+### User-Visible Notifications vs Audit Log
+
+`event.AuditInfo` / `AuditWarn` / `AuditErr` write to the audit log and broadcast on `audit.log.<level>` — the toast component on the frontend does NOT subscribe to that channel, so an audit entry alone produces no UI feedback. To raise a red or green toast in the browser, publish on the `notify.*` channel via `event.ErrorMsg(id, …)` (red) or `event.SuccessMsg(id, …)` / `event.PublishSuccessMsg(id, …)` (green); the plain `event.Error(msg)` / `event.Success(msg)` string forms are not translatable and are reserved for already-resolved dynamic text.
+
+The two helpers have distinct subscribers; choose based on who the message is for:
+
+- **Short endpoints whose response the frontend reads** (single-shot CRUD, login, settings updates). The calling component renders the response, so `AuditErr` plus an HTTP error is enough — the UI gets the error string from the response body.
+- **Long-running endpoints that the UI drives via the event hub** (`POST /api/v1/index`, `POST /api/v1/import/*path`, and similar). The frontend cancels the in-flight HTTP request on the first `index.*` / `import.*` wire event, so the response body is invisible in normal operation. In-flight failures that need a specific toast MUST be published via `event.ErrorMsg(...)` on `notify.error`; an HTTP error alone produces only the frontend's generic fallback toast (or nothing, if the cancel has already fired).
+- **Forensic events that don't need UI surfacing** (ACL denials, internal aborts whose user-visible signal comes from a sibling channel). `AuditErr` alone is the right call. Rate limit refusals use `event.AuditDebug` with `status.RateLimited`, or no audit line; other routine refusals of unauthenticated requests use `event.AuditDebug` as well.
+
+When in doubt, ask: "after this handler returns, what does the user see?" If the answer is "the frontend will read the response", `AuditErr` covers it. If the answer is "the page is already subscribed to wire events and the response is discarded", publish on `notify.*` as well.
+
+```go
+// Forensic audit only — frontend will read the response body and render the error.
+event.AuditErr([]string{ClientIP(c), "session %s", "delete album", status.Failed}, s.RefID)
+AbortBadRequest(c, err)
+
+// Forensic audit + specific red toast — needed when the request was already canceled by the wire.
+event.AuditErr([]string{ClientIP(c), "session %s", "index files", status.Failed}, s.RefID)
+event.ErrorMsg(i18n.ErrIndexingFailed)
+```
+
+### Swagger Documentation
+
+- Annotate handlers with Swagger comments that include full `/api/v1/...` paths, request/response schemas, and security definitions. Only annotate routes that are externally accessible.
+- Regenerate docs after adding or updating handlers: `make fmt-go swag-fmt swag`. This formats Go files, normalizes annotations, and updates `internal/api/swagger.json`. Do not edit the generated JSON manually.
+- When adding new DTOs, keep field names aligned with the JSON schema and update client documentation if serialized names change.
+- Use enum annotations sparingly and ensure they reflect actual runtime constraints to avoid misleading generated clients.
+
+### Testing Strategy
+
+- Build tests around `NewApiTest()` for a fresh Gin router and the package's shared config. Capture and restore the config options, fixture rows, files, and cache entries a test changes.
+- Wrap requests with helper functions (for example, `PerformRequestJSON`, `PerformAuthenticatedRequest`) to capture status codes, headers, and payloads. Assert headers using constants from `pkg/http/header`.
+- The package `TestMain` initializes the shared fixture database. Tests that need a second DB-backed config use an isolated test config and restore both `get.Config()` and the entity DB provider in `t.Cleanup`.
+- Stub external dependencies (`httptest.Server`) for remote calls and set `AllowPrivate=true` explicitly when the test server binds to loopback addresses.
+- Structure tests with table-driven subtests (`t.Run("CaseName", ...)`) and use PascalCase names. Provide cleanup functions (`t.Cleanup`) to remove temporary files or databases created during tests.
+- Do not run `internal/api` tests in parallel. These suites share fixture files, temporary assets, and database state, so parallel `go test` invocations can cause false failures and readonly/fixture-conflict errors.
+
+### Focused Test Runs
+
+- Fast iteration: `go test ./internal/api -run '<Package|HandlerName>' -count=1`
+- Cluster endpoints: `go test ./internal/api -run 'Cluster' -count=1`
+- Downloads and zip streaming: `go test ./internal/api -run 'Download|Archive' -count=1`
+- Combined CLI and API validation: pair `go test ./internal/commands -run 'Cluster' -count=1` with the matching API suite to ensure DTOs remain compatible.
+- Keep focused `internal/api` runs sequential. Do not launch multiple `go test ./internal/api ...` commands at the same time.
+
+### Preflight Checklist
+
+- Format and regenerate documentation: `make fmt-go swag-fmt swag`
+- Compile backend: `go build ./...`
+- Execute targeted API suites: `go test ./internal/api -run '<Name>' -count=1`
+- Run integration-heavy checks before release: `go test ./internal/service/cluster/registry -count=1` alongside relevant API routes to confirm cluster DTOs stay aligned.
+- Verify that `photoprism show commands --json` reflects any new API-driven flags or outputs when CLI exposure changes.

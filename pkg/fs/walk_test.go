@@ -1,6 +1,7 @@
 package fs
 
 import (
+	iofs "io/fs"
 	"testing"
 
 	"github.com/karrick/godirwalk"
@@ -8,7 +9,7 @@ import (
 )
 
 func TestSkipWalk(t *testing.T) {
-	t.Run("done", func(t *testing.T) {
+	t.Run("Done", func(t *testing.T) {
 		done := make(Done)
 		ignore := NewIgnoreList(".ppignore", true, false)
 
@@ -17,15 +18,33 @@ func TestSkipWalk(t *testing.T) {
 		if skip, result := SkipWalk("testdata/directory", true, false, done, ignore); skip {
 			assert.Nil(t, result)
 		} else {
-			t.Fatal("should be skipped")
+			t.Fatal("skip should be true because this is a directory and not a file")
 		}
 
 		assert.True(t, done["foo.jpg"].Exists())
 		assert.True(t, done["testdata/directory"].Exists())
 		assert.Equal(t, 2, len(done))
 	})
+	t.Run("Storage", func(t *testing.T) {
+		done := make(Done)
+		ignore := NewIgnoreList(".ppignore", true, false)
 
-	t.Run("symlink", func(t *testing.T) {
+		if skip, result := SkipWalk("testdata/originals", true, false, done, ignore); skip {
+			assert.Nil(t, result)
+		} else {
+			t.Fatal("skip should be true because this is a directory and not a file")
+		}
+
+		if skip, result := SkipWalk("testdata/originals/storage", true, false, done, ignore); skip {
+			assert.Equal(t, iofs.SkipDir, result)
+		} else {
+			t.Fatal("skip should be true because this is a directory and not a file")
+		}
+		assert.True(t, done["testdata/originals"].Exists())
+		assert.True(t, done["testdata/originals/storage"].Exists())
+		assert.Equal(t, 2, len(done))
+	})
+	t.Run("Symlink", func(t *testing.T) {
 		done := make(Done)
 		ignore := NewIgnoreList(".ppignore", true, false)
 
@@ -53,11 +72,10 @@ func TestSkipWalk(t *testing.T) {
 		assert.True(t, done["testdata/directory/subdirectory/symlink/self/self"].Exists())
 		assert.Equal(t, 4, len(done))
 	})
-
-	t.Run("godirwalk", func(t *testing.T) {
+	t.Run("Godirwalk", func(t *testing.T) {
 		done := make(Done)
 		var skipped []string
-		var skippedDirs []string
+		var dirs []string
 		testPath := "testdata"
 		ignore := NewIgnoreList(".ppignore", true, false)
 
@@ -68,7 +86,7 @@ func TestSkipWalk(t *testing.T) {
 
 				if skip, result := SkipWalk(fileName, isDir, isSymlink, done, ignore); skip {
 					if result != nil {
-						skippedDirs = append(skippedDirs, fileName)
+						dirs = append(dirs, fileName)
 					} else {
 						skipped = append(skipped, fileName)
 					}
@@ -88,10 +106,13 @@ func TestSkipWalk(t *testing.T) {
 		})
 
 		assert.NoError(t, err)
-		assert.Contains(t, skippedDirs, "testdata/directory/subdirectory/.hiddendir")
+		assert.Contains(t, dirs, "testdata/directory/subdirectory/.hiddendir")
 
-		expectSkipped := []string{
-			"testdata", "testdata/directory",
+		mustSkip := []string{
+			"testdata",
+			"testdata/config",
+			"testdata/config/.foo.local",
+			"testdata/directory",
 			"testdata/directory/.ppignore",
 			"testdata/directory/bar.txt",
 			"testdata/directory/baz.xml",
@@ -108,8 +129,10 @@ func TestSkipWalk(t *testing.T) {
 			"testdata/directory/subdirectory/symlink",
 			"testdata/directory/subdirectory/symlink/somefile.txt",
 			"testdata/directory/subdirectory/symlink/test.md",
-			"testdata/directory/subdirectory/symlink/test.txt"}
+			"testdata/directory/subdirectory/symlink/test.txt",
+			"testdata/originals",
+		}
 
-		assert.Equal(t, expectSkipped, skipped)
+		assert.Equal(t, mustSkip, skipped)
 	})
 }

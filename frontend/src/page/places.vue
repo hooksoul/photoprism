@@ -1,223 +1,790 @@
 <template>
-  <v-container fluid fill-height :class="$config.aclClasses('places')" class="pa-0 p-page p-page-places">
-    <div id="map" style="width: 100%; height: 100%;">
-      <div v-if="canSearch" class="map-control">
-        <div class="maplibregl-ctrl maplibregl-ctrl-group">
-          <v-text-field v-model.lazy.trim="filter.q"
-                        solo hide-details clearable flat single-line validate-on-blur
-                        class="input-search pa-0 ma-0"
-                        :label="$gettext('Search')"
-                        prepend-inner-icon="search"
-                        browser-autocomplete="off"
-                        autocorrect="off"
-                        autocapitalize="none"
-                        color="secondary-dark"
-                        @click:clear="clearQuery"
-                        @keyup.enter.native="formChange"
+  <div ref="page" tabindex="-1" class="p-page p-page-places fill-height" :class="$config.aclClasses('places')" @keydown="onKeyDown">
+    <div class="places" :class="'places--' + projection">
+      <div v-if="mapError">
+        <v-toolbar flat :density="$vuetify.display.smAndDown ? 'compact' : 'default'" class="page-toolbar" color="secondary">
+          <v-toolbar-title>
+            {{ $gettext("Places") }}
+          </v-toolbar-title>
+        </v-toolbar>
+        <div class="pa-3">
+          <v-alert color="primary" icon="mdi-alert-circle-outline" class="v-alert--default" variant="outlined">
+            <div class="font-weight-bold">
+              {{ mapError }}
+            </div>
+          </v-alert>
+        </div>
+      </div>
+      <div v-else-if="canSearch" class="map-control search-control">
+        <div ref="search" class="maplibregl-ctrl maplibregl-ctrl-group map-control-search">
+          <v-text-field
+            v-model.lazy.trim="filter.q"
+            :placeholder="$gettext('Search')"
+            density="compact"
+            flat
+            single-line
+            overflow
+            clearable
+            hide-details
+            theme="light"
+            validate-on="invalid-input"
+            prepend-inner-icon="mdi-magnify"
+            autocomplete="off"
+            autocorrect="off"
+            autocapitalize="none"
+            class="input-search pa-0"
+            @click:clear="clearQuery"
+            @keyup.enter="formChange"
           ></v-text-field>
         </div>
       </div>
+      <div ref="background" class="map-background"></div>
+      <div ref="map" class="map-container" :class="{ 'map-loaded': loaded }"></div>
+      <div v-if="showCluster" class="cluster-control">
+        <v-card class="cluster-control-container">
+          <p-page-photos ref="cluster" :key="cluster.latlng" :static-filter="cluster" :on-close="closeCluster" :embedded="true" />
+        </v-card>
+      </div>
     </div>
-  </v-container>
+  </div>
 </template>
 
 <script>
-import maplibregl from "maplibre-gl";
-import Api from "common/api";
+import { markRaw } from "vue";
+import $api from "common/api";
+import $fullscreen from "common/fullscreen";
+import * as sky from "common/sky";
+import * as maps from "common/map";
+import { getAppStorage } from "common/storage";
+import * as options from "options/options";
 import Thumb from "model/thumb";
+import PPagePhotos from "page/photos.vue";
+import MapStyleControl from "component/places/style-control";
+
+const ProjectionGlobe = "globe";
+const ProjectionMercator = "mercator";
+const ProjectionVertical = "vertical-perspective";
+
+// Pixels the map pans when the up or down arrow is clicked:
+const deltaDistance = 100;
+
+// Degrees the map rotates when the left or right arrow is clicked:
+const deltaDegrees = 25;
+
+// Easing callback function.
+const easing = (t) => {
+  return t * (2 - t);
+};
+
+// MapLibre GL.
+let maplibregl;
+const appStorage = getAppStorage();
 
 export default {
-  name: 'PPagePlaces',
+  name: "PPagePlaces",
+  components: {
+    PPagePhotos,
+  },
   props: {
     staticFilter: {
       type: Object,
-      default: () => {
-      },
+      default: () => {},
     },
   },
   data() {
+    const filter = {
+      q: this.query(),
+      s: this.scope(),
+    };
+
+    const settings = this.$config.getSettings();
+    const features = settings.features;
+
+    if (features) {
+      if (features.private) {
+        filter.public = "true";
+      }
+
+      if (features.review && (!this.staticFilter || !("quality" in this.staticFilter))) {
+        filter.quality = "3";
+      }
+    }
+
     return {
+      isRtl: this.$config.isRtl(),
       canSearch: this.$config.allow("places", "search"),
+      canUpload: this.$config.allow("files", "upload") && features.upload,
+      featExperimental: this.$config.featExperimental(),
       initialized: false,
       map: null,
+      mapError: false,
       markers: {},
       markersOnScreen: {},
+      markerHandlers: {},
+      clusterIds: [],
       loading: false,
-      url: "",
-      attribution: '<a href="https://www.maptiler.com/copyright/" target="_blank">&copy; MapTiler</a> <a href="https://www.openstreetmap.org/copyright" target="_blank">&copy; OpenStreetMap contributors</a>',
+      style: "",
+      projection: "",
+      mapStyles: [],
+      terrain: {
+        "topo-v2": "terrain_rgb",
+        "outdoor-v2": "terrain-rgb",
+        "0195eda5-6f09-7acd-8520-ab103fc75810": "terrain-rgb-v2",
+        "414c531c-926d-4164-a057-455a215c0eee": "terrain_rgb_virtual",
+      },
+      attribution:
+        '<a href="https://www.maptiler.com/copyright/" target="_blank" rel="noopener">&copy; MapTiler</a> <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener">&copy; OpenStreetMap contributors</a>',
       maxCount: 500000,
       options: {},
       mapFont: ["Open Sans Regular"],
       result: {},
-      filter: {q: this.query(), s: this.scope()},
+      filter: filter,
       lastFilter: {},
+      cluster: {},
+      showCluster: false,
       config: this.$config.values,
-      settings: this.$config.values.settings.maps,
+      settings: settings.maps,
+      animate: this.$util.mapAnimateDuration(settings),
+      loaded: false,
     };
   },
   watch: {
-    '$route'() {
+    $route() {
+      if (!this.$view.isActive(this)) {
+        return;
+      }
+
+      this.$view.focus(this.$refs?.page);
+
       this.filter.q = this.query();
       this.filter.s = this.scope();
-      this.lastFilter = {};
+      this.initialized = false;
 
       this.search();
-    }
+    },
   },
+  created() {
+    this._mapDataHandler = null;
+    this._sky = null;
+    this._styleSky = null;
+    this.mapStyles = options.MapsStyle(this.featExperimental, this.$config.has("mapKey"));
+  },
+  // mounted initializes the map and keeps renderer failures inside the Places view.
   mounted() {
-    this.$scrollbar.hide();
-    this.configureMap().then(() => this.renderMap());
+    this.$view.enter(this);
+    this._mapUnmounted = false;
+    this.initMap()
+      .then(() => maps.load())
+      .then((m) => {
+        if (this._mapUnmounted) {
+          return;
+        }
+        maplibregl = m;
+        this.renderMap();
+        this.openClusterFromUrl();
+      })
+      .catch(this.showMapError);
   },
-  destroyed() {
-    this.$scrollbar.show();
+  // beforeUnmount releases map resources and prevents delayed initialization.
+  beforeUnmount() {
+    this._mapUnmounted = true;
+    // Exit fullscreen mode if enabled, has no effect otherwise.
+    $fullscreen.exit();
+    this.teardownMap();
+  },
+  unmounted() {
+    this.$view.leave(this);
   },
   methods: {
-    configureMap() {
-      return this.$config.load().finally(() => {
-        const s = this.$config.values.settings.maps;
-        const filter = {
-          q: this.query(),
-          s: this.scope(),
-        };
+    // teardownMap releases the map and the sky renderer before the component is disposed.
+    teardownMap() {
+      this.removeMap();
 
-        let mapKey = "";
+      if (this._sky) {
+        this._sky.destroy();
+        this._sky = null;
+      }
+    },
+    // removeMap removes the map with its event listeners and markers, and detaches the sky renderer from it.
+    removeMap() {
+      if (!this.map) {
+        return;
+      }
 
-        if (this.$config.has("mapKey")) {
-          // Remove non-alphanumeric characters from key.
-          mapKey = this.$config.get("mapKey").replace(/[^a-z0-9]/gi, '');
+      if (typeof this.map.off === "function") {
+        if (this._mapDataHandler) {
+          this.map.off("data", this._mapDataHandler);
         }
+        this.map.off("move", this.updateMarkers);
+        this.map.off("moveend", this.updateMarkers);
+        this.map.off("resize", this.updateMarkers);
+        this.map.off("idle", this.updateMarkers);
+      }
 
-        const settings = this.$config.settings();
+      this._sky?.detach();
+      this._styleSky = null;
+      this._mapDataHandler = null;
 
-        if (settings && settings.features.private) {
+      this.clearAllMarkerClicks();
+
+      Object.keys(this.markersOnScreen).forEach((markerId) => {
+        const marker = this.markersOnScreen[markerId];
+        if (marker && typeof marker.remove === "function") {
+          marker.remove();
+        }
+      });
+
+      this.markers = {};
+      this.markersOnScreen = {};
+      this.markerHandlers = {};
+
+      if (typeof this.map.remove === "function") {
+        this.map.remove();
+      }
+
+      this.map = null;
+    },
+    ensureMarkerClick(id, marker, key, handlerFactory) {
+      const markerId = String(id);
+      if (!marker || typeof marker.getElement !== "function") {
+        return;
+      }
+
+      const element = marker.getElement();
+
+      if (!element || typeof element.addEventListener !== "function") {
+        return;
+      }
+
+      const existing = this.markerHandlers[markerId];
+
+      if (existing && existing.key === key && typeof existing.handler === "function") {
+        return;
+      }
+
+      if (existing && typeof existing.handler === "function" && typeof element.removeEventListener === "function") {
+        element.removeEventListener("click", existing.handler);
+      }
+
+      const handler = handlerFactory();
+
+      if (typeof handler !== "function") {
+        delete this.markerHandlers[markerId];
+        return;
+      }
+
+      element.addEventListener("click", handler);
+      this.markerHandlers[markerId] = { handler, key };
+    },
+    clearMarkerClick(id, marker) {
+      const markerId = String(id);
+      const existing = this.markerHandlers[markerId];
+
+      if (!existing) {
+        return;
+      }
+
+      const element = marker && typeof marker.getElement === "function" ? marker.getElement() : null;
+
+      if (element && typeof element.removeEventListener === "function" && typeof existing.handler === "function") {
+        element.removeEventListener("click", existing.handler);
+      }
+
+      delete this.markerHandlers[markerId];
+    },
+    clearAllMarkerClicks() {
+      Object.keys(this.markerHandlers).forEach((markerId) => {
+        const marker = this.markers[markerId] || this.markersOnScreen[markerId];
+        this.clearMarkerClick(markerId, marker);
+      });
+    },
+    // renderSky shows the star map behind the globe, or CSS stars if it cannot be rendered.
+    renderSky() {
+      const el = this.$refs.background;
+
+      if (!el || !this.map) {
+        return;
+      }
+
+      if (!this._sky) {
+        const fallback = () => {
+          if (!this._mapUnmounted) {
+            sky.render(el, 320);
+          }
+        };
+        const renderer = new sky.Sky(el, { onLost: fallback });
+        this._sky = renderer;
+        renderer.load(`${this.$config.staticUri}/img/sky/stars.avif`).catch((err) => {
+          if (this.$config.debug) {
+            console.debug("places: sky fallback", err);
+          }
+          renderer.destroy();
+          fallback();
+        });
+      }
+
+      this._sky.attach(this.map);
+    },
+    // updateAtmosphere draws the atmosphere around the globe and restores the style sky otherwise.
+    updateAtmosphere() {
+      const map = this.map;
+
+      if (!map || typeof map.setSky !== "function") {
+        return;
+      }
+
+      // Setters throw while the style is loading; the next projection change or style load retries.
+      try {
+        if (this.getProjection() === ProjectionGlobe) {
+          if (this._styleSky?.map !== map) {
+            const styleSky = map.getSky();
+            map.setSky(sky.atmosphere());
+            this._styleSky = { map, sky: styleSky };
+          }
+        } else if (this._styleSky?.map === map) {
+          map.setSky(sky.styleSky(this._styleSky.sky));
+          this._styleSky = null;
+        }
+      } catch {
+        // Ignore.
+      }
+    },
+    onKeyDown(ev) {
+      if (!ev || !(ev instanceof KeyboardEvent) || !this.$view.isActive(this) || document.activeElement instanceof HTMLInputElement) {
+        return;
+      }
+
+      if (ev.ctrlKey) {
+        switch (ev.code) {
+          case "KeyR":
+            ev.preventDefault();
+            this.reload();
+            break;
+          case "KeyG":
+            ev.preventDefault();
+            this.toggleProjection();
+            break;
+          case "KeyF":
+            ev.preventDefault();
+            this.$view.focus(this.$refs?.search, ".input-search input", false);
+            break;
+          case "KeyU":
+            ev.preventDefault();
+            if (this.canUpload) {
+              this.$event.publish("dialog.upload");
+            }
+            break;
+        }
+      } else if (this.initialized && this.map) {
+        // Use the arrow keys to move around the map with game-like controls.
+        switch (ev.code) {
+          case "ArrowUp":
+            ev.preventDefault();
+            this.map.panBy([0, -deltaDistance], {
+              easing,
+            });
+            break;
+          case "ArrowDown":
+            ev.preventDefault();
+            this.map.panBy([0, deltaDistance], {
+              easing,
+            });
+            break;
+          case "ArrowRight":
+            ev.preventDefault();
+            this.map.easeTo({
+              bearing: this.map.getBearing() + deltaDegrees,
+              easing,
+            });
+            break;
+          case "ArrowLeft":
+            ev.preventDefault();
+            this.map.easeTo({
+              bearing: this.map.getBearing() - deltaDegrees,
+              easing,
+            });
+            break;
+        }
+      }
+    },
+    toggleProjection() {
+      if (!this.map || !this.initialized || this.loading) {
+        return;
+      }
+
+      const currentProjection = this.getProjection();
+
+      if (currentProjection === ProjectionMercator || !currentProjection) {
+        this.setProjection(ProjectionGlobe);
+      } else {
+        this.setProjection(ProjectionMercator);
+      }
+    },
+    getProjection(fromStorage) {
+      if (fromStorage || !this.map || typeof this.map.getProjection !== "function") {
+        const lastProjection = appStorage.getItem("places.projection");
+        return lastProjection ? lastProjection : "";
+      }
+
+      return this.map.getProjection()?.type;
+    },
+    setProjection(newProjection) {
+      const currentProjection = this.getProjection();
+
+      if (currentProjection === newProjection) {
+        return;
+      }
+
+      switch (newProjection) {
+        case ProjectionGlobe:
+          this.map.setZoom(3);
+          break;
+        case ProjectionMercator:
+          break;
+        case ProjectionVertical:
+          break;
+      }
+
+      this.map.setProjection({ type: newProjection });
+      this.projection = newProjection;
+
+      if (!(this.$refs?.map instanceof HTMLElement)) {
+        return;
+      }
+
+      const btn = this.$refs.map.querySelector(".maplibregl-ctrl-globe, .maplibregl-ctrl-globe-enabled");
+
+      if (btn && btn instanceof HTMLElement) {
+        switch (newProjection) {
+          case ProjectionGlobe:
+            btn.classList.add("maplibregl-ctrl-globe-enabled");
+            btn.classList.remove("maplibregl-ctrl-globe");
+            btn.classList.title = this.map._getUIString("GlobeControl.Disable");
+            break;
+          default:
+            btn.classList.add("maplibregl-ctrl-globe");
+            btn.classList.remove("maplibregl-ctrl-globe-enabled");
+            btn.classList.title = this.map._getUIString("GlobeControl.Enable");
+            break;
+        }
+      }
+    },
+    // onProjectionChange remembers the projection and shows the sky and atmosphere in globe view.
+    onProjectionChange(ev) {
+      // Update current projection.
+      this.projection = ev.newProjection;
+
+      // Remember last used projection.
+      appStorage.setItem("places.projection", ev.newProjection);
+
+      // Render sky if new project is globe.
+      if (ev.newProjection === ProjectionGlobe) {
+        this.renderSky();
+      }
+
+      this.updateAtmosphere();
+    },
+    // showMapError provides a readable fallback for rendering and loading failures.
+    showMapError() {
+      this.mapError = this.$gettext("Maps are unavailable. Try another browser or device.");
+      this.loading = false;
+    },
+    // noWebGlSupport returns a message when the renderer's graphics requirement is unmet.
+    noWebGlSupport() {
+      return maps.supportsWebGL2() ? false : this.$gettext("Maps are unavailable. Try another browser or device.");
+    },
+    // initMap configures a style only when the browser can render it.
+    initMap() {
+      return this.$config.load().finally(() => {
+        const err = this.noWebGlSupport();
+        if (err) {
+          return Promise.reject(err);
+        }
+        this.configureMap(this.$config.values.settings.maps.style);
+        return Promise.resolve();
+      });
+    },
+    // setStyle replaces the map while keeping busy-state and error handling balanced.
+    setStyle(style) {
+      if (this.loading) {
+        return false;
+      }
+
+      this.$notify.blockUI("busy");
+
+      this.lastFilter = {};
+      this.initialized = false;
+
+      try {
+        this.removeMap();
+        this.$refs.map.innerHTML = "";
+        this.configureMap(style);
+        this.renderMap();
+        this.mapError = false;
+        return true;
+      } catch {
+        this.showMapError();
+        return false;
+      } finally {
+        this.$notify.unblockUI();
+      }
+    },
+    configureMap(style) {
+      const filter = {
+        q: this.query(),
+        s: this.scope(),
+      };
+
+      let mapKey = "";
+
+      if (this.$config.has("mapKey")) {
+        // Remove non-alphanumeric characters from key.
+        mapKey = this.$config.get("mapKey").replace(/[^a-z0-9]/gi, "");
+      }
+
+      const settings = this.$config.getSettings();
+      const features = settings.features;
+
+      if (settings) {
+        if (features.private) {
           filter.public = "true";
         }
 
-        if (settings && settings.features.review && (!this.staticFilter || !("quality" in this.staticFilter))) {
+        if (features.review && (!this.staticFilter || !("quality" in this.staticFilter))) {
           filter.quality = "3";
         }
+      }
 
-        let mapsStyle = s.style;
+      switch (style) {
+        case "offline":
+          this.style = this.featExperimental ? "low-resolution" : "default";
+          break;
+        case "streets":
+          this.style = "streets-v2";
+          break;
+        case "hybrid":
+          this.style = "414c531c-926d-4164-a057-455a215c0eee";
+          break;
+        case "satellite":
+          this.style = "0195eda5-6f09-7acd-8520-ab103fc75810";
+          break;
+        case "outdoor":
+          this.style = "outdoor-v2";
+          break;
+        case "topographique":
+          this.style = "topo-v2";
+          break;
+        case "":
+        case "basic":
+        case "standard":
+        case "buildings":
+          this.style = "default";
+          break;
+        default:
+          this.style = style;
+      }
 
-        if (!mapKey || !this.$config.isSponsor() && !this.$config.isDemo() || mapsStyle === "basic") {
-          mapsStyle = "offline";
-        } else if (!mapsStyle) {
-          mapsStyle = "streets";
-        }
+      if (!mapKey && this.style !== "low-resolution") {
+        this.style = "default";
+      }
 
-        let mapOptions = {
-          container: "map",
-          style: "https://api.maptiler.com/maps/" + mapsStyle + "/style.json?key=" + mapKey,
-          glyphs: "https://api.maptiler.com/fonts/{fontstack}/{range}.pbf?key=" + mapKey,
-          attributionControl: true,
-          customAttribution: this.attribution,
+      let mapOptions = {
+        container: this.$refs.map,
+        style: `https://api.maptiler.com/maps/${this.style}/style.json?key=${mapKey}`,
+        glyphs: `https://api.maptiler.com/fonts/{fontstack}/{range}.pbf?key=${mapKey}`,
+        attributionControl: { compact: true },
+        zoom: 0,
+      };
+
+      if (this.style === "default") {
+        mapOptions = {
+          container: this.$refs.map,
+          // Styles can be edited/created with https://maplibre.org/maputnik/.
+          // To test new styles, put the style file in /assets/static/maps
+          // and include it from there e.g. "/static/maps/default.json":
+          // style: `/static/maps/${this.style}.json`,
+          style: `https://cdn.photoprism.app/maps/${this.style}.json`,
+          glyphs: `https://cdn.photoprism.app/maps/font/{fontstack}/{range}.pbf`,
           zoom: 0,
         };
-
-        if (mapsStyle === "offline") {
-          mapOptions = {
-            container: "map",
-            style: {
-              "version": 8,
-              "sources": {
-                "world": {
-                  "type": "geojson",
-                  "data": `${this.$config.staticUri}/geo/world.json`,
-                  "maxzoom": 6
-                }
+      } else if (this.style === "low-resolution") {
+        mapOptions = {
+          container: this.$refs.map,
+          style: {
+            version: 8,
+            sources: {
+              world: {
+                type: "geojson",
+                data: `${this.$config.staticUri}/geo/world.json`,
+                maxzoom: 6,
               },
-              "glyphs": `${this.$config.staticUri}/font/{fontstack}/{range}.pbf`,
-              "layers": [
-                {
-                  "id": "background",
-                  "type": "background",
-                  "paint": {
-                    "background-color": "#aadafe"
-                  }
-                },
-                {
-                  id: "land",
-                  type: "fill",
-                  source: "world",
-                  // "source-layer": "land",
-                  paint: {
-                    "fill-color": "#cbe5ca",
-                  },
-                },
-                {
-                  "id": "country-abbrev",
-                  "type": "symbol",
-                  "source": "world",
-                  "maxzoom": 3,
-                  "layout": {
-                    "text-field": "{abbrev}",
-                    "text-font": ["Open Sans Semibold"],
-                    "text-transform": "uppercase",
-                    "text-max-width": 20,
-                    "text-size": {
-                      "stops": [[3, 10], [4, 11], [5, 12], [6, 16]]
-                    },
-                    "text-letter-spacing": {
-                      "stops": [[4, 0], [5, 1], [6, 2]]
-                    },
-                    "text-line-height": {
-                      "stops": [[5, 1.2], [6, 2]]
-                    }
-                  },
-                  "paint": {
-                    "text-halo-color": "#fff",
-                    "text-halo-width": 1
-                  },
-                },
-                {
-                  "id": "country-border",
-                  "type": "line",
-                  "source": "world",
-                  "paint": {
-                    "line-color": "#226688",
-                    "line-opacity": 0.25,
-                    "line-dasharray": [6, 2, 2, 2],
-                    "line-width": 1.2
-                  }
-                },
-                {
-                  "id": "country-name",
-                  "type": "symbol",
-                  "minzoom": 3,
-                  "source": "world",
-                  "layout": {
-                    "text-field": "{name}",
-                    "text-font": ["Open Sans Semibold"],
-                    "text-max-width": 20,
-                    "text-size": {
-                      "stops": [[3, 10], [4, 11], [5, 12], [6, 16]]
-                    }
-                  },
-                  "paint": {
-                    "text-halo-color": "#fff",
-                    "text-halo-width": 1
-                  },
-                },
-              ],
             },
-            attributionControl: true,
-            customAttribution: this.attribution,
-            zoom: 0,
-          };
-          this.url = '';
-        } else {
-          this.url = 'https://api.maptiler.com/maps/' + mapsStyle + '/{z}/{x}/{y}.png?key=' + mapKey;
-        }
+            glyphs: `${this.$config.staticUri}/font/{fontstack}/{range}.pbf`,
+            layers: [
+              {
+                id: "background",
+                type: "background",
+                paint: {
+                  "background-color": "#aadafe",
+                },
+              },
+              {
+                id: "land",
+                type: "fill",
+                source: "world",
+                // "source-layer": "land",
+                paint: {
+                  "fill-color": "#cbe5ca",
+                },
+              },
+              {
+                id: "country-abbrev",
+                type: "symbol",
+                source: "world",
+                maxzoom: 3,
+                layout: {
+                  "text-field": "{abbrev}",
+                  "text-font": ["Open Sans Semibold"],
+                  "text-transform": "uppercase",
+                  "text-max-width": 20,
+                  "text-size": {
+                    stops: [
+                      [3, 10],
+                      [4, 11],
+                      [5, 12],
+                      [6, 16],
+                    ],
+                  },
+                  "text-letter-spacing": {
+                    stops: [
+                      [4, 0],
+                      [5, 1],
+                      [6, 2],
+                    ],
+                  },
+                  "text-line-height": {
+                    stops: [
+                      [5, 1.2],
+                      [6, 2],
+                    ],
+                  },
+                },
+                paint: {
+                  "text-halo-color": "#fff",
+                  "text-halo-width": 1,
+                },
+              },
+              {
+                id: "country-border",
+                type: "line",
+                source: "world",
+                paint: {
+                  "line-color": "#226688",
+                  "line-opacity": 0.25,
+                  "line-dasharray": [6, 2, 2, 2],
+                  "line-width": 1.2,
+                },
+              },
+              {
+                id: "country-name",
+                type: "symbol",
+                minzoom: 3,
+                source: "world",
+                layout: {
+                  "text-field": "{name}",
+                  "text-font": ["Open Sans Semibold"],
+                  "text-max-width": 20,
+                  "text-size": {
+                    stops: [
+                      [3, 10],
+                      [4, 11],
+                      [5, 12],
+                      [6, 16],
+                    ],
+                  },
+                },
+                paint: {
+                  "text-halo-color": "#fff",
+                  "text-halo-width": 1,
+                },
+              },
+            ],
+          },
+          attributionControl: false,
+          zoom: 0,
+        };
+      }
 
-        this.filter = filter;
-        this.options = mapOptions;
+      this.filter = filter;
+      this.options = markRaw(mapOptions);
+    },
+    getClusterFromUrl() {
+      const hasLatLng = this.$route.query.latlng !== undefined && this.$route.query.latlng !== "";
+
+      if (!hasLatLng) {
+        return undefined;
+      }
+
+      return {
+        q: this.filter.q,
+        s: this.filter.s,
+        latlng: this.$route.query.latlng,
+      };
+    },
+    openCluster: function (cluster) {
+      this.cluster = cluster;
+      this.showCluster = true;
+    },
+    openClusterFromUrl: function () {
+      const cluster = this.getClusterFromUrl();
+
+      if (!cluster) {
+        return;
+      }
+
+      this.openCluster(cluster);
+    },
+    selectClusterByCoords: function (latNorth, lngEast, latSouth, lngWest) {
+      // The :key on the embedded photo list (bound to latlng) remounts it for the new
+      // location, so an already-open panel re-runs its search instead of going stale.
+      this.openCluster({
+        q: this.filter.q,
+        s: this.filter.s,
+        latlng: [latNorth, lngEast, latSouth, lngWest].join(","),
       });
     },
+    selectClusterById: function (clusterId) {
+      this.getClusterFeatures(clusterId, -1, (clusterFeatures) => {
+        let latNorth, lngEast, latSouth, lngWest;
+
+        for (const feature of clusterFeatures) {
+          const [lng, lat] = feature.geometry.coordinates;
+          if (latNorth === undefined || lat > latNorth) {
+            latNorth = lat;
+          }
+          if (lngEast === undefined || lng > lngEast) {
+            lngEast = lng;
+          }
+          if (latSouth === undefined || lat < latSouth) {
+            latSouth = lat;
+          }
+          if (lngWest === undefined || lng < lngWest) {
+            lngWest = lng;
+          }
+        }
+
+        this.selectClusterByCoords(latNorth, lngEast, latSouth, lngWest);
+      });
+    },
+    closeCluster: function () {
+      this.cluster = {};
+      this.showCluster = false;
+    },
     query: function () {
-      return this.$route.params.q ? this.$route.params.q : '';
+      return this.$route.query.q ? this.$route.query.q : "";
     },
     scope: function () {
-      return this.$route.params.s ? this.$route.params.s : '';
+      return this.$route.params.s ? this.$route.params.s : "";
     },
     openPhoto(uid) {
       // Abort if uid is empty or results aren't loaded.
@@ -240,38 +807,63 @@ export default {
       this.loading = true;
 
       // Perform get request to find nearby photos.
-      return Api.get("geo/view", options).then((r) => {
-        if (r && r.data && r.data.length > 0) {
-          // Show photos.
-          this.$viewer.show(Thumb.wrap(r.data), 0);
-        } else {
-          // Don't open viewer if nothing was found.
-          this.$notify.warn(this.$gettext("No pictures found"));
-        }
-      }).finally(() => {
-        this.loading = false;
-      });
+      return $api
+        .get("geo/view", options)
+        .then((r) => {
+          if (r && r.data && r.data.length > 0) {
+            // Show photos.
+            this.$lightbox.openModels(Thumb.wrap(r.data), 0);
+          } else {
+            // Don't open lightbox if nothing was found.
+            this.$notify.warn(this.$gettext("No pictures found"));
+          }
+        })
+        .finally(() => {
+          this.loading = false;
+        });
     },
     formChange() {
-      if (this.loading) return;
-      this.search();
+      if (this.loading) {
+        return;
+      }
+
+      this.$router.push({
+        query: {
+          q: this.filter.q,
+        },
+      });
     },
     clearQuery() {
-      this.filter.q = '';
-      this.search();
+      if (this.loading) {
+        return;
+      }
+
+      this.$router.push({
+        query: {},
+      });
     },
     updateQuery() {
-      if (this.loading) return;
+      if (this.loading) {
+        return false;
+      }
 
       if (this.query() !== this.filter.q) {
         if (this.filter.s) {
-          this.$router.replace({name: "places_scope", params: {s: this.filter.s, q: this.filter.q}});
+          this.$router.replace({
+            name: "places_view",
+            params: { s: this.filter.s },
+            query: { q: this.filter.q },
+          });
         } else if (this.filter.q) {
-          this.$router.replace({name: "places_query", params: {q: this.filter.q}});
+          this.$router.replace({ name: "places", query: { q: this.filter.q } });
         } else {
-          this.$router.replace({name: "places"});
+          this.$router.replace({ name: "places" });
         }
+
+        return true;
       }
+
+      return false;
     },
     searchParams() {
       const params = {
@@ -287,12 +879,49 @@ export default {
 
       return params;
     },
-    search() {
-      if (this.loading) return;
+    reload() {
+      if (!this.initialized || this.loading) {
+        return;
+      }
 
-      // Don't query the same data more than once
-      if (JSON.stringify(this.lastFilter) === JSON.stringify(this.filter)) return;
+      this.search(true);
+    },
+    // reset clears the GeoJSON source and refreshes markers after the worker update.
+    reset() {
+      Object.assign(this.result, { features: [] });
+      const map = this.map;
+
+      if (!map || typeof map.getSource !== "function") {
+        return;
+      }
+
+      const source = map.getSource("photos");
+
+      if (!source || typeof source.setData !== "function") {
+        return;
+      }
+
+      return source.setData(this.result).then(() => {
+        if (this.map === map) {
+          this.updateMarkers();
+        }
+      }).catch(() => {});
+    },
+    // search loads locations and waits for the active map source before updating markers.
+    // While busy, it returns the last search instead of starting another one.
+    search(force) {
+      if (this.loading) {
+        return this._searchPromise;
+      }
+
+      // Do not query the same data more than once unless search results need to be updated.
+      if (!force && this.initialized && JSON.stringify(this.lastFilter) === JSON.stringify(this.filter)) {
+        return;
+      }
+
       this.loading = true;
+
+      this.closeCluster();
 
       Object.assign(this.lastFilter, this.filter);
 
@@ -304,173 +933,469 @@ export default {
       };
 
       // Fetch results from server.
-      return Api.get("geo", options).then((response) => {
-        if (!response.data.features || response.data.features.length === 0) {
+      this._searchPromise = $api
+        .get("geo", options)
+        .then(async (response) => {
+          if (!response.data.features || response.data.features.length === 0) {
+            this.reset();
+            this.initialized = true;
+            this.loading = false;
+
+            this.$notify.warn(this.$gettext("No pictures found"));
+
+            return;
+          }
+
+          this.result = response.data;
+
+          const map = this.map;
+
+          // Without a map source, nothing is shown, so the search stays uninitialized and is repeated on load.
+          if (!map || typeof map.getSource !== "function") {
+            this.loading = false;
+            return;
+          }
+
+          const source = map.getSource("photos");
+
+          if (!source || typeof source.setData !== "function") {
+            this.loading = false;
+            return;
+          }
+
+          await source.setData(this.result);
+
+          if (this.map !== map) {
+            this.loading = false;
+            return;
+          }
+
+          if (this.filter.q || !this.initialized) {
+            if (typeof map.fitBounds === "function") {
+              map.fitBounds(this.result.bbox, {
+                maxZoom: 17,
+                padding: 100,
+                duration: this.animate,
+                essential: false,
+                animate: true,
+              });
+            }
+          }
+
+          this.initialized = true;
           this.loading = false;
 
-          this.$notify.warn(this.$gettext("No pictures found"));
+          this.updateMarkers();
+        })
+        .catch(() => {
+          this.reset();
+          this.initialized = true;
+          this.loading = false;
+        });
 
-          return;
-        }
-
-        this.result = response.data;
-
-        this.map.getSource("photos").setData(this.result);
-
-        if (this.filter.q || !this.initialized) {
-          this.map.fitBounds(this.result.bbox, {
-            maxZoom: 17,
-            padding: 100,
-            duration: this.settings.animate,
-            essential: false,
-            animate: this.settings.animate > 0
-          });
-        }
-
-        this.initialized = true;
-
-        this.updateMarkers();
-      }).finally(() => {
-        this.loading = false;
-      });
+      return this._searchPromise;
     },
     renderMap() {
-      this.map = new maplibregl.Map(this.options);
+      const lastProjection = this.getProjection(true);
+
+      // MapLibre stays raw, since a reactive proxy breaks the read-only values it
+      // memoizes on its own objects, e.g. the channels of parsed style colors.
+      this.map = markRaw(new maplibregl.Map({ ...this.options, locale: maps.locale() }));
       this.map.setLanguage(this.$config.values.settings.ui.language.split("-")[0]);
 
-      const controlPos = this.$rtl ? 'top-left' : 'top-right';
+      // Get informed about projection type changes.
+      this.map.on("projectiontransition", (ev) => this.onProjectionChange(ev));
 
-      this.map.addControl(new maplibregl.NavigationControl({showCompass: true}), controlPos);
-      this.map.addControl(new maplibregl.FullscreenControl({container: document.querySelector('body')}), controlPos);
-      this.map.addControl(new maplibregl.GeolocateControl({
-        positionOptions: {
-          enableHighAccuracy: true
-        },
-        trackUserLocation: true
-      }), controlPos);
+      // Add the atmosphere to a style that loads in globe projection.
+      this.map.on("style.load", () => this.updateAtmosphere());
+
+      // Restore last used projection type, if any.
+      if (lastProjection) {
+        this.projection = lastProjection;
+
+        // Restore last used projection type.
+        this.map.on("style.load", () => {
+          this.map.setProjection({
+            type: lastProjection,
+          });
+        });
+      }
+
+      const controlPos = "top-right";
+
+      // Add map navigation control.
+      this.map.addControl(
+        new maplibregl.NavigationControl({
+          visualizePitch: true,
+          showZoom: true,
+          showCompass: true,
+        }),
+        controlPos
+      );
+
+      // Add 3D terrain toggle control, if supported.
+      if (this.terrain[this.style]) {
+        this.map.addControl(
+          new maplibregl.TerrainControl({
+            source: this.terrain[this.style],
+            exaggeration: 1,
+          })
+        );
+      }
+
+      // Add 3D globe toggle control.
+      this.map.addControl(new maplibregl.GlobeControl());
+
+      // Add fullscreen toggle control, except on mobile devices.
+      if (!this.$isMobile) {
+        this.map.addControl(new maplibregl.FullscreenControl({ container: document.querySelector("body") }), controlPos);
+      }
+
+      // Add locate position control.
+      this.map.addControl(
+        new maplibregl.GeolocateControl({
+          positionOptions: {
+            enableHighAccuracy: true,
+          },
+          trackUserLocation: true,
+        }),
+        controlPos
+      );
+
+      // Add style switcher control.
+      if (this.mapStyles.length > 1) {
+        this.map.addControl(new MapStyleControl(this.mapStyles, this.style, this.setStyle), controlPos);
+      }
+
+      // Add map scale control.
+      this.map.addControl(new maplibregl.ScaleControl({ maxWidth: 120, unit: "metric" }), "bottom-left");
 
       this.map.on("load", () => this.onMapLoad());
     },
-    updateMarkers() {
-      if (this.loading) return;
-      let newMarkers = {};
-      let features = this.map.querySourceFeatures("photos");
+    getClusterFeatures(clusterId, limit, callback) {
+      const map = this.map;
 
+      if (!map || typeof map.getSource !== "function") {
+        return;
+      }
+
+      const source = map.getSource("photos");
+
+      if (!source || typeof source.getClusterLeaves !== "function") {
+        return;
+      }
+
+      source.getClusterLeaves(clusterId, limit, undefined).then((clusterFeatures) => {
+        callback(clusterFeatures);
+      });
+    },
+    getClusterSizeFromItemCount(itemCount) {
+      if (itemCount >= 10000) {
+        return 74;
+      } else if (itemCount >= 1000) {
+        return 70;
+      } else if (itemCount >= 750) {
+        return 68;
+      } else if (itemCount >= 200) {
+        return 66;
+      } else if (itemCount >= 100) {
+        return 64;
+      }
+
+      return 60;
+    },
+    abbreviateCount(val) {
+      const value = Number.parseInt(val);
+      if (value >= 1000) {
+        return (value / 1000).toFixed(0).toString() + "k";
+      }
+      return value;
+    },
+    // Renders a single photo marker that opens the picture and its surroundings in the viewer.
+    renderPhotoMarker(feature, token, newMarkers, map) {
+      const id = feature.id;
+      const props = feature.properties;
+      const coords = feature.geometry.coordinates;
+
+      let marker = this.markers[id];
+      if (!marker) {
+        const el = document.createElement("div");
+        el.className = "marker";
+        el.title = props.Title;
+        el.style.backgroundImage = `url(${this.$config.contentUri}/t/${props.Hash}/${token}/tile_50)`;
+        el.style.width = "50px";
+        el.style.height = "50px";
+
+        marker = this.markers[id] = markRaw(
+          new maplibregl.Marker({
+            element: el,
+          }).setLngLat(coords)
+        );
+      } else {
+        marker.setLngLat(coords);
+      }
+
+      const photoUid = props.UID;
+      this.ensureMarkerClick(id, marker, photoUid, () => () => this.openPhoto(photoUid));
+
+      newMarkers[id] = marker;
+
+      if (!this.markersOnScreen[id]) {
+        marker.addTo(map);
+      }
+    },
+    // Renders a stack marker for pictures sharing the same location and opens them as a
+    // group when clicked, so coincident photos no longer hide each other once zoomed in.
+    renderStackMarker(group, token, newMarkers, map) {
+      const count = group.features.length;
+      // Include the count in the cached marker id so a group whose size changes (pictures
+      // separating or merging as the map zooms) gets a fresh badge instead of a stale one.
+      const id = `s${group.key}:${count}`;
+      const bounds = group.bounds;
+      // Center the marker on the group's bounding box so a stack of near-coincident photos
+      // sits between them rather than on whichever picture happened to anchor the group.
+      const coords = [(bounds.lngW + bounds.lngE) / 2, (bounds.latS + bounds.latN) / 2];
+
+      let marker = this.markers[id];
+      if (!marker) {
+        const size = this.getClusterSizeFromItemCount(count);
+        const el = document.createElement("div");
+
+        el.style.width = `${size}px`;
+        el.style.height = `${size}px`;
+
+        const imageContainer = document.createElement("div");
+        imageContainer.className = "marker cluster-marker";
+
+        const previewImageCount = count >= 4 ? 4 : count > 1 ? 2 : 1;
+        const images = Array(previewImageCount)
+          .fill(null)
+          .map((a, i) => {
+            const feature = group.features[Math.floor((count * i) / previewImageCount)];
+            const image = document.createElement("div");
+            image.style.backgroundImage = `url(${this.$config.contentUri}/t/${feature.properties.Hash}/${token}/tile_${50})`;
+            return image;
+          });
+
+        imageContainer.append(...images);
+
+        const counterBubble = document.createElement("div");
+        counterBubble.className = "badge";
+        counterBubble.innerText = this.abbreviateCount(count);
+
+        el.append(imageContainer);
+        el.append(counterBubble);
+        marker = this.markers[id] = markRaw(
+          new maplibregl.Marker({
+            element: el,
+          }).setLngLat(coords)
+        );
+      } else {
+        marker.setLngLat(coords);
+      }
+
+      // Open the stack by its bounding box (padded server-side) so the panel lists every
+      // picture in the group, not just the one at the anchor coordinate.
+      this.ensureMarkerClick(id, marker, `${group.key}:${count}`, () => () => this.selectClusterByCoords(bounds.latN, bounds.lngE, bounds.latS, bounds.lngW));
+
+      newMarkers[id] = marker;
+
+      if (!this.markersOnScreen[id]) {
+        marker.addTo(map);
+      }
+    },
+    updateMarkers() {
+      // Busy loading data from the server?
+      if (this.loading) {
+        // Skip updating map markers.
+        return;
+      }
+
+      const map = this.map;
+
+      if (!map || typeof map.querySourceFeatures !== "function") {
+        return;
+      }
+
+      // Maps may emit resize events while a style reloads; skip processing until the source is ready.
+      const source = typeof map.getSource === "function" ? map.getSource("photos") : null;
+      if (!source) {
+        return;
+      }
+
+      const newMarkers = {};
+
+      // Get map features from the "photos" layer.
+      const features = map.querySourceFeatures("photos");
+
+      // Get API token required to show thumbnails.
+      let token = this.$config.previewToken;
+
+      // Collect un-clustered photo features so that pictures at the same location can be
+      // grouped into a single stack marker below.
+      const photoFeatures = [];
+
+      // Loop through clusters and collect photos for grouping.
       for (let i = 0; i < features.length; i++) {
         let coords = features[i].geometry.coordinates;
         let props = features[i].properties;
-        if (props.cluster) continue;
-        let id = features[i].id;
 
-        let marker = this.markers[id];
-        let token = this.$config.previewToken;
-        if (!marker) {
-          let el = document.createElement('div');
-          el.className = 'marker';
-          el.title = props.Title;
-          el.style.backgroundImage = `url(${this.$config.contentUri}/t/${props.Hash}/${token}/tile_50)`;
-          el.style.width = '50px';
-          el.style.height = '50px';
+        // Is it a cluster?
+        if (props.cluster) {
+          // Update cluster marker.
 
-          el.addEventListener('click', () => this.openPhoto(props.UID));
-          marker = this.markers[id] = new maplibregl.Marker({
-            element: el
-          }).setLngLat(coords);
+          // Attention: Do not confuse with photo feature IDs.
+          // Clusters have their own ID number range!
+          let id = -1 * props.cluster_id;
+
+          let marker = this.markers[id];
+
+          if (!marker) {
+            const size = this.getClusterSizeFromItemCount(props.point_count);
+            let el = document.createElement("div");
+
+            el.style.width = `${size}px`;
+            el.style.height = `${size}px`;
+
+            const imageContainer = document.createElement("div");
+            imageContainer.className = "marker cluster-marker";
+
+            source
+              .getClusterLeaves(props.cluster_id, 4, 0)
+              .then((clusterFeatures) => {
+                const previewImageCount = clusterFeatures.length >= 4 ? 4 : clusterFeatures.length > 1 ? 2 : 1;
+                const images = Array(previewImageCount)
+                  .fill(null)
+                  .map((a, i) => {
+                    const feature = clusterFeatures[Math.floor((clusterFeatures.length * i) / previewImageCount)];
+                    const image = document.createElement("div");
+                    image.style.backgroundImage = `url(${this.$config.contentUri}/t/${feature.properties.Hash}/${token}/tile_${50})`;
+                    return image;
+                  });
+
+                imageContainer.append(...images);
+              })
+              .catch(() => {});
+
+            const counterBubble = document.createElement("div");
+
+            counterBubble.className = "badge";
+            counterBubble.innerText = this.abbreviateCount(props.point_count);
+
+            el.append(imageContainer);
+            el.append(counterBubble);
+            marker = this.markers[id] = markRaw(
+              new maplibregl.Marker({
+                element: el,
+              }).setLngLat(coords)
+            );
+          } else {
+            marker.setLngLat(coords);
+          }
+
+          const clusterId = props.cluster_id;
+          this.ensureMarkerClick(id, marker, clusterId, () => () => this.selectClusterById(clusterId));
+
+          newMarkers[id] = marker;
+
+          if (!this.markersOnScreen[id]) {
+            marker.addTo(map);
+          }
         } else {
-          marker.setLngLat(coords);
-        }
-
-        newMarkers[id] = marker;
-
-        if (!this.markersOnScreen[id]) {
-          marker.addTo(this.map);
+          photoFeatures.push(features[i]);
         }
       }
-      for (let id in this.markersOnScreen) {
+
+      // Group un-clustered photos by on-screen proximity and render each group as a single
+      // marker, using a stack marker with a counter when several pictures share a spot. The
+      // projection keeps grouping zoom-aware so nearby pictures separate as the map zooms in.
+      const project = typeof map.project === "function" ? (coords) => map.project(coords) : null;
+
+      for (const group of maps.groupGeoFeatures(photoFeatures, project)) {
+        if (group.features.length > 1) {
+          this.renderStackMarker(group, token, newMarkers, map);
+        } else {
+          this.renderPhotoMarker(group.features[0], token, newMarkers, map);
+        }
+      }
+
+      // Hide markers that are not currently visible.
+      Object.keys(this.markersOnScreen).forEach((id) => {
         if (!newMarkers[id]) {
-          this.markersOnScreen[id].remove();
+          const marker = this.markersOnScreen[id];
+          this.clearMarkerClick(id, marker);
+          if (marker && typeof marker.remove === "function") {
+            marker.remove();
+          }
         }
-      }
+      });
+
+      // Remember the markers displayed on the map.
       this.markersOnScreen = newMarkers;
     },
+    minimizeAttribCtrl() {
+      if (this.$refs.map instanceof HTMLElement) {
+        const attrCtrl = this.$refs.map.querySelector(".maplibregl-ctrl-attrib");
+
+        if (attrCtrl && attrCtrl instanceof HTMLElement) {
+          attrCtrl.classList?.remove("maplibregl-compact-show");
+          attrCtrl.removeAttribute("open");
+        }
+      }
+    },
     onMapLoad() {
-      this.map.addSource('photos', {
-        type: 'geojson',
-        data: null,
+      this.minimizeAttribCtrl();
+
+      // Get projection type from map.
+      this.projection = this.getProjection();
+
+      // Add 'photos' data source.
+      this.map.addSource("photos", {
+        type: "geojson",
+        data: { type: "FeatureCollection", features: [] },
         cluster: true,
-        clusterMaxZoom: 14, // Max zoom to cluster points on
-        clusterRadius: 50 // Radius of each cluster when clustering points (defaults to 50)
+        clusterMaxZoom: 17, // Max zoom to cluster points on
+        clusterRadius: 80, // Radius of each cluster when clustering points (defaults to 50)
       });
 
+      // Add 'clusters' layer.
       this.map.addLayer({
-        id: 'clusters',
-        type: 'circle',
-        source: 'photos',
-        filter: ['has', 'point_count'],
+        id: "clusters",
+        type: "circle",
+        source: "photos",
+        filter: ["has", "point_count"],
         paint: {
-          'circle-color': [
-            'step',
-            ['get', 'point_count'],
-            '#2DC4B2',
-            100,
-            '#3BB3C3',
-            750,
-            '#669EC4'
-          ],
-          'circle-radius': [
-            'step',
-            ['get', 'point_count'],
-            20,
-            100,
-            30,
-            750,
-            40
-          ]
+          "circle-color": "#FFFFFF",
+          "circle-opacity": 0,
+          "circle-radius": 0,
+        },
+      });
+
+      // Example of dynamic map cluster rendering:
+      // https://maplibre.org/maplibre-gl-js/docs/examples/cluster-html/
+      if (this._mapDataHandler && typeof this.map.off === "function") {
+        this.map.off("data", this._mapDataHandler);
+      }
+
+      this._mapDataHandler = (e) => {
+        if (e?.sourceId === "photos" && e.isSourceLoaded) {
+          this.updateMarkers();
         }
+      };
+
+      this.map.on("data", this._mapDataHandler);
+
+      // Add additional event handlers to update the marker previews.
+      this.map.on("move", this.updateMarkers);
+      this.map.on("moveend", this.updateMarkers);
+      this.map.on("resize", this.updateMarkers);
+      this.map.on("idle", this.updateMarkers);
+
+      // Load pictures, or wait for the search that is already running.
+      Promise.resolve(this.search()).finally(() => {
+        this.loaded = true;
       });
-
-      this.map.addLayer({
-        id: 'cluster-count',
-        type: 'symbol',
-        source: 'photos',
-        filter: ['has', 'point_count'],
-        layout: {
-          'text-field': '{point_count_abbreviated}',
-          'text-font': this.mapFont,
-          'text-size': 13
-        }
-      });
-
-      this.map.on('render', this.updateMarkers);
-
-      this.map.on('click', 'clusters', (e) => {
-        const features = this.map.queryRenderedFeatures(e.point, {
-          layers: ['clusters']
-        });
-        const clusterId = features[0].properties.cluster_id;
-        this.map.getSource('photos').getClusterExpansionZoom(
-          clusterId,
-          (err, zoom) => {
-            if (err) return;
-
-            this.map.easeTo({
-              center: features[0].geometry.coordinates,
-              zoom: zoom
-            });
-          }
-        );
-      });
-
-      this.map.on('mouseenter', 'clusters', () => {
-        this.map.getCanvas().style.cursor = 'pointer';
-      });
-      this.map.on('mouseleave', 'clusters', () => {
-        this.map.getCanvas().style.cursor = '';
-      });
-
-      this.search();
     },
   },
 };
 </script>
-

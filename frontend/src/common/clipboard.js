@@ -1,6 +1,6 @@
 /*
 
-Copyright (c) 2018 - 2023 PhotoPrism UG. All rights reserved.
+Copyright (c) 2018 - 2026 PhotoPrism UG. All rights reserved.
 
     This program is free software: you can redistribute it and/or modify
     it under Version 3 of the GNU Affero General Public License (the "AGPL"):
@@ -13,7 +13,7 @@ Copyright (c) 2018 - 2023 PhotoPrism UG. All rights reserved.
 
     The AGPL is supplemented by our Trademark and Brand Guidelines,
     which describe how our Brand Assets may be used:
-    <https://www.photoprism.app/trademark>
+    <https://www.photoprism.app/trademark/>
 
 Feel free to send an email to hello@photoprism.app if you have questions,
 want to support our work, or just want to say hello.
@@ -24,9 +24,12 @@ Additional information can be found in our Developer Guide:
 */
 
 import RestModel from "model/rest";
-import Notify from "common/notify";
-import { $gettext } from "vm.js";
-import { config } from "app/session";
+import $notify from "common/notify";
+import { $gettext } from "common/gettext";
+import { $config } from "app/session";
+import { getAppStorage } from "common/storage";
+import { reactive } from "vue";
+
 export const MaxItems = 999;
 
 export class Clipboard {
@@ -39,7 +42,7 @@ export class Clipboard {
 
     this.storage = storage;
     this.selectionMap = {};
-    this.selection = [];
+    this.selection = reactive([]);
     this.lastId = "";
     this.maxItems = MaxItems;
 
@@ -48,14 +51,14 @@ export class Clipboard {
 
   isModel(model) {
     if (!model) {
-      if (config.debug) {
+      if ($config.debug) {
         console.warn("Clipboard::isModel() - empty model", model);
       }
       return false;
     }
 
     if (typeof model.getId !== "function") {
-      if (config.debug) {
+      if ($config.debug) {
         console.warn("Clipboard::isModel() - model.getId() is not a function", model);
       }
       return false;
@@ -97,7 +100,7 @@ export class Clipboard {
 
     if (index === -1) {
       if (this.selection.length >= this.maxItems) {
-        Notify.warn($gettext("Can't select more items"));
+        $notify.warn($gettext("Can't select more items"));
         return;
       }
 
@@ -123,18 +126,17 @@ export class Clipboard {
 
     const id = model.getId();
 
-    this.addId(id);
+    return this.addId(id);
   }
 
   addId(id) {
-    this.updateDom(id, true);
-
     if (this.hasId(id)) {
+      this.lastId = id;
       return true;
     }
 
     if (this.selection.length >= this.maxItems) {
-      Notify.warn($gettext("Can't select more items"));
+      $notify.warn($gettext("Can't select more items"));
       return false;
     }
 
@@ -143,13 +145,14 @@ export class Clipboard {
     this.lastId = id;
 
     this.saveToStorage();
+    this.updateDom(id, true);
 
     return true;
   }
 
   addRange(rangeEnd, models) {
     if (!models || !models[rangeEnd] || !(models[rangeEnd] instanceof RestModel)) {
-      if (config.debug) {
+      if ($config.debug) {
         console.warn("Clipboard::addRange() - invalid arguments:", rangeEnd, models);
       }
       return;
@@ -168,12 +171,19 @@ export class Clipboard {
       rangeEnd = newEnd;
     }
 
+    let added = 0;
+
     for (let i = rangeStart; i <= rangeEnd; i++) {
-      this.add(models[i], false);
-      this.updateDom(models[i].getId(), true);
+      const result = this.add(models[i]);
+
+      if (!result) {
+        break;
+      }
+
+      added++;
     }
 
-    return rangeEnd - rangeStart + 1;
+    return added;
   }
 
   has(model) {
@@ -219,7 +229,9 @@ export class Clipboard {
   }
 
   setIds(ids) {
-    if (!Array.isArray(ids)) return;
+    if (!Array.isArray(ids)) {
+      return;
+    }
 
     this.selection = ids;
     this.selectionMap = {};
@@ -257,6 +269,4 @@ export class Clipboard {
   }
 }
 
-const PhotoClipboard = new Clipboard(window.localStorage, "photo_clipboard");
-
-export default PhotoClipboard;
+export const PhotoClipboard = reactive(new Clipboard(getAppStorage(), "clipboard.photos"));

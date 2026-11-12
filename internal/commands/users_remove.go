@@ -3,8 +3,7 @@ package commands
 import (
 	"fmt"
 
-	"github.com/manifoldco/promptui"
-	"github.com/urfave/cli"
+	"github.com/urfave/cli/v2"
 
 	"github.com/photoprism/photoprism/internal/config"
 	"github.com/photoprism/photoprism/internal/entity"
@@ -13,15 +12,13 @@ import (
 )
 
 // UsersRemoveCommand configures the command name, flags, and action.
-var UsersRemoveCommand = cli.Command{
+var UsersRemoveCommand = &cli.Command{
 	Name:      "rm",
-	Usage:     "Removes a user account",
+	Usage:     "Deletes a registered user account",
 	ArgsUsage: "[username]",
 	Flags: []cli.Flag{
-		cli.BoolFlag{
-			Name:  "force, f",
-			Usage: "don't ask for confirmation",
-		},
+		YesFlag(),
+		DeprecatedForceFlag(),
 	},
 	Action: usersRemoveAction,
 }
@@ -35,7 +32,7 @@ func usersRemoveAction(ctx *cli.Context) error {
 
 		// Name or UID provided?
 		if id == "" {
-			return cli.ShowSubcommandHelp(ctx)
+			return ShowUsageError(ctx)
 		}
 
 		// Find user record.
@@ -44,29 +41,24 @@ func usersRemoveAction(ctx *cli.Context) error {
 		if rnd.IsUID(id, entity.UserUID) {
 			m = entity.FindUserByUID(id)
 		} else {
-			m = entity.FindUserByName(id)
+			m = entity.FindUserByExactName(id)
 		}
 
 		if m == nil {
-			return fmt.Errorf("user %s not found", clean.LogQuote(id))
-		} else if m.Deleted() {
-			return fmt.Errorf("user %s has already been deleted", clean.LogQuote(id))
+			return cli.Exit(fmt.Errorf("user %s not found", clean.LogQuote(id)), 3)
+		} else if m.IsDeleted() {
+			return cli.Exit(fmt.Errorf("user %s has already been deleted", clean.LogQuote(id)), 3)
 		}
 
-		if !ctx.Bool("force") {
-			actionPrompt := promptui.Prompt{
-				Label:     fmt.Sprintf("Delete user %s?", m.String()),
-				IsConfirm: true,
-			}
-
-			if _, err := actionPrompt.Run(); err != nil {
-				log.Infof("user %s was not deleted", m.String())
-				return nil
-			}
+		if proceed, err := ConfirmAction(ctx.Bool("yes") || ctx.Bool("force"), fmt.Sprintf("Delete user %s?", m.String())); err != nil {
+			return err
+		} else if !proceed {
+			log.Infof("user %s was not deleted", m.String())
+			return nil
 		}
 
 		if err := m.Delete(); err != nil {
-			return err
+			return cli.Exit(err, 1)
 		}
 
 		log.Infof("user %s has been deleted", m.String())

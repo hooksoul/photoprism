@@ -1,40 +1,65 @@
 package api
 
 import (
-	"github.com/gin-gonic/gin"
-
 	"github.com/photoprism/photoprism/internal/entity"
-	"github.com/photoprism/photoprism/internal/get"
-	"github.com/photoprism/photoprism/internal/session"
-	"github.com/photoprism/photoprism/pkg/clean"
+	"github.com/photoprism/photoprism/internal/photoprism/get"
+	"github.com/photoprism/photoprism/internal/server/limiter"
+	"github.com/photoprism/photoprism/pkg/authn"
+	"github.com/photoprism/photoprism/pkg/rnd"
 )
 
-// SessionID returns the session ID from the request context.
-func SessionID(c *gin.Context) (sessId string) {
-	if c == nil {
-		// Should never happen.
-		return ""
-	}
-
-	// Get the authentication token from the HTTP headers.
-	return clean.ID(c.GetHeader(session.Header))
+// Session finds the client session for the specified auth token, or returns nil if not found.
+func Session(clientIp, authToken string) *entity.Session {
+	sess, _ := LookupSession(clientIp, authToken)
+	return sess
 }
 
-// Session finds the client session for the given ID or returns nil otherwise.
-func Session(id string) *entity.Session {
-	// Skip authentication if app is running in public mode.
+// LookupSession finds the client session for the specified auth token, or returns nil and an error that
+// names the reason: authn.ErrTokenRequired, authn.ErrInvalidToken, or authn.ErrRateLimitExceeded.
+// A failed database query also returns authn.ErrInvalidToken, without counting against the limit.
+func LookupSession(clientIp, authToken string) (*entity.Session, error) {
+	return lookupSession(clientIp, authToken, "")
+}
+
+// lookupSession finds the session for the auth token like LookupSession, and also accepts a session that was
+// issued for the specified audience if it is not empty.
+func lookupSession(clientIp, authToken, audience string) (*entity.Session, error) {
+	// Skip authentication and return the default session when public mode is enabled.
 	if get.Config().Public() {
-		return get.Session().Public()
-	} else if id == "" {
-		return nil
+		return get.Session().Public(), nil
 	}
 
-	// Find session or otherwise return nil.
-	s, err := get.Session().Get(id)
+	// Check auth token format and return nil if it is invalid.
+	if authToken == "" {
+		return nil, authn.ErrTokenRequired
+	} else if !rnd.IsAuthAny(authToken) {
+		return nil, authn.ErrInvalidToken
+	}
 
+	// Check failure rate limit and return nil if it has been exceeded.
+	if limiter.Auth.Reject(clientIp) {
+		return nil, authn.ErrRateLimitExceeded
+	}
+
+	// Try to find an active session based on the hashed auth token.
+	var sess *entity.Session
+	var err error
+
+	if audience == "" {
+		sess, err = entity.FindSession(rnd.SessionID(authToken))
+	} else {
+		sess, err = entity.FindAudienceSession(rnd.SessionID(authToken), audience)
+	}
+
+	// Count a token without an active session towards the failure rate limit and return nil.
 	if err != nil {
-		return nil
+		if entity.SessionNotFound(err) {
+			limiter.Auth.Reserve(clientIp)
+		}
+
+		return nil, authn.ErrInvalidToken
 	}
 
-	return s
+	// Return session.
+	return sess, nil
 }

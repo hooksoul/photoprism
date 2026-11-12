@@ -1,13 +1,24 @@
 import { Selector, t } from "testcafe";
+import { getTopElement, logTime, logTimeEnd } from "./helpers";
 
 export default class Page {
-  constructor() {}
+  constructor() {
+    this.navDrawer = Selector(".v-navigation-drawer");
+    this.navActive = Selector(".v-navigation-drawer--active");
+    this.navInRail = Selector(".v-navigation-drawer--rail");
+    this.expandButton = Selector("div.nav-expand i");
+    this.expandButtonContainer = Selector("div.nav-expand");
+  }
 
   async openNav() {
-    if (await Selector("div.nav-expand").visible) {
-      await t.click(Selector("div.nav-expand a"));
-    } else if (await Selector("div.nav-expand").visible) {
-      await t.click(Selector("div.nav-expand i"));
+    if (await this.navActive.visible) { // Make sure that the nav has been rendered
+      if (await this.navInRail.exists) { // fail fast looking for a minimized nav
+        if (await this.expandButton.exists) {
+          await t.click(this.expandButton);
+        } else if (await this.expandButtonContainer.exists) {
+          await t.click(this.expandButton);
+        }
+      }
     }
   }
 
@@ -20,31 +31,32 @@ export default class Page {
       await t.click(Selector(".nav-" + page));
     } else {
       if (
-        (page === "monochrome") |
-        (page === "panoramas") |
-        (page === "stacks") |
-        (page === "scans") |
-        (page === "review") |
-        (page === "archive")
+        page === "monochrome" ||
+        page === "panoramas" ||
+        page === "stacks" ||
+        page === "scans" ||
+        page === "review" ||
+        page === "private" ||
+        page === "archive"
       ) {
-        if (!(await Selector("div.v-list__group--active div.nav-browse").visible)) {
-          await t.click(Selector("div.nav-browse + div"));
+        if (!(await Selector("div.v-list-group--open a.nav-browse").visible)) {
+          await t.click(Selector("div.nav-browse .mdi-chevron-down"));
         }
-      } else if (page === "live") {
-        if (!(await Selector("div.v-list__group--active div.nav-video").visible)) {
-          await t.click(Selector("div.nav-video + div"));
+      } else if (page === "live" || page === "video") {
+        if (!(await Selector("div.v-list-group--open a.nav-media").visible)) {
+          await t.click(Selector("div.nav-media .mdi-chevron-down"));
         }
       } else if (page === "states") {
-        if (!(await Selector("div.v-list__group--active div.nav-places").visible)) {
-          await t.click(Selector("div.nav-places + div"));
+        if (!(await Selector("div.v-list-group--open a.nav-places").visible)) {
+          await t.click(Selector("div.nav-places .mdi-chevron-down"));
         }
-      } else if ((page === "originals") | (page === "hidden") | (page === "errors")) {
-        if (!(await Selector("div.v-list__group--active div.nav-library").visible)) {
-          await t.click(Selector("div.nav-library + div"));
+      } else if (page === "originals" || page === "hidden" || page === "errors") {
+        if (!(await Selector("div.v-list-group--open a.nav-library").visible)) {
+          await t.click(Selector("div.nav-library .mdi-chevron-down"));
         }
-      } else if ((page === "about") | (page === "feedback") | (page === "license")) {
-        if (!(await Selector("div.v-list__group--active div.nav-settings").visible)) {
-          await t.click(Selector("div.nav-settings + div"));
+      } else if (page === "about" || page === "feedback" || page === "license") {
+        if (!(await Selector("div.v-list-group--open a.nav-settings").visible)) {
+          await t.click(Selector("div.nav-settings .mdi-chevron-down"));
         }
       }
       await t.click(Selector(".nav-" + page));
@@ -60,48 +72,63 @@ export default class Page {
       await t.wait(5000);
     }
     if (
-      (page === "monochrome") |
-      (page === "panoramas") |
-      (page === "stacks") |
-      (page === "scans") |
-      (page === "review") |
-      (page === "archive")
+      page === "monochrome" ||
+      page === "panoramas" ||
+      page === "stacks" ||
+      page === "scans" ||
+      page === "review" ||
+      page === "private" ||
+      page === "archive"
     ) {
       if (
-        !(await Selector("div.v-list__group--active div.nav-browse", { timeout: 15000 }).visible)
+        !(await Selector("div.v-list-group--open div.nav-browse", { timeout: 15000 }).visible) &
+        (await Selector("div.nav-browse .mdi-chevron-down", { timeout: 15000 }).visible)
       ) {
-        await t.click(Selector("div.nav-browse + div", { timeout: 15000 }));
+        await t.click(Selector("div.nav-browse .mdi-chevron-down", { timeout: 15000 }));
       }
     } else if (page === "live") {
       if (await Selector(".nav-video").visible) {
-        if (!(await Selector("div.v-list__group--active div.nav-video").visible)) {
-          await t.click(Selector("div.nav-video + div"));
+        if (
+          !(await Selector("div.v-list-group--open div.nav-video").visible) &
+          (await Selector("div.nav-video .mdi-chevron-down", { timeout: 15000 }).visible)
+        ) {
+          await t.click(Selector("div.nav-video .mdi-chevron-down"));
         }
       }
     } else if (page === "states") {
       if (await Selector(".nav-places").visible) {
-        if (!(await Selector("div.v-list__group--active div.nav-places").visible)) {
-          await t.click(Selector("div.nav-places + div"));
+        if (
+          !(await Selector("div.v-list-group--open div.nav-places").visible) &
+          (await Selector("div.nav-places .mdi-chevron-down", { timeout: 15000 }).visible)
+        ) {
+          await t.click(Selector("div.nav-places .mdi-chevron-down"));
         }
       }
-    } else if ((page === "originals") | (page === "hidden") | (page === "errors")) {
+    } else if (page === "originals" || page === "hidden" || page === "errors") {
       if (await Selector(".nav-library").visible) {
-        if (!(await Selector("div.v-list__group--active div.nav-library").visible)) {
-          if (await Selector("div.nav-library + div").visible) {
-            await t.click(Selector("div.nav-library + div"));
+        if (!(await Selector("div.v-list-group--open div.nav-library").visible)) {
+          if (await Selector("div.nav-library .mdi-chevron-down").visible) {
+            await t.click(Selector("div.nav-library .mdi-chevron-down"));
           }
         }
       }
-    } else if ((page === "abouts") | (page === "feedback") | (page === "license")) {
+    } else if (page === "abouts" || page === "feedback" || page === "license" || page === "admin-users" || page === "services") {
       if (await Selector(".nav-settings").visible) {
-        if (!(await Selector("div.v-list__group--active div.nav-settings").visible)) {
-          await t.click(Selector("div.nav-settings + div"));
+        if (
+          !(await Selector("div.v-list-group--open div.nav-settings").visible) &
+          (await Selector("div.nav-settings .mdi-chevron-down", { timeout: 15000 }).visible)
+        ) {
+          await t.click(Selector("div.nav-settings .mdi-chevron-down"));
         }
       }
     }
 
     if (visible) {
       await t.expect(Selector(".nav-" + page).visible).ok();
+    } else if (page === "services") {
+      // Services is rendered with v-if, so it is absent (not merely hidden) when the role lacks
+      // the permission; assert absence directly instead of waiting out the visibility timeout.
+      await t.expect(Selector(".nav-" + page).exists).notOk();
     } else {
       await t.expect(Selector(".nav-" + page).visible).notOk();
     }

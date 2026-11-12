@@ -1,40 +1,50 @@
 <template>
-  <v-container fluid fill-height class="pa-0 ma-0 p-tab p-tab-logs">
-    <v-layout row wrap fill-height class="pa-0 ma-3">
-      <v-flex grow xs12 class="pa-2 terminal elevation-0 p-logs" style="overflow: auto;">
-        <p v-if="logs.length === 0" class="p-log-empty">
-          <translate>Nothing to see here yet.</translate>
-        </p>
-        <p v-for="(log, index) in logs" :key="index.id" class="p-log-message text-selectable" :class="'p-log-' + log.level">
-          {{ formatTime(log.time) }} {{ level(log) }} <span>{{ log.message }}</span>
-        </p>
-      </v-flex>
-    </v-layout>
-  </v-container>
+  <div class="p-tab p-tab-logs pa-4 fill-height">
+    <v-row class="d-flex align-stretch">
+      <v-col cols="12" class="grow pa-2 bg-terminal elevation-0 p-logs" style="overflow: auto">
+        <div v-if="logs.length === 0" class="p-log-empty flex-grow-1">{{ $gettext(`Nothing to see here yet.`) }}</div>
+        <div v-for="log in logs" :key="log.id" class="p-log-message text-selectable text-break" :class="'p-log-' + log.level">
+          <span :title="utcTime(log.time) + ' UTC'" class="cursor-help p-log-message__time">{{ localTime(log.time) }}</span>
+          {{ formatLevel(log.level) }}
+          <span class="p-log-message__text">{{ log.message }}</span>
+        </div>
+      </v-col>
+    </v-row>
+  </div>
 </template>
 
 <script>
-import {DateTime} from "luxon";
+import { DateTime } from "luxon";
 
 export default {
-  name: 'PTabLogs',
+  name: "PTabLogs",
   data() {
     return {
       logs: this.$log.logs,
+      timeZone: this.$config.getTimeZone(),
     };
   },
-  created() {
-  },
   methods: {
-    level(log) {
-      return log.level.substr(0, 4).toUpperCase();
-    },
-    formatTime(s) {
+    formatLevel(s) {
       if (!s) {
-        return this.$gettext("Unknown");
+        return "INFO";
       }
 
-      return DateTime.fromISO(s).toFormat("yyyy-LL-dd HH:mm:ss");
+      return s.substring(0, 4).toUpperCase();
+    },
+    localTime(s) {
+      if (!s) {
+        return "0000-00-00 00:00:00";
+      }
+
+      return DateTime.fromISO(s, { zone: this.timeZone }).toFormat("yyyy-LL-dd HH:mm:ss");
+    },
+    utcTime(s) {
+      if (!s) {
+        return "0000-00-00 00:00:00";
+      }
+
+      return DateTime.fromISO(s, { zone: "UTC" }).toFormat("yyyy-LL-dd HH:mm:ss");
     },
   },
 };

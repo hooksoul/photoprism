@@ -1,0 +1,81 @@
+package api
+
+import (
+	"net/http"
+
+	"github.com/gin-gonic/gin"
+
+	"github.com/photoprism/photoprism/internal/ai/vision"
+	"github.com/photoprism/photoprism/internal/auth/acl"
+	"github.com/photoprism/photoprism/internal/entity"
+	"github.com/photoprism/photoprism/pkg/http/header"
+	"github.com/photoprism/photoprism/pkg/media"
+)
+
+// PostVisionLabels returns suitable labels for an image.
+//
+//	@Summary	returns suitable labels for an image
+//	@Id			PostVisionLabels
+//	@Tags		Vision
+//	@Accept		json
+//	@Produce	json
+//	@Success	200		{object}	vision.ApiResponse
+//	@Failure	400,413	{object}	vision.ApiResponse
+//	@Failure	403		{object}	vision.ApiResponse	"Vision API disabled; permission errors return i18n.Response"
+//	@Failure	401,429	{object}	i18n.Response
+//	@Param		images	body		vision.ApiRequest	true	"list of image file urls"
+//	@Router		/api/v1/vision/labels [post]
+func PostVisionLabels(router *gin.RouterGroup) {
+	router.POST("/vision/labels", func(c *gin.Context) {
+		s := Auth(c, acl.ResourceVision, acl.ActionUse)
+
+		// Abort if permission is not granted.
+		if s.Abort(c) {
+			return
+		}
+
+		// Abort if the Computer Vision API is disabled.
+		if abortVisionApiDisabled(c) {
+			return
+		}
+
+		var request vision.ApiRequest
+
+		// File uploads are not currently supported for this API endpoint.
+		if header.HasContentType(&c.Request.Header, header.ContentTypeMultipart) {
+			c.JSON(http.StatusBadRequest, vision.NewApiError(request.GetId(), http.StatusBadRequest))
+			return
+		}
+
+		// Assign and validate request form values.
+		LimitRequestBodyBytes(c, MaxVisionRequestBytes)
+
+		if err := c.BindJSON(&request); err != nil {
+			if IsRequestBodyTooLarge(err) {
+				c.JSON(http.StatusRequestEntityTooLarge, vision.NewApiError(request.GetId(), http.StatusRequestEntityTooLarge))
+				return
+			}
+
+			c.JSON(http.StatusBadRequest, vision.NewApiError(request.GetId(), http.StatusBadRequest))
+			return
+		}
+
+		// Run inference to find matching labels.
+		labels, err := vision.GenerateLabels(request.Images, media.SrcRemote, entity.SrcAuto)
+
+		if err != nil {
+			logVisionErr("labels", err)
+			c.JSON(http.StatusBadRequest, vision.NewApiError(request.GetId(), http.StatusBadRequest))
+			return
+		}
+
+		// Generate Vision API service response.
+		response := vision.NewLabelsResponse(
+			request.GetId(),
+			&vision.Model{Type: vision.ModelTypeLabels},
+			labels,
+		)
+
+		c.JSON(http.StatusOK, response)
+	})
+}

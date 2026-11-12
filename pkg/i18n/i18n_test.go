@@ -1,0 +1,115 @@
+package i18n
+
+import (
+	"os"
+	"testing"
+
+	"github.com/leonelquinteros/gotext"
+	"github.com/stretchr/testify/assert"
+)
+
+// TestMain executes runTestMain returning it's results.  It is done this way so that defer can be used to cleanup.
+func TestMain(m *testing.M) {
+	os.Exit(runTestMain(m))
+}
+
+func runTestMain(m *testing.M) int {
+	gotext.Configure(localeDir, string(locale), "default")
+
+	return m.Run()
+}
+
+func TestMsg(t *testing.T) {
+	t.Run("AlreadyExists", func(t *testing.T) {
+		msg := Msg(ErrAlreadyExists, "A cat")
+		assert.Equal(t, "A cat already exists", msg)
+	})
+	t.Run("UnexpectedError", func(t *testing.T) {
+		msg := Msg(ErrUnexpected, "A cat")
+		assert.Equal(t, "Something went wrong, try again", msg)
+	})
+	t.Run("UploadToServiceFailed", func(t *testing.T) {
+		msg := Msg(ErrUploadToServiceFailed, "My NAS")
+		assert.Equal(t, "Upload to My NAS failed", msg)
+		assert.Equal(t, "Upload to %s failed", Source(ErrUploadToServiceFailed))
+	})
+	t.Run("AlreadyExistsGerman", func(t *testing.T) {
+		SetLocale("de")
+		msgTrans := Msg(ErrAlreadyExists, "Eine Katze")
+		assert.Equal(t, "Eine Katze existiert bereits", msgTrans)
+		SetLocale("")
+		msgDefault := Msg(ErrAlreadyExists, "A cat")
+		assert.Equal(t, "A cat already exists", msgDefault)
+	})
+	t.Run("AlreadyExistsPolish", func(t *testing.T) {
+		SetLocale("pl")
+		msgTrans := Msg(ErrAlreadyExists, "Kot")
+		assert.Equal(t, "Kot już istnieje", msgTrans)
+		SetLocale("")
+		msgDefault := Msg(ErrAlreadyExists, "A cat")
+		assert.Equal(t, "A cat already exists", msgDefault)
+	})
+	t.Run("BrazilianPortuguese", func(t *testing.T) {
+		SetLocale("pt_BR")
+		msgTrans := Msg(ErrAlreadyExists, "Gata")
+		assert.Equal(t, "Gata já existe", msgTrans)
+		SetLocale("")
+		msgDefault := Msg(ErrAlreadyExists, "A cat")
+		assert.Equal(t, "A cat already exists", msgDefault)
+	})
+}
+
+func TestError(t *testing.T) {
+	t.Run("AlreadyExists", func(t *testing.T) {
+		err := Error(ErrAlreadyExists, "A cat")
+		assert.EqualError(t, err, "A cat already exists")
+	})
+	t.Run("UnexpectedError", func(t *testing.T) {
+		err := Error(ErrUnexpected, "A cat")
+		assert.EqualError(t, err, "Something went wrong, try again")
+	})
+	t.Run("AlreadyExistsGerman", func(t *testing.T) {
+		SetLocale("de")
+		errGerman := Error(ErrAlreadyExists, "Eine Katze")
+		assert.EqualError(t, errGerman, "Eine Katze existiert bereits")
+		SetLocale("")
+		errDefault := Error(ErrAlreadyExists, "A cat")
+		assert.EqualError(t, errDefault, "A cat already exists")
+	})
+}
+
+func TestLower(t *testing.T) {
+	t.Run("ErrAlreadyExists", func(t *testing.T) {
+		msg := Lower(ErrAlreadyExists, "Eine Katze")
+		assert.Equal(t, "eine katze already exists", msg)
+		SetLocale("de")
+		errGerman := Lower(ErrAlreadyExists, "Eine Katze")
+		assert.Equal(t, errGerman, "eine katze already exists")
+		SetLocale("")
+		errDefault := Lower(ErrAlreadyExists, "Eine Katze")
+		assert.Equal(t, errDefault, "eine katze already exists")
+	})
+	t.Run("ErrForbidden", func(t *testing.T) {
+		msg := Lower(ErrForbidden, "A cat")
+		assert.Equal(t, "permission denied", msg)
+	})
+}
+
+func TestSource(t *testing.T) {
+	t.Run("WithPlaceholder", func(t *testing.T) {
+		assert.Equal(t, "%s already exists", Source(ErrAlreadyExists))
+	})
+	t.Run("WithoutPlaceholder", func(t *testing.T) {
+		assert.Equal(t, "Permission denied", Source(ErrForbidden))
+	})
+	t.Run("AuthErrorMessages", func(t *testing.T) {
+		assert.Equal(t, "Registration disabled", Source(ErrRegistrationDisabled))
+		assert.Equal(t, "Verified email required", Source(ErrVerifiedEmailRequired))
+	})
+	t.Run("UntranslatedAfterSetLocale", func(t *testing.T) {
+		SetLocale("de")
+		assert.Equal(t, "%s already exists", Source(ErrAlreadyExists))
+		SetLocale("")
+		assert.Equal(t, "%s already exists", Source(ErrAlreadyExists))
+	})
+}

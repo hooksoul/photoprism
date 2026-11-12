@@ -1,18 +1,28 @@
 package config
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"html/template"
 	"os"
 	"path/filepath"
+	"slices"
+	"strings"
+
+	"github.com/photoprism/photoprism/pkg/fs"
 )
 
+// ClientAssets holds hashed frontend asset filenames emitted by the build pipeline.
 type ClientAssets struct {
+	BuildPath                 string `json:"-"`
 	BaseUri                   string `json:"-"`
 	AppCss                    string `json:"app.css"`
 	AppJs                     string `json:"app.js"`
 	ShareCss                  string `json:"share.css"`
 	ShareJs                   string `json:"share.js"`
+	SplashCss                 string `json:"splash.css"`
+	SplashJs                  string `json:"splash.js"`
 	MaterialIconsRegularTtf   string `json:"MaterialIcons-Regular.ttf"`
 	MaterialIconsRegularWoff  string `json:"MaterialIcons-Regular.woff"`
 	MaterialIconsRegularEot   string `json:"MaterialIcons-Regular.eot"`
@@ -24,13 +34,13 @@ type ClientAssets struct {
 }
 
 // NewClientAssets creates a new ClientAssets instance.
-func NewClientAssets(baseUri string) ClientAssets {
-	return ClientAssets{BaseUri: baseUri}
+func NewClientAssets(buildPath, baseUri string) *ClientAssets {
+	return &ClientAssets{BuildPath: buildPath, BaseUri: baseUri}
 }
 
-// Load loads the frontend assets from a webpack manifest file.
+// Load loads the frontend assets from the build's flat manifest file.
 func (a *ClientAssets) Load(fileName string) error {
-	jsonFile, err := os.ReadFile(fileName)
+	jsonFile, err := os.ReadFile(filepath.Join(a.BuildPath, fileName)) //nolint:gosec // path derived from configured assets directory
 
 	if err != nil {
 		return err
@@ -39,7 +49,20 @@ func (a *ClientAssets) Load(fileName string) error {
 	return json.Unmarshal(jsonFile, a)
 }
 
-// AppCssUri returns the web app stylesheet URI.
+// Missing returns the manifest keys of the entry points the web app cannot start or share without.
+func (a *ClientAssets) Missing() (keys []string) {
+	for key, value := range map[string]string{"app.css": a.AppCss, "app.js": a.AppJs, "share.js": a.ShareJs} {
+		if value == "" {
+			keys = append(keys, key)
+		}
+	}
+
+	slices.Sort(keys)
+
+	return keys
+}
+
+// AppCssUri returns the web app CSS URI.
 func (a *ClientAssets) AppCssUri() string {
 	if a.AppCss == "" {
 		return ""
@@ -47,7 +70,7 @@ func (a *ClientAssets) AppCssUri() string {
 	return fmt.Sprintf("%s/build/%s", a.BaseUri, a.AppCss)
 }
 
-// AppJsUri returns the web app javascript URI.
+// AppJsUri returns the web app JS URI.
 func (a *ClientAssets) AppJsUri() string {
 	if a.AppJs == "" {
 		return ""
@@ -55,7 +78,7 @@ func (a *ClientAssets) AppJsUri() string {
 	return fmt.Sprintf("%s/build/%s", a.BaseUri, a.AppJs)
 }
 
-// ShareCssUri returns the web sharing stylesheet URI.
+// ShareCssUri returns the web sharing CSS URI.
 func (a *ClientAssets) ShareCssUri() string {
 	if a.ShareCss == "" {
 		return ""
@@ -63,7 +86,7 @@ func (a *ClientAssets) ShareCssUri() string {
 	return fmt.Sprintf("%s/build/%s", a.BaseUri, a.ShareCss)
 }
 
-// ShareJsUri returns the web sharing javascript URI.
+// ShareJsUri returns the web sharing JS URI.
 func (a *ClientAssets) ShareJsUri() string {
 	if a.ShareJs == "" {
 		return ""
@@ -71,13 +94,71 @@ func (a *ClientAssets) ShareJsUri() string {
 	return fmt.Sprintf("%s/build/%s", a.BaseUri, a.ShareJs)
 }
 
-// ClientAssets returns the frontend build assets.
-func (c *Config) ClientAssets() ClientAssets {
-	result := NewClientAssets(c.StaticUri())
+// SplashCssUri returns the splash screen CSS URI.
+func (a *ClientAssets) SplashCssUri() string {
+	if a.SplashCss == "" {
+		return ""
+	}
+	return fmt.Sprintf("%s/build/%s", a.BaseUri, a.SplashCss)
+}
 
-	if err := result.Load(filepath.Join(c.BuildPath(), "assets.json")); err != nil {
+// SplashCssFile returns the splash screen CSS filename.
+func (a *ClientAssets) SplashCssFile() string {
+	if a.SplashCss == "" {
+		return ""
+	}
+	return a.SplashCss
+}
+
+// SplashCssFileContents returns the splash screen CSS file contents for embedding in HTML.
+func (a *ClientAssets) SplashCssFileContents() template.CSS {
+	return template.CSS(a.readFile(a.SplashCssFile())) //nolint:gosec // assets are loaded from trusted local build output
+}
+
+// SplashJsUri returns the splash screen JS URI.
+func (a *ClientAssets) SplashJsUri() string {
+	if a.SplashJs == "" {
+		return ""
+	}
+	return fmt.Sprintf("%s/build/%s", a.BaseUri, a.SplashJs)
+}
+
+// SplashJsFile returns the splash screen JS filename.
+func (a *ClientAssets) SplashJsFile() string {
+	if a.SplashJs == "" {
+		return ""
+	}
+	return a.SplashJs
+}
+
+// SplashJsFileContents returns the splash screen JS file contents for embedding in HTML.
+func (a *ClientAssets) SplashJsFileContents() template.JS {
+	if a.SplashJs == "" {
+		return ""
+	}
+	return template.JS(a.readFile(a.SplashJs)) //nolint:gosec // assets are loaded from trusted local build output
+}
+
+// readFile reads the file contents and returns them as string.
+func (a *ClientAssets) readFile(fileName string) string {
+	if fileName == "" {
+		return ""
+	} else if css, err := os.ReadFile(filepath.Join(a.BuildPath, fileName)); err != nil { //nolint:gosec // path derived from configured assets directory
+		return ""
+	} else {
+		return string(bytes.TrimSpace(css))
+	}
+}
+
+// ClientAssets returns the frontend build assets.
+func (c *Config) ClientAssets() *ClientAssets {
+	result := NewClientAssets(c.StaticBuildPath(), c.StaticUri())
+
+	if err := result.Load(fs.AssetsJsonFile); err != nil {
 		log.Debugf("frontend: %s", err)
-		log.Errorf("frontend: cannot read assets.json")
+		log.Errorf("frontend: cannot read %s", fs.AssetsJsonFile)
+	} else if missing := result.Missing(); len(missing) > 0 {
+		log.Errorf("frontend: %s has no entry for %s", fs.AssetsJsonFile, strings.Join(missing, ", "))
 	}
 
 	return result
@@ -85,5 +166,5 @@ func (c *Config) ClientAssets() ClientAssets {
 
 // ClientManifestUri returns the frontend manifest.json URI.
 func (c *Config) ClientManifestUri() string {
-	return fmt.Sprintf("%s?%x", c.BaseUri("/manifest.json"), c.VersionChecksum())
+	return fmt.Sprintf("%s?%x", c.BaseUri("/"+fs.ManifestJsonFile), c.VersionChecksum())
 }

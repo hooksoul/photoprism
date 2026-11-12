@@ -6,32 +6,35 @@ import (
 	"github.com/dustin/go-humanize/english"
 	"github.com/gin-gonic/gin"
 
-	"github.com/photoprism/photoprism/internal/acl"
+	"github.com/photoprism/photoprism/internal/auth/acl"
 	"github.com/photoprism/photoprism/internal/entity"
 	"github.com/photoprism/photoprism/internal/event"
 	"github.com/photoprism/photoprism/internal/form"
-	"github.com/photoprism/photoprism/internal/get"
-	"github.com/photoprism/photoprism/internal/i18n"
+	"github.com/photoprism/photoprism/internal/photoprism/get"
 	"github.com/photoprism/photoprism/internal/server/limiter"
 	"github.com/photoprism/photoprism/pkg/clean"
+	"github.com/photoprism/photoprism/pkg/i18n"
 )
 
-// UpdateUserPassword changes the password of the currently authenticated user.
+// UpdateUserPassword changes the password of the specified user.
 //
-// PUT /api/v1/users/:uid/password
+//	@Summary	change a user's password
+//	@Id			UpdateUserPassword
+//	@Tags		Users, Authentication
+//	@Accept		json
+//	@Produce	json
+//	@Param		uid						path		string				true	"user uid"
+//	@Param		request					body		form.ChangePassword	true	"old and new password"
+//	@Success	200						{object}	i18n.Response
+//	@Failure	400,401,403,404,413,429	{object}	i18n.Response
+//	@Router		/api/v1/users/{uid}/password [put]
 func UpdateUserPassword(router *gin.RouterGroup) {
 	router.PUT("/users/:uid/password", func(c *gin.Context) {
 		conf := get.Config()
 
-		// You cannot change any passwords without authentication and settings enabled.
+		// Password changes require authentication and enabled settings.
 		if conf.Public() || conf.DisableSettings() {
 			Abort(c, http.StatusForbidden, i18n.ErrPublic)
-			return
-		}
-
-		// Check limit for failed auth requests (max. 10 per minute).
-		if limiter.Login.Reject(ClientIP(c)) {
-			limiter.AbortJSON(c)
 			return
 		}
 
@@ -42,20 +45,31 @@ func UpdateUserPassword(router *gin.RouterGroup) {
 			return
 		}
 
-		// Check if the session user is has user management privileges.
-		isPrivileged := acl.Resources.AllowAll(acl.ResourceUsers, s.User().AclRole(), acl.Permissions{acl.AccessAll, acl.ActionManage})
-		isSuperAdmin := isPrivileged && s.User().IsSuperAdmin()
+		// Get client IP address.
+		clientIp := ClientIP(c)
+
+		// Check request rate limit.
+		r := limiter.Login.Request(clientIp)
+
+		if r.Reject() {
+			limiter.AbortJSON(c)
+			return
+		}
+
+		// Check whether the role can manage all user accounts.
+		isAdmin := acl.Rules.AllowAll(acl.ResourceUsers, s.GetUserRole(), acl.Permissions{acl.AccessAll, acl.ActionManage})
+		isSuperAdmin := isAdmin && s.GetUser().IsSuperAdmin()
 		uid := clean.UID(c.Param("uid"))
 
 		var u *entity.User
 
-		// Users may only change their own password.
-		if !isPrivileged && s.User().UserUID != uid {
+		// Non-admin users may only change their own password.
+		if !isAdmin && s.GetUser().UserUID != uid {
 			AbortForbidden(c)
 			return
-		} else if s.User().UserUID == uid {
-			u = s.User()
-			isPrivileged = false
+		} else if s.GetUser().UserUID == uid {
+			u = s.GetUser()
+			isAdmin = false
 			isSuperAdmin = false
 		} else if u = entity.FindUserByUID(uid); u == nil {
 			Abort(c, http.StatusNotFound, i18n.ErrUserNotFound)
@@ -64,19 +78,40 @@ func UpdateUserPassword(router *gin.RouterGroup) {
 
 		f := form.ChangePassword{}
 
+		// Assign and validate request form values.
+		LimitRequestBodyBytes(c, MaxAuthRequestBytes)
+
 		if err := c.BindJSON(&f); err != nil {
+			if IsRequestBodyTooLarge(err) {
+				AbortRequestTooLarge(c, i18n.ErrInvalidPassword)
+				return
+			}
+
 			Error(c, http.StatusBadRequest, err, i18n.ErrInvalidPassword)
 			return
 		}
 
-		// Verify that the old password is correct.
+		// Check password and abort if invalid.
 		if isSuperAdmin && f.OldPassword == "" {
-			// Do nothing.
-		} else if u.WrongPassword(f.OldPassword) {
-			limiter.Login.Reserve(ClientIP(c))
+			// Ignore if a super admin performs the change for another account.
+		} else if u.InvalidPassword(f.OldPassword) {
 			Abort(c, http.StatusBadRequest, i18n.ErrInvalidPassword)
 			return
 		}
+
+		// Return the reserved request rate limit tokens after successful authentication.
+		r.Success()
+
+		// Validate the new password before other sessions are revoked.
+		if err := entity.ValidatePasswordLength(f.NewPassword); err != nil {
+			Error(c, http.StatusBadRequest, err, i18n.ErrInvalidPassword)
+			return
+		}
+
+		// Revoke other login sessions, but not app passwords or client access tokens, before the tokens
+		// are regenerated, so they do not receive the new preview token.
+		event.AuditInfo([]string{ClientIP(c), "session %s", "users", "%s", "revoked %s"}, s.RefID, clean.LogQuote(u.UserName),
+			english.Plural(u.RevokeDerivedSessions([]string{s.ID}), "session", "sessions"))
 
 		// Set new password.
 		if err := u.SetPassword(f.NewPassword); err != nil {
@@ -84,16 +119,19 @@ func UpdateUserPassword(router *gin.RouterGroup) {
 			return
 		}
 
-		// Update tokens if user matches with session.
-		if s.User().UserUID == u.UID() {
-			s.SetPreviewToken(u.PreviewToken)
-			s.SetDownloadToken(u.DownloadToken)
+		// Revoke sessions that were signed in while the password was changed.
+		if n := u.RevokeDerivedSessions([]string{s.ID}); n > 0 {
+			event.AuditInfo([]string{ClientIP(c), "session %s", "users", "%s", "revoked %s"}, s.RefID, clean.LogQuote(u.UserName),
+				english.Plural(n, "session", "sessions"))
 		}
 
-		// Invalidate all other user sessions to protect the account:
-		// https://cheatsheetseries.owasp.org/cheatsheets/Session_Management_Cheat_Sheet.html
-		event.AuditInfo([]string{ClientIP(c), "session %s", "password changed", "invalidated %s"}, s.RefID,
-			english.Plural(u.DeleteSessions([]string{s.ID}), "session", "sessions"))
+		// Update tokens if user matches with session.
+		if s.GetUser().UserUID == u.GetUID() {
+			s.SetPreviewToken(u.PreviewToken)
+		}
+
+		// Log event.
+		event.AuditInfo([]string{ClientIP(c), "session %s", "users", "%s", "password", "changed"}, s.RefID, clean.LogQuote(u.UserName))
 
 		AddTokenHeaders(c, s)
 		c.JSON(http.StatusOK, i18n.NewResponse(http.StatusOK, i18n.MsgPasswordChanged))

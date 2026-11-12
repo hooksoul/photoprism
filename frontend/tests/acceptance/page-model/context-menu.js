@@ -1,7 +1,10 @@
 import { Selector, t } from "testcafe";
 
 export default class Page {
-  constructor() {}
+  constructor() {
+    // Inert dialog title used to blur the album combobox while keeping focus in the dialog.
+    this.albumDialogTitle = Selector("div.p-photo-album-dialog div.v-toolbar-title", { timeout: 7000 });
+  }
 
   async openContextMenu() {
     if (!(await Selector(".action-clear").visible)) {
@@ -24,15 +27,12 @@ export default class Page {
         .notOk();
     } else {
       if (await Selector("#t-clipboard button.action-" + action).visible) {
-        await t
-          .expect(Selector("#t-clipboard button.action-" + action).hasAttribute("disabled"))
-          .ok();
+        await t.expect(Selector("#t-clipboard button.action-" + action).hasAttribute("disabled")).ok();
       } else {
         await t.expect(Selector("#t-clipboard button.action-" + action).visible).notOk();
       }
     }
   }
-
   async triggerContextMenuAction(action, albumName) {
     await this.openContextMenu();
     if (t.browser.platform === "mobile") {
@@ -42,10 +42,24 @@ export default class Page {
     if (action === "delete") {
       await t.click(Selector("button.action-confirm"));
     }
-    if ((action === "album") | (action === "clone")) {
-      await t
-        .typeText(Selector(".input-album input"), albumName, { replace: true })
-        .pressKey("enter");
+    if ((action === "album") || (action === "clone")) {
+      await t.click(Selector(".input-albums"));
+
+      // Handle single album name or array of album names
+      const albumNames = Array.isArray(albumName) ? albumName : [albumName];
+
+      for (const name of albumNames) {
+        if (await Selector("div").withText(name).parent('div[role="option"]').visible) {
+          // Click on the album option to select it
+          await t
+            .click(Selector("div").withText(name).parent('div[role="option"]'))
+            .click(this.albumDialogTitle);
+        } else {
+          await t.typeText(Selector(".input-albums input:not([type='hidden'])"), name).click(this.albumDialogTitle);
+        }
+        await t.expect(Selector("span.v-chip").withText(name).visible).ok();
+      }
+      await t.click(Selector("button.action-confirm"));
     }
   }
 

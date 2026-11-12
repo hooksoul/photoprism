@@ -1,28 +1,58 @@
 package commands
 
 import (
-	"github.com/urfave/cli"
+	"fmt"
 
-	"github.com/photoprism/photoprism/internal/acl"
+	"github.com/urfave/cli/v2"
+
+	"github.com/photoprism/photoprism/internal/auth/acl"
+	"github.com/photoprism/photoprism/pkg/authn"
 )
 
 // Usage hints for the user management subcommands.
 const (
-	UserNameUsage     = "full `NAME` for display in the interface"
-	UserEmailUsage    = "unique `EMAIL` address of the user"
-	UserPasswordUsage = "`PASSWORD` for local authentication"
-	UserRoleUsage     = "user role `NAME` (leave blank for default)"
-	UserAdminUsage    = "make user super admin with full access"
-	UserNoLoginUsage  = "disable login on the web interface"
-	UserWebDAVUsage   = "allow to sync files via WebDAV"
+	UserNameUsage       = "full `NAME` for display in the interface"
+	UserEmailUsage      = "`EMAIL` address of the user"
+	UserPasswordUsage   = "`PASSWORD` for local authentication (8-72 characters)"
+	UserAuthUsage       = "authentication `PROVIDER` (default, local, oidc, or none)"
+	UserAuthIDUsage     = "authentication `ID`, e.g. Subject ID or Distinguished Name (DN)"
+	UserAuthIssuerUsage = "authentication `ISSUER` URL, e.g. the Portal base URL for OIDC accounts"
+	UserAdminUsage      = "makes user super admin with full access"
+	UserNoLoginUsage    = "disables login on the web interface"
+	UserWebDAVUsage     = "allows to sync files via WebDAV"
+	UserMCPUsage        = "allows the use of MCP if the role permits it, as new accounts do by default, --mcp=false disallows it"
+	UserDisable2FA      = "deactivates two-factor authentication"
+	UserRestoreUsage    = "restores a deleted account without asking for confirmation"
 )
 
-// UsersCommand configures the user management subcommands.
-var UsersCommand = cli.Command{
+// UserRestoreFlag returns the --restore flag of the commands that offer to restore a deleted account.
+func UserRestoreFlag() *cli.BoolFlag {
+	return &cli.BoolFlag{Name: "restore", Usage: UserRestoreUsage}
+}
+
+// UserMCPFlag returns the --mcp flag of the add and modify user commands.
+func UserMCPFlag() *cli.BoolFlag {
+	return &cli.BoolFlag{Name: "mcp", Usage: UserMCPUsage, DisableDefaultText: true}
+}
+
+// UserRoleUsageFor builds the --role flag help from the assignable user roles in m, so
+// each edition's CLI lists exactly the roles its own registered map accepts (Portal, for
+// example, includes cluster_admin). Edition commands pass their static auth.UserRoles map.
+func UserRoleUsageFor(m acl.RoleStrings) string {
+	return fmt.Sprintf("user account `ROLE`, e.g. %s", m.CliUsageString())
+}
+
+var (
+	// UserRoleUsage describes the assignable user roles for CLI help.
+	UserRoleUsage = UserRoleUsageFor(acl.UserRoles)
+)
+
+// UsersCommands configures the user management subcommands.
+var UsersCommands = &cli.Command{
 	Name:    "users",
 	Aliases: []string{"user"},
 	Usage:   "User management subcommands",
-	Subcommands: []cli.Command{
+	Subcommands: []*cli.Command{
 		UsersListCommand,
 		UsersLegacyCommand,
 		UsersAddCommand,
@@ -35,33 +65,80 @@ var UsersCommand = cli.Command{
 
 // UserFlags specifies the add and modify user command flags.
 var UserFlags = []cli.Flag{
-	cli.StringFlag{
-		Name:  "name, n",
-		Usage: UserNameUsage,
+	&cli.StringFlag{
+		Name:    "name",
+		Aliases: []string{"n"},
+		Usage:   UserNameUsage,
 	},
-	cli.StringFlag{
-		Name:  "email, m",
-		Usage: UserEmailUsage,
+	&cli.StringFlag{
+		Name:    "email",
+		Aliases: []string{"m"},
+		Usage:   UserEmailUsage,
 	},
-	cli.StringFlag{
-		Name:  "password, p",
-		Usage: UserPasswordUsage,
+	&cli.StringFlag{
+		Name:    "password",
+		Aliases: []string{"p"},
+		Usage:   UserPasswordUsage,
 	},
-	cli.StringFlag{
-		Name:  "role, r",
-		Usage: UserRoleUsage,
-		Value: acl.RoleAdmin.String(),
+	&cli.StringFlag{
+		Name:    "role",
+		Aliases: []string{"r"},
+		Usage:   UserRoleUsage,
+		Value:   acl.RoleAdmin.String(),
 	},
-	cli.BoolFlag{
-		Name:  "superadmin, s",
-		Usage: UserAdminUsage,
+	&cli.StringFlag{
+		Name:    "auth",
+		Aliases: []string{"A"},
+		Usage:   UserAuthUsage,
+		Value:   authn.ProviderDefault.String(),
 	},
-	cli.BoolFlag{
-		Name:  "no-login, l",
-		Usage: UserNoLoginUsage,
+	&cli.StringFlag{
+		Name:  "auth-id",
+		Usage: UserAuthIDUsage,
+		Value: "",
 	},
-	cli.BoolFlag{
-		Name:  "webdav, w",
-		Usage: UserWebDAVUsage,
+	&cli.StringFlag{
+		Name:  "auth-issuer",
+		Usage: UserAuthIssuerUsage,
+		Value: "",
 	},
+	SuperAdminFlag(UserAdminUsage),
+	&cli.BoolFlag{
+		Name:    "no-login",
+		Aliases: []string{"l"},
+		Usage:   UserNoLoginUsage,
+	},
+	&cli.BoolFlag{
+		Name:    "webdav",
+		Aliases: []string{"w"},
+		Usage:   UserWebDAVUsage,
+	},
+	UserMCPFlag(),
+}
+
+// UserTokensFlag is a CLI flag for showing the security tokens in reports.
+var UserTokensFlag = &cli.BoolFlag{
+	Name:  "tokens",
+	Usage: "show user preview and download tokens",
+}
+
+// UsersLoginFlag is a CLI flag for showing the last login timestamp in reports.
+var UsersLoginFlag = &cli.BoolFlag{
+	Name:    "login",
+	Aliases: []string{"l"},
+	Usage:   "shows date and time of last login",
+}
+
+// UsersCreatedFlag is a CLI flag for showing the account creation timestamp in reports.
+var UsersCreatedFlag = &cli.BoolFlag{
+	Name:    "created",
+	Aliases: []string{"a"},
+	Usage:   "shows account creation timestamp",
+}
+
+// UsersDeletedFlag is a CLI flag for showing deleted user accounts in reports.
+var UsersDeletedFlag = &cli.BoolFlag{
+	Name:    "deleted",
+	Aliases: []string{"r"},
+	Usage:   "shows deleted user accounts",
 }

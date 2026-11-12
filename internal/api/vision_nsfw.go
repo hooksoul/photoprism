@@ -1,0 +1,89 @@
+package api
+
+import (
+	"net/http"
+
+	"github.com/gin-gonic/gin"
+
+	"github.com/photoprism/photoprism/internal/ai/vision"
+	"github.com/photoprism/photoprism/internal/auth/acl"
+	"github.com/photoprism/photoprism/pkg/http/header"
+	"github.com/photoprism/photoprism/pkg/media"
+)
+
+// PostVisionNsfw checks the specified images for inappropriate content.
+//
+//	@Summary	checks the specified images for inappropriate content
+//	@Id			PostVisionNsfw
+//	@Tags		Vision
+//	@Accept		json
+//	@Produce	json
+//	@Success	200		{object}	vision.ApiResponse
+//	@Failure	400,413	{object}	vision.ApiResponse
+//	@Failure	403		{object}	vision.ApiResponse	"Vision API disabled; permission errors return i18n.Response"
+//	@Failure	401,429	{object}	i18n.Response
+//	@Param		images	body		vision.ApiRequest	true	"list of image file urls"
+//	@Router		/api/v1/vision/nsfw [post]
+func PostVisionNsfw(router *gin.RouterGroup) {
+	router.POST("/vision/nsfw", func(c *gin.Context) {
+		s := Auth(c, acl.ResourceVision, acl.ActionUse)
+
+		// Abort if permission is not granted.
+		if s.Abort(c) {
+			return
+		}
+
+		// Abort if the Computer Vision API is disabled.
+		if abortVisionApiDisabled(c) {
+			return
+		}
+
+		var request vision.ApiRequest
+
+		// File uploads are not currently supported for this API endpoint.
+		if header.HasContentType(&c.Request.Header, header.ContentTypeMultipart) {
+			c.JSON(http.StatusBadRequest, vision.NewApiError(request.GetId(), http.StatusBadRequest))
+			return
+		}
+
+		// Assign and validate request form values.
+		LimitRequestBodyBytes(c, MaxVisionRequestBytes)
+
+		if err := c.BindJSON(&request); err != nil {
+			if IsRequestBodyTooLarge(err) {
+				c.JSON(http.StatusRequestEntityTooLarge, vision.NewApiError(request.GetId(), http.StatusRequestEntityTooLarge))
+				return
+			}
+
+			c.JSON(http.StatusBadRequest, vision.NewApiError(request.GetId(), http.StatusBadRequest))
+			return
+		}
+
+		// Run inference to check the specified images for inappropriate content.
+		results, err := vision.DetectNSFW(request.Images, media.SrcRemote)
+
+		if err != nil {
+			logVisionErr("nsfw", err)
+			c.JSON(http.StatusBadRequest, vision.NewApiError(request.GetId(), http.StatusBadRequest))
+			return
+		}
+
+		// Name the detector that produced the scores, since a client cannot otherwise tell
+		// which taxonomy the class probabilities belong to, or whether they exist at all.
+		model := vision.Config.Model(vision.ModelTypeNsfw)
+
+		if model == nil {
+			model = vision.NsfwModel
+		}
+
+		// Generate Vision API service response.
+		response := vision.ApiResponse{
+			Id:     request.GetId(),
+			Code:   http.StatusOK,
+			Model:  &vision.Model{Type: vision.ModelTypeNsfw, Name: model.Name, Version: model.Version},
+			Result: vision.ApiResult{Nsfw: results},
+		}
+
+		c.JSON(http.StatusOK, response)
+	})
+}

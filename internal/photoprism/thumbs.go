@@ -1,7 +1,6 @@
 package photoprism
 
 import (
-	"errors"
 	"fmt"
 	"path/filepath"
 	"runtime/debug"
@@ -14,6 +13,9 @@ import (
 	"github.com/photoprism/photoprism/internal/mutex"
 	"github.com/photoprism/photoprism/pkg/clean"
 	"github.com/photoprism/photoprism/pkg/fs"
+	"github.com/photoprism/photoprism/pkg/fs/disk"
+	"github.com/photoprism/photoprism/pkg/i18n"
+	"github.com/photoprism/photoprism/pkg/log/status"
 )
 
 // Thumbs represents a thumbnail image generator.
@@ -24,6 +26,19 @@ type Thumbs struct {
 // NewThumbs returns a new thumbnails generator and expects the config as argument.
 func NewThumbs(conf *config.Config) *Thumbs {
 	return &Thumbs{conf: conf}
+}
+
+// insufficientStorage reports whether thumbnail generation must abort because the
+// configured files quota is reached or the storage path is critically low on free disk space.
+func (w *Thumbs) insufficientStorage() bool {
+	if !w.conf.InsufficientStorage() {
+		return false
+	}
+
+	// Do not leak server internals like the size of the storage volume.
+	log.Errorf("thumbs: aborting due to insufficient storage")
+	event.ErrorMsg(i18n.ErrInsufficientStorage)
+	return true
 }
 
 // Start creates thumbnails for files in the originals and sidecar folders.
@@ -48,6 +63,13 @@ func (w *Thumbs) Start(dir string, force, originalsOnly bool) (err error) {
 	// Scan sidecar folder?
 	originalsOnly = originalsOnly || sidecarPath == "" || sidecarPath == originalsPath || !fs.PathExists(sidecarDir)
 
+	// Reset the cached disk usage so a freshly freed disk is detected immediately.
+	disk.FlushFree()
+
+	if w.insufficientStorage() {
+		return status.ErrInsufficientStorage
+	}
+
 	// Start creating thumbnails.
 	if _, err = w.Dir(originalsDir, force); err != nil || originalsOnly {
 		return err
@@ -62,29 +84,29 @@ func (w *Thumbs) Start(dir string, force, originalsOnly bool) (err error) {
 func (w *Thumbs) Dir(dir string, force bool) (fs.Done, error) {
 	done := make(fs.Done)
 
-	if err := mutex.MainWorker.Start(); err != nil {
+	if err := mutex.IndexWorker.Start(); err != nil {
 		return done, err
 	}
 
-	defer mutex.MainWorker.Stop()
+	defer mutex.IndexWorker.Stop()
 
 	jobs := make(chan ThumbsJob)
 	thumbnailsPath := w.conf.ThumbCachePath()
 
 	// Start a fixed number of goroutines to read and digest files.
 	var wg sync.WaitGroup
-	var numWorkers = w.conf.Workers()
+	var numWorkers = w.conf.IndexWorkers()
 
 	wg.Add(numWorkers)
 
-	for i := 0; i < numWorkers; i++ {
+	for range numWorkers {
 		go func() {
 			ThumbsWorker(jobs)
 			wg.Done()
 		}()
 	}
 
-	ignore := fs.NewIgnoreList(fs.IgnoreFile, true, false)
+	ignore := fs.NewIgnoreList(fs.PPIgnoreFilename, true, false)
 	ignore.Log = func(fileName string) {
 		log.Infof(`thumbs: ignored "%s"`, fs.RelName(fileName, dir))
 	}
@@ -96,8 +118,14 @@ func (w *Thumbs) Dir(dir string, force bool) (fs.Done, error) {
 			}
 		}()
 
-		if mutex.MainWorker.Canceled() {
-			return errors.New("canceled")
+		if mutex.IndexWorker.Canceled() {
+			return status.ErrCanceled
+		}
+
+		// Stop the walk if storage drops below the threshold mid-scan.
+		if w.insufficientStorage() {
+			mutex.IndexWorker.Cancel()
+			return status.ErrInsufficientStorage
 		}
 
 		isDir, _ := info.IsDirOrSymlinkToDir()
@@ -134,7 +162,7 @@ func (w *Thumbs) Dir(dir string, force bool) (fs.Done, error) {
 
 	log.Infof("thumbs: processing %s", clean.Log(dir))
 
-	if err := ignore.Dir(dir); err != nil {
+	if err := ignore.Path(dir); err != nil {
 		log.Infof("thumbs: %s", err)
 	}
 

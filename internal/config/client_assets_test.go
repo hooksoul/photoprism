@@ -1,37 +1,46 @@
 package config
 
 import (
+	"html/template"
 	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+
+	"github.com/photoprism/photoprism/pkg/fs"
 )
 
 func TestClientAssets_Load(t *testing.T) {
 	c := NewConfig(CliTestContext())
 
 	t.Run("Ok", func(t *testing.T) {
-		a := NewClientAssets(c.StaticUri())
+		testBuildPath := "testdata/static/build"
+		a := NewClientAssets(testBuildPath, c.StaticUri())
 
-		err := a.Load("testdata/static/build/assets.json")
+		err := a.Load(fs.AssetsJsonFile)
 
 		assert.NoError(t, err)
 
 		assert.Equal(t, "/static", a.BaseUri)
-		assert.Equal(t, "app.2259c0edcc020e7af593.css", a.AppCss)
-		assert.Equal(t, "/static/build/app.2259c0edcc020e7af593.css", a.AppCssUri())
-		assert.Equal(t, "app.9bd7132eaee8e4c7c7e3.js", a.AppJs)
-		assert.Equal(t, "/static/build/app.9bd7132eaee8e4c7c7e3.js", a.AppJsUri())
-		assert.Equal(t, "share.2259c0edcc020e7af593.css", a.ShareCss)
-		assert.Equal(t, "/static/build/share.2259c0edcc020e7af593.css", a.ShareCssUri())
-		assert.Equal(t, "share.7aaf321a984ae545e4e5.js", a.ShareJs)
-		assert.Equal(t, "/static/build/share.7aaf321a984ae545e4e5.js", a.ShareJsUri())
+		assert.Equal(t, "app.test.css", a.AppCss) // app.test.css
+		assert.Equal(t, "/static/build/app.test.css", a.AppCssUri())
+		assert.Equal(t, "app.test.js", a.AppJs)
+		assert.Equal(t, "/static/build/app.test.js", a.AppJsUri())
+		assert.Equal(t, "share.test.css", a.ShareCss)
+		assert.Equal(t, "/static/build/share.test.css", a.ShareCssUri())
+		assert.Equal(t, "share.test.js", a.ShareJs)
+		assert.Equal(t, "/static/build/share.test.js", a.ShareJsUri())
+		assert.Equal(t, "/static/build/splash.test.css", a.SplashCssUri())
+		assert.Equal(t, "splash.test.css", a.SplashCssFile())
+		assert.NotEmpty(t, a.SplashCssFileContents())
+		assert.Equal(t, "/static/build/splash.test.js", a.SplashJsUri())
+		assert.Equal(t, "splash.test.js", a.SplashJsFile())
 	})
-
 	t.Run("Error", func(t *testing.T) {
-		a := NewClientAssets(c.StaticUri())
+		testBuildPath := "testdata/foo"
+		a := NewClientAssets(testBuildPath, c.StaticUri())
 
-		err := a.Load("testdata/foo/assets.json")
+		err := a.Load(fs.AssetsJsonFile)
 
 		assert.Error(t, err)
 
@@ -44,6 +53,8 @@ func TestClientAssets_Load(t *testing.T) {
 		assert.Equal(t, "", a.ShareCssUri())
 		assert.Equal(t, "", a.ShareJs)
 		assert.Equal(t, "", a.ShareJsUri())
+		assert.Equal(t, "", a.SplashJsUri())
+		assert.Equal(t, "", a.SplashJsFile())
 	})
 }
 
@@ -52,25 +63,28 @@ func TestConfig_ClientAssets(t *testing.T) {
 
 	c.options.AssetsPath = "testdata"
 	c.options.CdnUrl = "https://mycdn.com/foo/"
-	c.SetWallpaperUri("kashmir")
+	c.SetWallpaperUri("default")
 
 	a := c.ClientAssets()
 
 	assert.Equal(t, "https://mycdn.com/foo/static", a.BaseUri)
-	assert.Equal(t, "app.2259c0edcc020e7af593.css", a.AppCss)
-	assert.Equal(t, "https://mycdn.com/foo/static/build/app.2259c0edcc020e7af593.css", a.AppCssUri())
-	assert.Equal(t, "app.9bd7132eaee8e4c7c7e3.js", a.AppJs)
-	assert.Equal(t, "https://mycdn.com/foo/static/build/app.9bd7132eaee8e4c7c7e3.js", a.AppJsUri())
-	assert.Equal(t, "share.2259c0edcc020e7af593.css", a.ShareCss)
-	assert.Equal(t, "https://mycdn.com/foo/static/build/share.2259c0edcc020e7af593.css", a.ShareCssUri())
-	assert.Equal(t, "share.7aaf321a984ae545e4e5.js", a.ShareJs)
-	assert.Equal(t, "https://mycdn.com/foo/static/build/share.7aaf321a984ae545e4e5.js", a.ShareJsUri())
-	assert.Equal(t, "https://mycdn.com/foo/static/img/wallpaper/kashmir.jpg", c.WallpaperUri())
+	assert.Equal(t, "app.test.css", a.AppCss)
+	assert.Equal(t, "https://mycdn.com/foo/static/build/app.test.css", a.AppCssUri())
+	assert.Equal(t, "app.test.js", a.AppJs)
+	assert.Equal(t, "https://mycdn.com/foo/static/build/app.test.js", a.AppJsUri())
+	assert.Equal(t, "share.test.css", a.ShareCss)
+	assert.Equal(t, "https://mycdn.com/foo/static/build/share.test.css", a.ShareCssUri())
+	assert.Equal(t, "share.test.js", a.ShareJs)
+	assert.Equal(t, "https://mycdn.com/foo/static/build/share.test.js", a.ShareJsUri())
+	assert.Equal(t, "https://mycdn.com/foo/static/img/wallpaper/default.jpg", c.WallpaperUri())
+	assert.Equal(t, "https://mycdn.com/foo/static/build/splash.test.css", a.SplashCssUri())
+	assert.Equal(t, "splash.test.css", a.SplashCssFile())
+	assert.Equal(t, template.CSS("body{color: black;}"), a.SplashCssFileContents())
 
 	c.options.AssetsPath = "testdata/invalid"
 	c.options.CdnUrl = ""
 	c.options.SiteUrl = "http://myhost/foo"
-	c.SetWallpaperUri("kashmir")
+	c.SetWallpaperUri("default")
 
 	a = c.ClientAssets()
 
@@ -98,4 +112,31 @@ func TestClientManifestUri(t *testing.T) {
 	c.options.SiteUrl = "http://myhost/foo"
 
 	assert.True(t, strings.HasPrefix(c.ClientManifestUri(), "/foo/manifest.json?2e5b4b86"))
+}
+
+func TestClientAssets_Missing(t *testing.T) {
+	t.Run("Complete", func(t *testing.T) {
+		a := &ClientAssets{AppCss: "app.css", AppJs: "app.js", ShareJs: "share.js"}
+		assert.Empty(t, a.Missing())
+	})
+	t.Run("Partial", func(t *testing.T) {
+		a := &ClientAssets{AppCss: "app.css"}
+		assert.Equal(t, []string{"app.js", "share.js"}, a.Missing())
+	})
+	t.Run("Empty", func(t *testing.T) {
+		assert.Equal(t, []string{"app.css", "app.js", "share.js"}, (&ClientAssets{}).Missing())
+	})
+}
+
+func TestClientAssets_SplashJs(t *testing.T) {
+	t.Run("ShareOnly", func(t *testing.T) {
+		a := &ClientAssets{BaseUri: "/static", ShareJs: "share.js"}
+		assert.Equal(t, "", a.SplashJsUri())
+		assert.Equal(t, "", a.SplashJsFile())
+	})
+	t.Run("SplashOnly", func(t *testing.T) {
+		a := &ClientAssets{BaseUri: "/static", SplashJs: "splash.js"}
+		assert.Equal(t, "/static/build/splash.js", a.SplashJsUri())
+		assert.Equal(t, "splash.js", a.SplashJsFile())
+	})
 }

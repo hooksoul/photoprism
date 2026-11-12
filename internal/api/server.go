@@ -2,39 +2,42 @@ package api
 
 import (
 	"net/http"
-	"os"
-	"syscall"
 
 	"github.com/gin-gonic/gin"
 
-	"github.com/photoprism/photoprism/internal/acl"
-	"github.com/photoprism/photoprism/internal/get"
+	"github.com/photoprism/photoprism/internal/auth/acl"
+	"github.com/photoprism/photoprism/internal/photoprism/get"
+	"github.com/photoprism/photoprism/internal/server/process"
 )
 
-// StopServer shuts down the server.
+// StopServer allows authorized admins to restart the server.
 //
-// POST /api/v1/server/stop
+//	@Summary	allows authorized admins to restart the server
+//	@Id			StopServer
+//	@Tags		Internal
+//	@Produce	json
+//	@Success	200		{object}	config.Options
+//	@Failure	401,403	{object}	i18n.Response
+//	@Router		/api/v1/server/stop [post]
 func StopServer(router *gin.RouterGroup) {
 	router.POST("/server/stop", func(c *gin.Context) {
 		s := Auth(c, acl.ResourceConfig, acl.ActionManage)
+
 		conf := get.Config()
 
-		// Abort if permission was not granted.
+		// Abort if permission is not granted.
 		if s.Invalid() || conf.Public() || conf.DisableSettings() || conf.DisableRestart() {
 			AbortForbidden(c)
 			return
 		}
 
-		process, err := os.FindProcess(os.Getpid())
-		if err != nil {
-			c.AbortWithStatusJSON(http.StatusInternalServerError, NewResponse(http.StatusInternalServerError, err, ""))
-			return
-		} else {
-			c.JSON(http.StatusOK, conf.Options())
-		}
+		options := conf.RedactedOptions()
 
-		if err = process.Signal(syscall.SIGTERM); err != nil {
-			log.Errorf("server: %s", err)
-		}
+		// Trigger restart.
+		//
+		// Note that this requires an entrypoint script or other process to
+		// spawns a new instance when the server exists with status code 1.
+		c.JSON(http.StatusOK, options)
+		process.Restart()
 	})
 }

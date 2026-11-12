@@ -4,17 +4,19 @@ import (
 	"strings"
 	"time"
 
-	"github.com/photoprism/photoprism/internal/acl"
-	"github.com/photoprism/photoprism/internal/customize"
+	"github.com/photoprism/photoprism/internal/auth/acl"
+	"github.com/photoprism/photoprism/internal/auth/tokens"
+	"github.com/photoprism/photoprism/internal/config/customize"
 	"github.com/photoprism/photoprism/internal/entity"
-	"github.com/photoprism/photoprism/internal/query"
-	"github.com/photoprism/photoprism/pkg/colors"
-	"github.com/photoprism/photoprism/pkg/env"
+	"github.com/photoprism/photoprism/internal/entity/query"
+	"github.com/photoprism/photoprism/pkg/media/colors"
 	"github.com/photoprism/photoprism/pkg/txt"
 )
 
+// ClientType identifies which flavor of client (public/share/user) a configuration describes.
 type ClientType string
 
+// Available client configuration types.
 const (
 	ClientPublic ClientType = "public"
 	ClientShare  ClientType = "share"
@@ -31,17 +33,20 @@ type ClientConfig struct {
 	Copyright        string              `json:"copyright"`
 	Flags            string              `json:"flags"`
 	BaseUri          string              `json:"baseUri"`
+	FrontendUri      string              `json:"frontendUri"`
+	StorageNamespace string              `json:"storageNamespace"`
 	StaticUri        string              `json:"staticUri"`
+	ClientAssets     *ClientAssets       `json:"-"`
 	CssUri           string              `json:"cssUri"`
 	JsUri            string              `json:"jsUri"`
 	ManifestUri      string              `json:"manifestUri"`
 	ApiUri           string              `json:"apiUri"`
 	ContentUri       string              `json:"contentUri"`
 	VideoUri         string              `json:"videoUri"`
-	WallpaperUri     string              `json:"wallpaperUri"`
 	SiteUrl          string              `json:"siteUrl"`
 	SiteDomain       string              `json:"siteDomain"`
 	SiteAuthor       string              `json:"siteAuthor"`
+	SiteName         string              `json:"siteName"`
 	SiteTitle        string              `json:"siteTitle"`
 	SiteCaption      string              `json:"siteCaption"`
 	SiteDescription  string              `json:"siteDescription"`
@@ -51,30 +56,38 @@ type ClientConfig struct {
 	AppName          string              `json:"appName"`
 	AppMode          string              `json:"appMode"`
 	AppIcon          string              `json:"appIcon"`
+	AppTouchIcon     string              `json:"appTouchIcon"`
 	AppColor         string              `json:"appColor"`
+	DefaultLocale    string              `json:"defaultLocale"`
+	DefaultTimezone  string              `json:"defaultTimezone"`
+	WallpaperUri     string              `json:"wallpaperUri"`
 	Restart          bool                `json:"restart"`
 	Debug            bool                `json:"debug"`
 	Trace            bool                `json:"trace"`
 	Test             bool                `json:"test"`
 	Demo             bool                `json:"demo"`
+	Portal           bool                `json:"portal"`
 	Sponsor          bool                `json:"sponsor"`
 	ReadOnly         bool                `json:"readonly"`
 	UploadNSFW       bool                `json:"uploadNSFW"`
+	UploadAllow      string              `json:"uploadAllow"`
 	Public           bool                `json:"public"`
 	AuthMode         string              `json:"authMode"`
+	OAuthApps        bool                `json:"oauthApps"`
 	UsersPath        string              `json:"usersPath"`
 	LoginUri         string              `json:"loginUri"`
+	LoginInfo        string              `json:"loginInfo"`
 	RegisterUri      string              `json:"registerUri"`
 	PasswordLength   int                 `json:"passwordLength"`
 	PasswordResetUri string              `json:"passwordResetUri"`
+	Develop          bool                `json:"develop"`
 	Experimental     bool                `json:"experimental"`
 	AlbumCategories  []string            `json:"albumCategories"`
-	Albums           entity.Albums       `json:"albums"`
 	Cameras          entity.Cameras      `json:"cameras"`
 	Lenses           entity.Lenses       `json:"lenses"`
 	Countries        entity.Countries    `json:"countries"`
-	People           entity.People       `json:"people"`
 	Thumbs           ThumbSizes          `json:"thumbs"`
+	ThumbLimit       int                 `json:"thumbLimit"`
 	Tier             int                 `json:"tier"`
 	Membership       string              `json:"membership"`
 	Customer         string              `json:"customer"`
@@ -83,24 +96,47 @@ type ClientConfig struct {
 	PreviewToken     string              `json:"previewToken,omitempty"`
 	Disable          ClientDisable       `json:"disable"`
 	Count            ClientCounts        `json:"count"`
-	Pos              ClientPosition      `json:"pos"`
 	Years            Years               `json:"years"`
 	Colors           []map[string]string `json:"colors"`
 	Categories       CategoryLabels      `json:"categories"`
 	Clip             int                 `json:"clip"`
-	Server           env.Resources       `json:"server"`
+	Usage            Usage               `json:"usage"`
 	Settings         *customize.Settings `json:"settings,omitempty"`
 	ACL              acl.Grants          `json:"acl,omitempty"`
+	McpRoles         []string            `json:"mcpRoles,omitempty"`
 	Ext              Values              `json:"ext"`
 }
 
 // ApplyACL updates the client config values based on the ACL and Role provided.
-func (c ClientConfig) ApplyACL(a acl.ACL, r acl.Role) ClientConfig {
+func (c *ClientConfig) ApplyACL(a acl.ACL, r acl.Role) *ClientConfig {
 	if c.Settings != nil {
 		c.Settings = c.Settings.ApplyACL(a, r)
 	}
 
 	c.ACL = a.Grants(r)
+
+	// Roles that may access all accounts also receive the user roles that may use MCP, for the account dialogs.
+	if c.ACL[acl.ResourceUsers].Allow(acl.AccessAll) {
+		c.McpRoles = acl.UserRoles.Allowed(a, acl.ResourceMCP, acl.ActionView)
+	} else {
+		c.McpRoles = nil
+	}
+
+	if !c.ACL[acl.ResourceUsers].Allow(acl.ActionView) {
+		c.Usage.UsersFreePct = -1
+		c.Usage.UsersUsedPct = -1
+	}
+
+	// Storage usage stays with the roles that act on it: managing pictures shows the usage bar, and
+	// uploading needs the quota state so the upload and import actions can be disabled when full.
+	if !c.ACL[acl.ResourcePhotos].Allow(acl.ActionManage) && !c.ACL[acl.ResourcePhotos].Allow(acl.ActionUpload) {
+		c.Usage.StorageLow = false
+		c.Usage.FilesUsed = 0
+		c.Usage.FilesUsedPct = -1
+		c.Usage.FilesFree = 0
+		c.Usage.FilesFreePct = -1
+		c.Usage.FilesTotal = 0
+	}
 
 	return c
 }
@@ -110,16 +146,19 @@ type Years []int
 
 // ClientDisable represents disabled client features a user cannot turn back on.
 type ClientDisable struct {
+	Restart        bool `json:"restart"`
 	WebDAV         bool `json:"webdav"`
+	MCP            bool `json:"mcp"`
 	Settings       bool `json:"settings"`
 	Places         bool `json:"places"`
 	Backups        bool `json:"backups"`
 	TensorFlow     bool `json:"tensorflow"`
 	Faces          bool `json:"faces"`
 	Classification bool `json:"classification"`
-	Sips           bool `json:"sips"`
 	FFmpeg         bool `json:"ffmpeg"`
 	ExifTool       bool `json:"exiftool"`
+	Vips           bool `json:"vips"`
+	Sips           bool `json:"sips"`
 	Darktable      bool `json:"darktable"`
 	RawTherapee    bool `json:"rawtherapee"`
 	ImageMagick    bool `json:"imagemagick"`
@@ -133,12 +172,17 @@ type ClientDisable struct {
 type ClientCounts struct {
 	All            int `json:"all"`
 	Photos         int `json:"photos"`
+	Media          int `json:"media"`
+	Animated       int `json:"animated"`
 	Live           int `json:"live"`
+	Audio          int `json:"audio"`
 	Videos         int `json:"videos"`
+	Documents      int `json:"documents"`
 	Cameras        int `json:"cameras"`
 	Lenses         int `json:"lenses"`
 	Countries      int `json:"countries"`
 	Hidden         int `json:"hidden"`
+	Archived       int `json:"archived"`
 	Favorites      int `json:"favorites"`
 	Review         int `json:"review"`
 	Stories        int `json:"stories"`
@@ -160,20 +204,13 @@ type ClientCounts struct {
 	LabelMaxPhotos int `json:"labelMaxPhotos"`
 }
 
+// CategoryLabels enumerates label metadata exposed to the client for navigation buckets.
 type CategoryLabels []CategoryLabel
 
+// CategoryLabel contains the slug and name for a single label entry surfaced to the client.
 type CategoryLabel struct {
-	LabelUID   string `json:"UID"`
 	CustomSlug string `json:"Slug"`
 	LabelName  string `json:"Name"`
-}
-
-type ClientPosition struct {
-	PhotoUID string    `json:"uid"`
-	CellID   string    `json:"cid"`
-	TakenAt  time.Time `json:"utc"`
-	PhotoLat float64   `json:"lat"`
-	PhotoLng float64   `json:"lng"`
 }
 
 // Flags returns config flags as string slice.
@@ -198,6 +235,10 @@ func (c *Config) Flags() (flags []string) {
 		flags = append(flags, "sponsor")
 	}
 
+	if c.Develop() {
+		flags = append(flags, "develop")
+	}
+
 	if c.Experimental() {
 		flags = append(flags, "experimental")
 	}
@@ -218,18 +259,26 @@ func (c *Config) Flags() (flags []string) {
 }
 
 // ClientPublic returns config values for use by the JavaScript UI and other clients.
-func (c *Config) ClientPublic() ClientConfig {
+func (c *Config) ClientPublic() *ClientConfig {
 	if c.Public() {
-		return c.ClientUser(true).ApplyACL(acl.Resources, acl.RoleAdmin)
+		cfg := c.ClientUser(true).ApplyACL(acl.Rules, acl.RoleAdmin)
+
+		// Tokens are otherwise assigned per session, so public mode sets them here.
+		cfg.PreviewToken = entity.TokenPublic
+		cfg.DownloadToken = entity.TokenPublic
+
+		return cfg
 	}
 
 	a := c.ClientAssets()
 
-	cfg := ClientConfig{
+	cfg := &ClientConfig{
 		Settings: c.PublicSettings(),
-		ACL:      acl.Resources.Grants(acl.RoleUnknown),
+		ACL:      acl.Rules.Grants(acl.RoleNone),
 		Disable: ClientDisable{
+			Restart:        true,
 			WebDAV:         true,
+			MCP:            c.DisableMCP(),
 			Settings:       c.DisableSettings(),
 			Places:         c.DisablePlaces(),
 			Backups:        true,
@@ -253,7 +302,10 @@ func (c *Config) ClientPublic() ClientConfig {
 		About:            c.About(),
 		Edition:          c.Edition(),
 		BaseUri:          c.BaseUri(""),
+		FrontendUri:      c.FrontendUri(""),
+		StorageNamespace: c.StorageNamespace(),
 		StaticUri:        c.StaticUri(),
+		ClientAssets:     a,
 		CssUri:           a.AppCssUri(),
 		JsUri:            a.AppJsUri(),
 		ApiUri:           c.ApiUri(),
@@ -262,6 +314,7 @@ func (c *Config) ClientPublic() ClientConfig {
 		SiteUrl:          c.SiteUrl(),
 		SiteDomain:       c.SiteDomain(),
 		SiteAuthor:       c.SiteAuthor(),
+		SiteName:         c.SiteName(),
 		SiteTitle:        c.SiteTitle(),
 		SiteCaption:      c.SiteCaption(),
 		SiteDescription:  c.SiteDescription(),
@@ -271,7 +324,10 @@ func (c *Config) ClientPublic() ClientConfig {
 		AppName:          c.AppName(),
 		AppMode:          c.AppMode(),
 		AppIcon:          c.AppIcon(),
+		AppTouchIcon:     c.AppTouchIcon(),
 		AppColor:         c.AppColor(),
+		DefaultLocale:    c.DefaultLocale(),
+		DefaultTimezone:  c.DefaultTimezone().String(),
 		WallpaperUri:     c.WallpaperUri(),
 		Version:          c.Version(),
 		Copyright:        c.Copyright(),
@@ -280,30 +336,30 @@ func (c *Config) ClientPublic() ClientConfig {
 		Trace:            c.Trace(),
 		Test:             c.Test(),
 		Demo:             c.Demo(),
+		Portal:           c.Portal(),
 		Sponsor:          c.Sponsor(),
 		ReadOnly:         c.ReadOnly(),
 		Public:           c.Public(),
 		AuthMode:         c.AuthMode(),
 		UsersPath:        c.UsersPath(),
 		LoginUri:         c.LoginUri(),
+		LoginInfo:        c.LoginInfo(),
 		RegisterUri:      c.RegisterUri(),
 		PasswordResetUri: c.PasswordResetUri(),
+		Develop:          c.Develop(),
 		Experimental:     c.Experimental(),
-		Albums:           entity.Albums{},
 		Cameras:          entity.Cameras{},
 		Lenses:           entity.Lenses{},
 		Countries:        entity.Countries{},
-		People:           entity.People{},
 		Tier:             c.Hub().Tier(),
 		Membership:       c.Hub().Membership(),
 		Customer:         "",
 		MapKey:           "",
 		Thumbs:           Thumbs,
+		ThumbLimit:       c.ThumbSizeLimit(),
 		Colors:           colors.All.List(),
 		ManifestUri:      c.ClientManifestUri(),
 		Clip:             txt.ClipDefault,
-		PreviewToken:     entity.TokenPublic,
-		DownloadToken:    entity.TokenPublic,
 		Ext:              ClientExt(c, ClientPublic),
 	}
 
@@ -311,14 +367,16 @@ func (c *Config) ClientPublic() ClientConfig {
 }
 
 // ClientShare returns reduced client config values for share link visitors.
-func (c *Config) ClientShare() ClientConfig {
+func (c *Config) ClientShare() *ClientConfig {
 	a := c.ClientAssets()
 
-	cfg := ClientConfig{
+	cfg := &ClientConfig{
 		Settings: c.ShareSettings(),
-		ACL:      acl.Resources.Grants(acl.RoleVisitor),
+		ACL:      acl.Rules.Grants(acl.RoleVisitor),
 		Disable: ClientDisable{
+			Restart:        true,
 			WebDAV:         c.DisableWebDAV(),
+			MCP:            c.DisableMCP(),
 			Settings:       c.DisableSettings(),
 			Places:         c.DisablePlaces(),
 			Backups:        true,
@@ -342,7 +400,10 @@ func (c *Config) ClientShare() ClientConfig {
 		About:            c.About(),
 		Edition:          c.Edition(),
 		BaseUri:          c.BaseUri(""),
+		FrontendUri:      c.FrontendUri(""),
+		StorageNamespace: c.StorageNamespace(),
 		StaticUri:        c.StaticUri(),
+		ClientAssets:     a,
 		CssUri:           a.AppCssUri(),
 		JsUri:            a.ShareJsUri(),
 		ApiUri:           c.ApiUri(),
@@ -351,6 +412,7 @@ func (c *Config) ClientShare() ClientConfig {
 		SiteUrl:          c.SiteUrl(),
 		SiteDomain:       c.SiteDomain(),
 		SiteAuthor:       c.SiteAuthor(),
+		SiteName:         c.SiteName(),
 		SiteTitle:        c.SiteTitle(),
 		SiteCaption:      c.SiteCaption(),
 		SiteDescription:  c.SiteDescription(),
@@ -360,7 +422,10 @@ func (c *Config) ClientShare() ClientConfig {
 		AppName:          c.AppName(),
 		AppMode:          c.AppMode(),
 		AppIcon:          c.AppIcon(),
+		AppTouchIcon:     c.AppTouchIcon(),
 		AppColor:         c.AppColor(),
+		DefaultLocale:    c.DefaultLocale(),
+		DefaultTimezone:  c.DefaultTimezone().String(),
 		WallpaperUri:     c.WallpaperUri(),
 		Version:          c.Version(),
 		Copyright:        c.Copyright(),
@@ -369,29 +434,30 @@ func (c *Config) ClientShare() ClientConfig {
 		Trace:            c.Trace(),
 		Test:             c.Test(),
 		Demo:             c.Demo(),
+		Portal:           c.Portal(),
 		Sponsor:          c.Sponsor(),
 		ReadOnly:         c.ReadOnly(),
 		UploadNSFW:       c.UploadNSFW(),
+		UploadAllow:      c.UploadAllow().Accept(),
 		Public:           c.Public(),
 		AuthMode:         c.AuthMode(),
 		UsersPath:        "",
 		LoginUri:         c.LoginUri(),
+		LoginInfo:        c.LoginInfo(),
 		RegisterUri:      c.RegisterUri(),
 		PasswordResetUri: c.PasswordResetUri(),
+		Develop:          c.Develop(),
 		Experimental:     c.Experimental(),
-		Albums:           entity.Albums{},
 		Cameras:          entity.Cameras{},
 		Lenses:           entity.Lenses{},
 		Countries:        entity.Countries{},
-		People:           entity.People{},
 		Colors:           colors.All.List(),
 		Thumbs:           Thumbs,
+		ThumbLimit:       c.ThumbSizeLimit(),
 		Tier:             c.Hub().Tier(),
 		Membership:       c.Hub().Membership(),
 		Customer:         c.Hub().Customer(),
 		MapKey:           c.Hub().MapKey(),
-		DownloadToken:    c.DownloadToken(),
-		PreviewToken:     c.PreviewToken(),
 		ManifestUri:      c.ClientManifestUri(),
 		Clip:             txt.ClipDefault,
 		Ext:              ClientExt(c, ClientShare),
@@ -401,7 +467,7 @@ func (c *Config) ClientShare() ClientConfig {
 }
 
 // ClientUser returns complete client config values for users with full access.
-func (c *Config) ClientUser(withSettings bool) ClientConfig {
+func (c *Config) ClientUser(withSettings bool) *ClientConfig {
 	a := c.ClientAssets()
 
 	var s *customize.Settings
@@ -410,19 +476,22 @@ func (c *Config) ClientUser(withSettings bool) ClientConfig {
 		s = c.Settings()
 	}
 
-	cfg := ClientConfig{
+	cfg := &ClientConfig{
 		Settings: s,
 		Disable: ClientDisable{
-			WebDAV:         c.DisableWebDAV(),
 			Settings:       c.DisableSettings(),
-			Places:         c.DisablePlaces(),
 			Backups:        c.DisableBackups(),
+			Restart:        c.DisableRestart(),
+			WebDAV:         c.DisableWebDAV(),
+			MCP:            c.DisableMCP(),
+			Places:         c.DisablePlaces(),
 			TensorFlow:     c.DisableTensorFlow(),
 			Faces:          c.DisableFaces(),
 			Classification: c.DisableClassification(),
-			Sips:           c.DisableSips(),
 			FFmpeg:         c.DisableFFmpeg(),
 			ExifTool:       c.DisableExifTool(),
+			Vips:           c.DisableVips(),
+			Sips:           c.DisableSips(),
 			Darktable:      c.DisableDarktable(),
 			RawTherapee:    c.DisableRawTherapee(),
 			ImageMagick:    c.DisableImageMagick(),
@@ -437,7 +506,10 @@ func (c *Config) ClientUser(withSettings bool) ClientConfig {
 		About:            c.About(),
 		Edition:          c.Edition(),
 		BaseUri:          c.BaseUri(""),
+		FrontendUri:      c.FrontendUri(""),
+		StorageNamespace: c.StorageNamespace(),
 		StaticUri:        c.StaticUri(),
+		ClientAssets:     a,
 		CssUri:           a.AppCssUri(),
 		JsUri:            a.AppJsUri(),
 		ApiUri:           c.ApiUri(),
@@ -446,6 +518,7 @@ func (c *Config) ClientUser(withSettings bool) ClientConfig {
 		SiteUrl:          c.SiteUrl(),
 		SiteDomain:       c.SiteDomain(),
 		SiteAuthor:       c.SiteAuthor(),
+		SiteName:         c.SiteName(),
 		SiteTitle:        c.SiteTitle(),
 		SiteCaption:      c.SiteCaption(),
 		SiteDescription:  c.SiteDescription(),
@@ -455,7 +528,10 @@ func (c *Config) ClientUser(withSettings bool) ClientConfig {
 		AppName:          c.AppName(),
 		AppMode:          c.AppMode(),
 		AppIcon:          c.AppIcon(),
+		AppTouchIcon:     c.AppTouchIcon(),
 		AppColor:         c.AppColor(),
+		DefaultLocale:    c.DefaultLocale(),
+		DefaultTimezone:  c.DefaultTimezone().String(),
 		WallpaperUri:     c.WallpaperUri(),
 		Version:          c.Version(),
 		Copyright:        c.Copyright(),
@@ -464,45 +540,42 @@ func (c *Config) ClientUser(withSettings bool) ClientConfig {
 		Trace:            c.Trace(),
 		Test:             c.Test(),
 		Demo:             c.Demo(),
+		Portal:           c.Portal(),
 		Sponsor:          c.Sponsor(),
 		ReadOnly:         c.ReadOnly(),
 		UploadNSFW:       c.UploadNSFW(),
+		UploadAllow:      c.UploadAllow().Accept(),
 		Public:           c.Public(),
 		AuthMode:         c.AuthMode(),
+		OAuthApps:        c.OAuthAppsEnabled(),
 		UsersPath:        c.UsersPath(),
 		LoginUri:         c.LoginUri(),
+		LoginInfo:        c.LoginInfo(),
 		RegisterUri:      c.RegisterUri(),
 		PasswordLength:   c.PasswordLength(),
 		PasswordResetUri: c.PasswordResetUri(),
+		Develop:          c.Develop(),
 		Experimental:     c.Experimental(),
-		Albums:           entity.Albums{},
 		Cameras:          entity.Cameras{},
 		Lenses:           entity.Lenses{},
 		Countries:        entity.Countries{},
-		People:           entity.People{},
 		Colors:           colors.All.List(),
 		Thumbs:           Thumbs,
+		ThumbLimit:       c.ThumbSizeLimit(),
 		Tier:             c.Hub().Tier(),
 		Membership:       c.Hub().Membership(),
 		Customer:         c.Hub().Customer(),
 		MapKey:           c.Hub().MapKey(),
-		DownloadToken:    c.DownloadToken(),
-		PreviewToken:     c.PreviewToken(),
 		ManifestUri:      c.ClientManifestUri(),
 		Clip:             txt.ClipDefault,
-		Server:           env.Info(),
+		Usage:            c.Usage(),
 		Ext:              ClientExt(c, ClientUser),
 	}
 
-	hidePrivate := c.Settings().Features.Private
+	// Query start time.
+	start := time.Now()
 
-	c.Db().
-		Table("photos").
-		Select("photo_uid, cell_id, photo_lat, photo_lng, taken_at").
-		Where("deleted_at IS NULL AND photo_lat <> 0 AND photo_lng <> 0").
-		Order("taken_at DESC").
-		Limit(1).Offset(0).
-		Take(&cfg.Pos)
+	hidePrivate := c.Settings().Features.Private
 
 	c.Db().
 		Table("cameras").
@@ -519,35 +592,53 @@ func (c *Config) ClientUser(withSettings bool) ClientConfig {
 	if hidePrivate {
 		c.Db().
 			Table("photos").
-			Select("SUM(photo_type = 'video' AND photo_quality > -1 AND photo_private = 0) AS videos, " +
-				"SUM(photo_type = 'live' AND photo_quality > -1 AND photo_private = 0) AS live, " +
-				"SUM(photo_quality = -1) AS hidden, SUM(photo_type IN ('image','animated','vector','raw') AND photo_private = 0 AND photo_quality > -1) AS photos, " +
-				"SUM(photo_type IN ('image','live','animated','vector','raw') AND photo_quality < 3 AND photo_quality > -1 AND photo_private = 0) AS review, " +
-				"SUM(photo_favorite = 1 AND photo_private = 0 AND photo_quality > -1) AS favorites, " +
-				"SUM(photo_private = 1 AND photo_quality > -1) AS private").
-			Where("photos.id NOT IN (SELECT photo_id FROM files WHERE file_primary = 1 AND (file_missing = 1 OR file_error <> ''))").
+			Select("COUNT(CASE WHEN photo_type = 'animated' AND photo_quality > -1 AND photo_private = FALSE THEN 1 END) AS animated, " +
+				"COUNT(CASE WHEN photo_type = 'video' AND photo_quality > -1 AND photo_private = FALSE THEN 1 END) AS videos, " +
+				"COUNT(CASE WHEN photo_type = 'live' AND photo_quality > -1 AND photo_private = FALSE THEN 1 END) AS live, " +
+				"COUNT(CASE WHEN photo_type = 'audio' AND photo_quality > -1 AND photo_private = FALSE THEN 1 END) AS audio, " +
+				"COUNT(CASE WHEN photo_type = 'document' AND photo_quality > -1 AND photo_private = FALSE THEN 1 END) AS documents, " +
+				"COUNT(CASE WHEN photo_quality = -1 THEN 1 END) AS hidden, " +
+				"COUNT(CASE WHEN photo_type NOT IN ('animated','video','live','audio','document') AND photo_quality > -1 AND photo_private = FALSE THEN 1 END) AS photos, " +
+				"COUNT(CASE WHEN photo_quality BETWEEN 0 AND 2 THEN 1 END) AS review, " +
+				"COUNT(CASE WHEN photo_favorite = TRUE AND photo_private = FALSE AND photo_quality > -1 THEN 1 END) AS favorites, " +
+				"COUNT(CASE WHEN photo_private = TRUE AND photo_quality > -1 THEN 1 END) AS private").
+			Where("photos.id NOT IN (SELECT photo_id FROM files WHERE file_primary = TRUE AND (file_missing = TRUE OR file_error <> ''))").
 			Where("deleted_at IS NULL").
 			Take(&cfg.Count)
 	} else {
 		c.Db().
 			Table("photos").
-			Select("SUM(photo_type = 'video' AND photo_quality > -1) AS videos, " +
-				"SUM(photo_type = 'live' AND photo_quality > -1) AS live, " +
-				"SUM(photo_quality = -1) AS hidden, SUM(photo_type IN ('image','raw','animated') AND photo_quality > -1) AS photos, " +
-				"SUM(photo_type IN ('image','raw','live','animated') AND photo_quality < 3 AND photo_quality > -1) AS review, " +
-				"SUM(photo_favorite = 1 AND photo_quality > -1) AS favorites, " +
+			Select("COUNT(CASE WHEN photo_type = 'animated' AND photo_quality > -1 THEN 1 END) AS animated, " +
+				"COUNT(CASE WHEN photo_type = 'video' AND photo_quality > -1 THEN 1 END) AS videos, " +
+				"COUNT(CASE WHEN photo_type = 'live' AND photo_quality > -1 THEN 1 END) AS live, " +
+				"COUNT(CASE WHEN photo_type = 'audio' AND photo_quality > -1 THEN 1 END) AS audio, " +
+				"COUNT(CASE WHEN photo_type = 'document' AND photo_quality > -1 THEN 1 END) AS documents, " +
+				"COUNT(CASE WHEN photo_quality = -1 THEN 1 END) AS hidden, " +
+				"COUNT(CASE WHEN photo_type NOT IN ('animated','video','live','audio','document') AND photo_quality > -1 THEN 1 END) AS photos, " +
+				"COUNT(CASE WHEN photo_quality BETWEEN 0 AND 2 THEN 1 END) AS review, " +
+				"COUNT(CASE WHEN photo_favorite = TRUE AND photo_quality > -1 THEN 1 END) AS favorites, " +
 				"0 AS private").
-			Where("photos.id NOT IN (SELECT photo_id FROM files WHERE file_primary = 1 AND (file_missing = 1 OR file_error <> ''))").
+			Where("photos.id NOT IN (SELECT photo_id FROM files WHERE file_primary = TRUE AND (file_missing = TRUE OR file_error <> ''))").
 			Where("deleted_at IS NULL").
 			Take(&cfg.Count)
 	}
 
-	// Calculate total count.
-	cfg.Count.All = cfg.Count.Photos + cfg.Count.Live + cfg.Count.Videos
+	// Get number of archived pictures.
+	if c.Settings().Features.Archive {
+		c.Db().
+			Table("photos").
+			Select("COUNT(CASE WHEN photo_quality > -1 THEN 1 END) AS archived").
+			Where("deleted_at IS NOT NULL").
+			Take(&cfg.Count)
+	}
+
+	// Calculate total counts.
+	cfg.Count.Media = cfg.Count.Animated + cfg.Count.Live + cfg.Count.Videos + cfg.Count.Audio
+	cfg.Count.All = cfg.Count.Photos + cfg.Count.Media + cfg.Count.Documents
 
 	// Exclude pictures in review from total count.
 	if c.Settings().Features.Review {
-		cfg.Count.All = cfg.Count.All - cfg.Count.Review
+		cfg.Count.All -= cfg.Count.Review
 	}
 
 	c.Db().
@@ -555,21 +646,35 @@ func (c *Config) ClientUser(withSettings bool) ClientConfig {
 		Select("MAX(photo_count) AS label_max_photos, COUNT(*) AS labels").
 		Where("photo_count > 0").
 		Where("deleted_at IS NULL").
-		Where("(label_priority >= 0 OR label_favorite = 1)").
+		Where("(labels.label_priority >= 0 AND labels.photo_count > 1 OR labels.label_favorite = TRUE)").
 		Take(&cfg.Count)
 
 	if hidePrivate {
 		c.Db().
 			Table("albums").
-			Select("SUM(album_type = ?) AS albums, SUM(album_type = ?) AS moments, SUM(album_type = ?) AS months, SUM(album_type = ?) AS states, SUM(album_type = ?) AS folders, "+
-				"SUM(album_type = ? AND album_private = 1) AS private_albums, SUM(album_type = ? AND album_private = 1) AS private_moments, SUM(album_type = ? AND album_private = 1) AS private_months, SUM(album_type = ? AND album_private = 1) AS private_states, SUM(album_type = ? AND album_private = 1) AS private_folders",
-				entity.AlbumManual, entity.AlbumMoment, entity.AlbumMonth, entity.AlbumState, entity.AlbumFolder, entity.AlbumManual, entity.AlbumMoment, entity.AlbumMonth, entity.AlbumState, entity.AlbumFolder).
-			Where("deleted_at IS NULL AND (albums.album_type <> 'folder' OR albums.album_path IN (SELECT photos.photo_path FROM photos WHERE photos.photo_private = 0 AND photos.deleted_at IS NULL))").
+			Select("COUNT(CASE WHEN album_type = ? THEN 1 END) AS albums, "+
+				"COUNT(CASE WHEN album_type = ? THEN 1 END) AS moments, "+
+				"COUNT(CASE WHEN album_type = ? THEN 1 END) AS months, "+
+				"COUNT(CASE WHEN album_type = ? THEN 1 END) AS states, "+
+				"COUNT(CASE WHEN album_type = ? THEN 1 END) AS folders, "+
+				"COUNT(CASE WHEN album_type = ? AND album_private = TRUE THEN 1 END) AS private_albums, "+
+				"COUNT(CASE WHEN album_type = ? AND album_private = TRUE THEN 1 END) AS private_moments, "+
+				"COUNT(CASE WHEN album_type = ? AND album_private = TRUE THEN 1 END) AS private_months, "+
+				"COUNT(CASE WHEN album_type = ? AND album_private = TRUE THEN 1 END) AS private_states, "+
+				"COUNT(CASE WHEN album_type = ? AND album_private = TRUE THEN 1 END) AS private_folders",
+				entity.AlbumManual, entity.AlbumMoment, entity.AlbumMonth, entity.AlbumState, entity.AlbumFolder,
+				entity.AlbumManual, entity.AlbumMoment, entity.AlbumMonth, entity.AlbumState, entity.AlbumFolder).
+			Where("deleted_at IS NULL AND (albums.album_type <> 'folder' OR albums.album_path IN (SELECT photos.photo_path FROM photos WHERE photos.photo_private = FALSE AND photos.deleted_at IS NULL))").
 			Take(&cfg.Count)
 	} else {
 		c.Db().
 			Table("albums").
-			Select("SUM(album_type = ?) AS albums, SUM(album_type = ?) AS moments, SUM(album_type = ?) AS months, SUM(album_type = ?) AS states, SUM(album_type = ?) AS folders", entity.AlbumManual, entity.AlbumMoment, entity.AlbumMonth, entity.AlbumState, entity.AlbumFolder).
+			Select("COUNT(CASE WHEN album_type = ? THEN 1 END) AS albums, "+
+				"COUNT(CASE WHEN album_type = ? THEN 1 END) AS moments, "+
+				"COUNT(CASE WHEN album_type = ? THEN 1 END) AS months, "+
+				"COUNT(CASE WHEN album_type = ? THEN 1 END) AS states, "+
+				"COUNT(CASE WHEN album_type = ? THEN 1 END) AS folders",
+				entity.AlbumManual, entity.AlbumMoment, entity.AlbumMonth, entity.AlbumState, entity.AlbumFolder).
 			Where("deleted_at IS NULL AND (albums.album_type <> 'folder' OR albums.album_path IN (SELECT photos.photo_path FROM photos WHERE photos.deleted_at IS NULL))").
 			Take(&cfg.Count)
 	}
@@ -577,7 +682,7 @@ func (c *Config) ClientUser(withSettings bool) ClientConfig {
 	c.Db().
 		Table("files").
 		Select("COUNT(*) AS files").
-		Where("file_missing = 0 AND file_root = ? AND deleted_at IS NULL", entity.RootOriginals).
+		Where("file_missing = FALSE AND file_root = ? AND deleted_at IS NULL", entity.RootOriginals).
 		Take(&cfg.Count)
 
 	c.Db().
@@ -587,7 +692,7 @@ func (c *Config) ClientUser(withSettings bool) ClientConfig {
 
 	c.Db().
 		Table("places").
-		Select("SUM(photo_count > 0) AS places").
+		Select("COUNT(CASE WHEN photo_count > 0 THEN 1 END) AS places").
 		Where("id <> 'zz'").
 		Take(&cfg.Count)
 
@@ -597,10 +702,10 @@ func (c *Config) ClientUser(withSettings bool) ClientConfig {
 
 	// People are subjects with type person.
 	cfg.Count.People, _ = query.PeopleCount()
-	cfg.People, _ = query.People()
 
+	// Cameras added manually are included even if no picture references them yet.
 	c.Db().
-		Where("id IN (SELECT photos.camera_id FROM photos WHERE photos.photo_quality > -1 OR photos.deleted_at IS NULL)").
+		Where("id IN (SELECT photos.camera_id FROM photos WHERE photos.photo_quality > -1 OR photos.deleted_at IS NULL) OR camera_src = ?", entity.SrcManual).
 		Where("deleted_at IS NULL").
 		Limit(10000).Order("camera_slug").
 		Find(&cfg.Cameras)
@@ -611,24 +716,21 @@ func (c *Config) ClientUser(withSettings bool) ClientConfig {
 		Find(&cfg.Lenses)
 
 	c.Db().
-		Where("deleted_at IS NULL AND album_favorite = 1").
-		Limit(20).Order("album_title").
-		Find(&cfg.Albums)
-
-	c.Db().
 		Table("photos").
 		Where("photo_year > 0 AND (photos.photo_quality > -1 OR photos.deleted_at IS NULL)").
 		Order("photo_year DESC").
 		Pluck("DISTINCT photo_year", &cfg.Years)
 
+	cfg.Categories = make(CategoryLabels, 0)
+
 	c.Db().
 		Table("categories").
-		Select("l.label_uid, l.custom_slug, l.label_name").
+		Select("l.custom_slug, l.label_name").
 		Joins("JOIN labels l ON categories.category_id = l.id").
 		Where("l.deleted_at IS NULL").
-		Group("l.custom_slug, l.label_uid, l.label_name").
+		Group("l.custom_slug, l.label_name").
 		Order("l.custom_slug").
-		Limit(1000).Offset(0).
+		Limit(10000).Offset(0).
 		Scan(&cfg.Categories)
 
 	c.Db().
@@ -637,34 +739,87 @@ func (c *Config) ClientUser(withSettings bool) ClientConfig {
 		Where("deleted_at IS NULL AND album_category <> ''").
 		Group("album_category").
 		Order("album_category").
-		Limit(1000).Offset(0).
+		Limit(10000).Offset(0).
 		Pluck("album_category", &cfg.AlbumCategories)
+
+	// Lists without values are serialized as null, as the frontend expects.
+	if len(cfg.Years) == 0 {
+		cfg.Years = nil
+	}
+
+	if len(cfg.AlbumCategories) == 0 {
+		cfg.AlbumCategories = nil
+	}
+
+	// Trace log for performance measurement.
+	log.Tracef("config: updated counts [%s]", time.Since(start))
 
 	return cfg
 }
 
 // ClientRole provides the client config values for the specified user role.
-func (c *Config) ClientRole(role acl.Role) ClientConfig {
-	return c.ClientUser(true).ApplyACL(acl.Resources, role)
+func (c *Config) ClientRole(role acl.Role) *ClientConfig {
+	return c.ClientUser(true).ApplyACL(acl.Rules, role)
+}
+
+// ClientOAuth provides the client config values for a session of an OAuth2 client without an account,
+// which loads previews from the API rather than a CDN. ClientSession assigns its tokens.
+func (c *Config) ClientOAuth(sess *entity.Session) *ClientConfig {
+	cfg := c.ClientUser(false).ApplyACL(acl.Rules, sess.GetClientRole())
+	cfg.Settings = c.SessionSettings(sess)
+	cfg.ContentUri = c.ApiUri()
+	cfg.VideoUri = c.ApiUri()
+
+	return cfg
 }
 
 // ClientSession provides the client config values for the specified session.
-func (c *Config) ClientSession(sess *entity.Session) (cfg ClientConfig) {
-	if sess.User().IsVisitor() {
+func (c *Config) ClientSession(sess *entity.Session) (cfg *ClientConfig) {
+	switch {
+	case sess.NoUser() && sess.IsClient():
+		cfg = c.ClientOAuth(sess)
+	case sess.GetUser().IsVisitor():
 		cfg = c.ClientShare()
-	} else if sess.User().IsRegistered() {
-		cfg = c.ClientUser(false).ApplyACL(acl.Resources, sess.User().AclRole())
+	case sess.GetUser().IsRegistered():
+		cfg = c.ClientUser(false).ApplyACL(acl.Rules, sess.GetUserRole())
 		cfg.Settings = c.SessionSettings(sess)
-	} else {
+	default:
 		cfg = c.ClientPublic()
 	}
 
-	if c.Public() {
+	switch {
+	case c.Public():
 		cfg.PreviewToken = entity.TokenPublic
 		cfg.DownloadToken = entity.TokenPublic
-	} else if sess.PreviewToken != "" || sess.DownloadToken != "" {
+	case sess.SignedPreview():
+		// A client session without an account receives a signed preview token bound to the session, and
+		// none if its scope or role does not cover previews.
+		cfg.PreviewToken = ""
+
+		if sess.ScopePermitsPreview() && sess.RolePermitsPreview() {
+			cfg.PreviewToken = tokens.PreviewToken(sess.ID, sess.ExpiresAt())
+		}
+
+		cfg.DownloadToken = ""
+
+		if sess.ScopePermitsDownload() {
+			cfg.DownloadToken = tokens.DownloadToken(sess.ID)
+		}
+	case sess.PreviewToken != "":
 		cfg.PreviewToken = sess.PreviewToken
-		cfg.DownloadToken = sess.DownloadToken
+
+		// The download token is the "?t=" value: a signed, session-bound token so header-less download
+		// endpoints can scope the response to this session. It is delivered only when the session's scope
+		// covers a downloadable resource; the endpoints apply their own scope check.
+		if sess.ScopePermitsDownload() {
+			cfg.DownloadToken = tokens.DownloadToken(sess.ID)
+		}
+	default:
+		// A session without its own preview token receives neither token: the instance-wide values stay
+		// registered and accepted, so existing URLs keep working, but they are not handed to a caller
+		// that has no token of its own.
+		cfg.PreviewToken = ""
+		cfg.DownloadToken = ""
 	}
 
 	return cfg

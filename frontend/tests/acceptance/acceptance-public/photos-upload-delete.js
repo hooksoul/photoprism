@@ -10,8 +10,20 @@ import PhotoEdit from "../page-model/photo-edit";
 import Originals from "../page-model/originals";
 import Album from "../page-model/album";
 import Library from "../page-model/library";
+import Notifies from "../page-model/notifications";
+import { helperBeforeFixture, helperBeforeEach, helperAfterEach } from "../page-model/helpers";
 
-fixture`Test photos upload and delete`.page`${testcafeconfig.url}`;
+fixture`Test photos upload and delete`
+.page`${testcafeconfig.url}`
+.beforeEach(async t => {
+  await helperBeforeEach(t);
+})
+.afterEach(async t => {
+  await helperAfterEach(t);
+})
+.before(async ctx => {
+  await helperBeforeFixture(ctx);
+});
 
 const menu = new Menu();
 const album = new Album();
@@ -22,41 +34,44 @@ const page = new Page();
 const photoedit = new PhotoEdit();
 const originals = new Originals();
 const library = new Library();
+const notifies = new Notifies();
 
 test.meta("testID", "photos-upload-delete-001").meta({ type: "short", mode: "public" })(
-  "Core: Upload + Delete jpg/json",
+  "Core: Upload + Delete jpg/xmp",
   async (t) => {
     if (t.browser.platform === "mobile") {
       console.log("Skipped on mobile");
     } else {
       await menu.openNav();
-      const InitialOriginalsCount = await Selector(".nav-originals .nav-count", { timeout: 5000 })
-        .innerText;
+      const InitialOriginalsCount = await Selector("a.nav-originals span.nav-count-item", { timeout: 5000 }).innerText;
       await t.expect(fs.existsSync("../storage/acceptance/originals/2020/10")).notOk();
-      await toolbar.search("digikam");
+      await toolbar.search("digikam", false);
       const PhotoCount = await photo.getPhotoCount("all");
 
       await t.expect(PhotoCount).eql(0);
 
       await toolbar.triggerToolbarAction("upload");
       await t
-        .setFilesToUpload(Selector(".input-upload"), [
+        .setFilesToUpload(Selector('input[type="file"]'), [
           "../../upload-files/digikam.jpg",
-          "../../upload-files/digikam.json",
-        ])
-        .wait(15000);
+          "../../upload-files/digikam.xmp",
+        ]);
+      await t.click(Selector("button.action-upload"));
+      await notifies.waitForUpload();
+      await toolbar.triggerToolbarAction("refresh");
       const PhotoCountAfterUpload = await photo.getPhotoCount("all");
 
       await t.expect(PhotoCountAfterUpload).eql(1);
 
       const UploadedPhoto = await photo.getNthPhotoUid("all", 0);
       await t.navigateTo("/library/index/files/2020/10");
+      await notifies.waitForFoldersToLoad(5000, true);
       const FileCount = await originals.getFileCount();
 
       await t.expect(FileCount).eql(2);
 
       await menu.openNav();
-      const OriginalsCountAfterUpload = await Selector(".nav-originals .nav-count", {
+      const OriginalsCountAfterUpload = await Selector("a.nav-originals span.nav-count-item", {
         timeout: 5000,
       }).innerText;
       await t.expect(parseInt(InitialOriginalsCount) + 2).eql(parseInt(OriginalsCountAfterUpload));
@@ -68,9 +83,9 @@ test.meta("testID", "photos-upload-delete-001").meta({ type: "short", mode: "pub
       await t.click(photoedit.filesTab);
 
       await t
-        .expect(Selector("div.caption").withText(".json").visible)
+        .expect(Selector("div.text-caption").withText(".xmp").visible)
         .ok()
-        .expect(Selector("div.caption").withText(".jpg").visible)
+        .expect(Selector("div.text-caption").withText(".jpg").visible)
         .ok();
 
       await t.click(photoedit.dialogClose);
@@ -93,87 +108,82 @@ test.meta("testID", "photos-upload-delete-001").meta({ type: "short", mode: "pub
 
       await t.expect(FileCountAfterDelete).eql(0);
       if (t.browser.platform !== "mobile") {
-        const originalsLengthAfterDelete = fs.readdirSync(
-          "../storage/acceptance/originals/2020/10"
-        ).length;
+        const originalsLengthAfterDelete = fs.readdirSync("../storage/acceptance/originals/2020/10").length;
         await t.expect(originalsLengthAfterDelete).eql(0);
       }
     }
   }
 );
 
-test.meta("testID", "photos-upload-delete-002").meta({ mode: "public" })(
-  "Core: Upload + Delete video",
-  async (t) => {
-    if (t.browser.platform === "mobile") {
-      console.log("Skipped on mobile");
-    } else {
-      await t.expect(fs.existsSync("../storage/acceptance/originals/2020/06")).notOk();
-      await toolbar.search("korn");
-      const PhotoCount = await photo.getPhotoCount("all");
+test.meta("testID", "photos-upload-delete-002").meta({ mode: "public" })("Core: Upload + Delete video", async (t) => {
+  if (t.browser.platform === "mobile") {
+    console.log("Skipped on mobile");
+  } else {
+    await t.expect(fs.existsSync("../storage/acceptance/originals/2020/06")).notOk();
+    await toolbar.search("korn", false);
+    const PhotoCount = await photo.getPhotoCount("all");
 
-      await t.expect(PhotoCount).eql(0);
+    await t.expect(PhotoCount).eql(0);
 
-      await toolbar.triggerToolbarAction("upload");
-      await t
-        .setFilesToUpload(Selector(".input-upload"), ["../../upload-files/korn.mp4"])
-        .wait(15000);
-      const PhotoCountAfterUpload = await photo.getPhotoCount("all");
+    await toolbar.triggerToolbarAction("upload");
+    await t.setFilesToUpload(Selector('input[type="file"]'), ["../../upload-files/korn.mp4"]);
+    await t.click(Selector("button.action-upload"));
 
-      await t.expect(PhotoCountAfterUpload).eql(1);
+    await notifies.waitForUpload();
+    await toolbar.triggerToolbarAction("refresh");
+    const PhotoCountAfterUpload = await photo.getPhotoCount("all");
 
-      const UploadedPhoto = await photo.getNthPhotoUid("all", 0);
-      await t.navigateTo("/library/index/files/2020/06");
-      const FileCount = await originals.getFileCount();
+    await t.expect(PhotoCountAfterUpload).eql(1);
 
-      await t.expect(FileCount).eql(1);
+    const UploadedPhoto = await photo.getNthPhotoUid("all", 0);
+    await t.navigateTo("/library/index/files/2020/06");
+    await notifies.waitForFoldersToLoad(5000, true);
 
-      await menu.openPage("browse");
-      await toolbar.search("korn");
-      await photo.triggerHoverAction("uid", UploadedPhoto, "select");
-      await contextmenu.triggerContextMenuAction("edit", "");
-      await t.click(photoedit.filesTab);
+    const FileCount = await originals.getFileCount();
 
-      await t
-        .expect(Selector("div.caption").withText(".mp4").visible)
-        .ok()
-        .expect(Selector("div.caption").withText(".jpg").visible)
-        .ok();
+    await t.expect(FileCount).eql(1);
 
-      await t.click(photoedit.dialogClose);
+    await menu.openPage("browse");
+    await toolbar.search("korn");
+    await photo.triggerHoverAction("uid", UploadedPhoto, "select");
+    await contextmenu.triggerContextMenuAction("edit", "");
+    await t.click(photoedit.filesTab);
 
-      if (t.browser.platform !== "mobile") {
-        await t.expect(fs.existsSync("../storage/acceptance/originals/2020/06")).ok();
-        const originalsLength = fs.readdirSync("../storage/acceptance/originals/2020/06").length;
-        await t.expect(originalsLength).eql(1);
-        const sidecarLength = fs.readdirSync("../storage/acceptance/originals/2020/06").length;
-        await t.expect(sidecarLength).eql(1);
-      }
+    await t
+      .expect(Selector("div.text-caption").withText(".mp4").visible)
+      .ok()
+      .expect(Selector("div.text-caption").withText(".jpg").visible)
+      .ok();
 
-      await contextmenu.triggerContextMenuAction("archive", "");
-      await menu.openPage("archive");
-      await photo.triggerHoverAction("uid", UploadedPhoto, "select");
-      await contextmenu.triggerContextMenuAction("delete", "");
-      await menu.openPage("browse");
-      await toolbar.search("korn");
-      await photo.checkPhotoVisibility(UploadedPhoto, false);
-      await t.navigateTo("/library/index/files/2020/06");
-      const FileCountAfterDelete = await originals.getFileCount();
+    await t.click(photoedit.dialogClose);
 
-      await t.expect(FileCountAfterDelete).eql(0);
-      if (t.browser.platform !== "mobile") {
-        const originalsLengthAfterDelete = fs.readdirSync(
-          "../storage/acceptance/originals/2020/06"
-        ).length;
-        await t.expect(originalsLengthAfterDelete).eql(0);
-        const sidecarLengthAfterDelete = fs.readdirSync(
-          "../storage/acceptance/originals/2020/06"
-        ).length;
-        await t.expect(sidecarLengthAfterDelete).eql(0);
-      }
+    if (t.browser.platform !== "mobile") {
+      await t.expect(fs.existsSync("../storage/acceptance/originals/2020/06")).ok();
+      const originalsLength = fs.readdirSync("../storage/acceptance/originals/2020/06").length;
+      await t.expect(originalsLength).eql(1);
+      const sidecarLength = fs.readdirSync("../storage/acceptance/originals/2020/06").length;
+      await t.expect(sidecarLength).eql(1);
+    }
+
+    await contextmenu.triggerContextMenuAction("archive", "");
+    await menu.openPage("archive");
+    await photo.triggerHoverAction("uid", UploadedPhoto, "select");
+    await contextmenu.triggerContextMenuAction("delete", "");
+    await menu.openPage("browse");
+    await toolbar.search("korn");
+    await photo.checkPhotoVisibility(UploadedPhoto, false);
+    await t.navigateTo("/library/index/files/2020/06");
+    const FileCountAfterDelete = await originals.getFileCount();
+
+    await t.expect(FileCountAfterDelete).eql(0);
+    if (t.browser.platform !== "mobile") {
+      const originalsLengthAfterDelete = fs.readdirSync("../storage/acceptance/originals/2020/06").length;
+      await t.expect(originalsLengthAfterDelete).eql(0);
+      const sidecarLengthAfterDelete = fs.readdirSync("../storage/acceptance/originals/2020/06").length;
+      await t.expect(sidecarLengthAfterDelete).eql(0);
     }
   }
-);
+});
 
 test.meta("testID", "photos-upload-delete-003").meta({ mode: "public" })(
   "Core: Upload to existing Album + Delete",
@@ -187,12 +197,11 @@ test.meta("testID", "photos-upload-delete-003").meta({ mode: "public" })(
       await album.openAlbumWithUid(AlbumUid);
       const PhotoCount = await photo.getPhotoCount("all");
       await toolbar.triggerToolbarAction("upload");
-      await t
-        .click(Selector(".input-albums"))
-        .click(page.selectOption.withText("Christmas"))
-        .setFilesToUpload(Selector(".input-upload"), ["../../upload-files/ladybug.jpg"])
-        .wait(15000);
-      const PhotoCountAfterUpload = await photo.getPhotoCount("all");
+      await t.setFilesToUpload(Selector('input[type="file"]'), ["../../upload-files/ladybug.jpg"]);
+      await t.click(Selector("button.action-upload"));
+      await notifies.waitForUpload();
+      await toolbar.triggerToolbarAction("refresh");
+      const PhotoCountAfterUpload = await photo.getPhotoCount("all", 12000);
 
       await t.expect(PhotoCountAfterUpload).eql(PhotoCount + 1);
 
@@ -228,14 +237,15 @@ test.meta("testID", "photos-upload-delete-004").meta({ mode: "public" })(
       await toolbar.triggerToolbarAction("upload");
       await t
         .click(Selector(".input-albums"))
-        .typeText(Selector(".input-albums input"), "NewCreatedAlbum")
+        .typeText(Selector(".input-albums input:not([type='hidden'])"), "NewCreatedAlbum")
         .pressKey("enter")
-        .setFilesToUpload(Selector(".input-upload"), ["../../upload-files/digikam.jpg"])
-        .wait(15000);
+        .setFilesToUpload(Selector('input[type="file"]'), ["../../upload-files/digikam.jpg"]);
+      await t.click(Selector("button.action-upload"));
+      await notifies.waitForUpload();
       if (t.browser.platform === "mobile") {
         await t.eval(() => location.reload());
       } else {
-        await toolbar.triggerToolbarAction("reload");
+        await toolbar.triggerToolbarAction("refresh");
       }
       const AlbumCountAfterUpload = await album.getAlbumCount("all");
 
@@ -261,8 +271,8 @@ test.meta("testID", "photos-upload-delete-004").meta({ mode: "public" })(
       await menu.openPage("albums");
       await toolbar.search("NewCreatedAlbum");
       await album.openNthAlbum(0);
-      await photo.checkPhotoVisibility(UploadedPhotoUid, false);
       const PhotoCountAfterDelete = await photo.getPhotoCount("all");
+      await photo.checkPhotoVisibility(UploadedPhotoUid, false);
 
       await t.expect(PhotoCountAfterDelete).eql(0);
 
@@ -282,14 +292,15 @@ test.meta("testID", "photos-upload-delete-005").meta({ type: "short", mode: "pub
       console.log("Skipped on mobile");
     } else {
       await toolbar.triggerToolbarAction("upload");
-      await t
-        .setFilesToUpload(Selector(".input-upload"), ["../../upload-files/hentai_2.jpg"])
-        .wait(15000);
-      await t.click(Selector("nav.v-toolbar button"));
+      await t.setFilesToUpload(Selector('input[type="file"]'), ["../../upload-files/hentai_2.jpg"]);
+      await t.click(Selector("button.action-upload"));
+      await notifies.waitForUploadFailed();
+      await t.click(Selector("button.action-close")).wait(8000);
+
       await menu.openPage("library");
       await t.click(library.logsTab);
 
-      await t.expect(Selector("p").withText("hentai_2.jpg might be offensive").visible).ok();
+      await t.expect(Selector("div.p-log-message").withText("hentai_2.jpg might be offensive").visible).ok();
     }
   }
 );
@@ -301,17 +312,43 @@ test.meta("testID", "photos-upload-delete-006").meta({ type: "short", mode: "pub
       console.log("Skipped on mobile");
     } else {
       await menu.openNav();
-      const InitialOriginalsCount = await Selector(".nav-originals .nav-count", {
+      const InitialOriginalsCount = await Selector("a.nav-originals span.nav-count-item", {
         timeout: 10000,
       }).innerText;
       await menu.openPage("browse");
 
       await toolbar.triggerToolbarAction("upload");
-      await t
-        .setFilesToUpload(Selector(".input-upload"), ["../../upload-files/foo.txt"])
-        .wait(15000);
+      await t.setFilesToUpload(Selector('input[type="file"]'), ["../../upload-files/foo.txt"]);
+      await t.click(Selector("button.action-upload"));
+      await notifies.waitForUpload();
       await menu.openNav();
-      const OriginalsCountAfterUpload = await Selector(".nav-originals .nav-count", {
+      const OriginalsCountAfterUpload = await Selector("a.nav-originals span.nav-count-item", {
+        timeout: 10000,
+      }).innerText;
+
+      await t.expect(parseInt(InitialOriginalsCount)).eql(parseInt(OriginalsCountAfterUpload));
+    }
+  }
+);
+
+test.meta("testID", "photos-upload-delete-007").meta({ type: "short", mode: "public" })(
+  "Core: Try uploading json file",
+  async (t) => {
+    if (t.browser.platform === "mobile") {
+      console.log("Skipped on mobile");
+    } else {
+      await menu.openNav();
+      const InitialOriginalsCount = await Selector("a.nav-originals span.nav-count-item", {
+        timeout: 10000,
+      }).innerText;
+      await menu.openPage("browse");
+
+      await toolbar.triggerToolbarAction("upload");
+      await t.setFilesToUpload(Selector('input[type="file"]'), ["../../upload-files/digikam.json"]);
+      await t.click(Selector("button.action-upload"));
+      await notifies.waitForUpload();
+      await menu.openNav();
+      const OriginalsCountAfterUpload = await Selector("a.nav-originals span.nav-count-item", {
         timeout: 10000,
       }).innerText;
 

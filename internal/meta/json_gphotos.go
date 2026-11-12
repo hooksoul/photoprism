@@ -6,9 +6,11 @@ import (
 	"runtime/debug"
 	"time"
 
-	"gopkg.in/photoprism/go-tz.v2/tz"
+	"github.com/photoprism/photoprism/pkg/geo"
+	"github.com/photoprism/photoprism/pkg/time/tz"
 )
 
+// GPhoto represents the photo-level fields exported by Google Photos JSON sidecars.
 type GPhoto struct {
 	Title       string `json:"title"`
 	Description string `json:"description"`
@@ -19,18 +21,22 @@ type GPhoto struct {
 	UpdatedAt   GTime  `json:"modificationTime"`
 }
 
-func (m GPhoto) SanitizedTitle() string {
+// GetTitle returns the sanitized Google Photos title.
+func (m GPhoto) GetTitle() string {
 	return SanitizeTitle(m.Title)
 }
 
-func (m GPhoto) SanitizedDescription() string {
-	return SanitizeDescription(m.Description)
+// GetCaption returns the sanitized Google Photos description.
+func (m GPhoto) GetCaption() string {
+	return SanitizeCaption(m.Description)
 }
 
+// GMeta wraps album metadata embedded in Google Photos sidecars.
 type GMeta struct {
 	Album GAlbum `json:"albumData"`
 }
 
+// GAlbum contains album-level information from Google Photos exports.
 type GAlbum struct {
 	Title       string `json:"title"`
 	Description string `json:"description"`
@@ -40,29 +46,35 @@ type GAlbum struct {
 	Geo         GGeo   `json:"geoData"`
 }
 
+// Exists reports whether the album entry has meaningful data.
 func (m GAlbum) Exists() bool {
 	return m.Title != ""
 }
 
+// GGeo holds geolocation data provided by Google Photos.
 type GGeo struct {
 	Lat      float64 `json:"latitude"`
 	Lng      float64 `json:"longitude"`
 	Altitude float64 `json:"altitude"`
 }
 
+// Exists reports whether the geolocation entry has usable coordinates.
 func (m GGeo) Exists() bool {
 	return m.Lat != 0.0 && m.Lng != 0.0
 }
 
+// GTime stores Unix timestamps used in Google Photos metadata.
 type GTime struct {
 	Unix      int64  `json:"timestamp,string"`
 	Formatted string `json:"formatted"`
 }
 
+// Exists reports whether the timestamp is set.
 func (m GTime) Exists() bool {
 	return m.Unix > 0
 }
 
+// Time returns the timestamp as a UTC time.Time.
 func (m GTime) Time() time.Time {
 	return time.Unix(m.Unix, 0).UTC()
 }
@@ -102,12 +114,12 @@ func (data *Data) GPhoto(jsonData []byte) (err error) {
 		return err
 	}
 
-	if s := p.SanitizedTitle(); s != "" && data.Title == "" {
+	if s := p.GetTitle(); s != "" && data.Title == "" {
 		data.Title = s
 	}
 
-	if s := p.SanitizedDescription(); s != "" && data.Description == "" {
-		data.Description = s
+	if s := p.GetCaption(); s != "" && data.Caption == "" {
+		data.Caption = s
 	}
 
 	if p.Views > 0 && data.Views == 0 {
@@ -126,8 +138,7 @@ func (data *Data) GPhoto(jsonData []byte) (err error) {
 
 	if p.Geo.Exists() {
 		if data.Lat == 0 && data.Lng == 0 {
-			data.Lat = float32(p.Geo.Lat)
-			data.Lng = float32(p.Geo.Lng)
+			data.Lat, data.Lng, _ = geo.ClampCoordinateBounds(p.Geo.Lat, p.Geo.Lng)
 		}
 
 		if data.Altitude == 0 {
@@ -137,25 +148,21 @@ func (data *Data) GPhoto(jsonData []byte) (err error) {
 
 	// Set time zone and calculate UTC time.
 	if data.Lat != 0 && data.Lng != 0 {
-		zones, err := tz.GetZone(tz.Point{
-			Lat: float64(data.Lat),
-			Lon: float64(data.Lng),
-		})
-
-		if err == nil && len(zones) > 0 {
-			data.TimeZone = zones[0]
+		if zone := tz.Position(data.Lat, data.Lng); zone != "" {
+			data.TimeZone = zone
 		}
 
-		if !data.TakenAtLocal.IsZero() {
-			if loc, err := time.LoadLocation(data.TimeZone); err != nil {
-				log.Warnf("metadata: unknown time zone %s (gphotos)", data.TimeZone)
-			} else if tl, err := time.ParseInLocation("2006:01:02 15:04:05", data.TakenAtLocal.Format("2006:01:02 15:04:05"), loc); err == nil {
+		if loc := tz.Find(data.TimeZone); !data.TakenAtLocal.IsZero() {
+			if tl, locErr := time.ParseInLocation("2006:01:02 15:04:05", data.TakenAtLocal.Format("2006:01:02 15:04:05"), loc); locErr == nil {
 				data.TakenAt = tl.UTC().Truncate(time.Second)
 			} else {
-				log.Errorf("metadata: %s (gphotos)", err.Error()) // this should never happen
+				log.Errorf("metadata: %s (gphotos)", locErr.Error()) // this should never happen
 			}
 		}
 	}
+
+	// Normalize time zone name.
+	data.TimeZone = tz.Name(data.TimeZone)
 
 	return nil
 }

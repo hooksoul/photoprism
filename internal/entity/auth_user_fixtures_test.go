@@ -5,7 +5,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 
-	"github.com/photoprism/photoprism/internal/acl"
+	"github.com/photoprism/photoprism/internal/auth/acl"
 )
 
 func TestUserMap_Get(t *testing.T) {
@@ -15,7 +15,6 @@ func TestUserMap_Get(t *testing.T) {
 		assert.Equal(t, "alice", r.Username())
 		assert.IsType(t, User{}, r)
 	})
-
 	t.Run("Invalid", func(t *testing.T) {
 		r := UserFixtures.Get("monstera")
 		assert.Equal(t, "", r.UserName)
@@ -34,12 +33,11 @@ func TestUserMap_Pointer(t *testing.T) {
 		assert.Equal(t, acl.RoleAdmin, r.AclRole())
 		assert.IsType(t, &User{}, r)
 	})
-
 	t.Run("Invalid", func(t *testing.T) {
 		r := UserFixtures.Pointer("monstera")
 		assert.Equal(t, "", r.UserName)
 		assert.Equal(t, "", r.Email())
-		assert.Equal(t, acl.RoleUnknown, r.AclRole())
+		assert.Equal(t, acl.RoleNone, r.AclRole())
 		assert.IsType(t, &User{}, r)
 	})
 }

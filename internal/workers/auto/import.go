@@ -1,0 +1,106 @@
+package auto
+
+import (
+	"path/filepath"
+	"sync"
+	"time"
+
+	"github.com/dustin/go-humanize/english"
+
+	"github.com/photoprism/photoprism/internal/api"
+	"github.com/photoprism/photoprism/internal/entity"
+	"github.com/photoprism/photoprism/internal/event"
+	"github.com/photoprism/photoprism/internal/mutex"
+	"github.com/photoprism/photoprism/internal/photoprism"
+	"github.com/photoprism/photoprism/internal/photoprism/get"
+	"github.com/photoprism/photoprism/pkg/clean"
+	"github.com/photoprism/photoprism/pkg/i18n"
+)
+
+var autoImport = time.Time{}
+var importMutex = sync.Mutex{}
+
+// ResetImport resets the auto import trigger time.
+func ResetImport() {
+	importMutex.Lock()
+	defer importMutex.Unlock()
+
+	autoImport = time.Time{}
+}
+
+// ShouldImport sets the auto import trigger to the current time.
+func ShouldImport() {
+	importMutex.Lock()
+	defer importMutex.Unlock()
+
+	autoImport = time.Now()
+}
+
+// mustImport tests if auto import must be started.
+func mustImport(delay time.Duration) bool {
+	if delay.Seconds() <= 0 {
+		return false
+	}
+
+	importMutex.Lock()
+	defer importMutex.Unlock()
+
+	return !autoImport.IsZero() && time.Until(autoImport) < -1*delay && !mutex.IndexWorker.Running()
+}
+
+// Import starts importing originals e.g. after WebDAV uploads.
+func Import() error {
+	if mutex.IndexWorker.Running() {
+		return nil
+	}
+
+	conf := get.Config()
+
+	if conf.ReadOnly() || !conf.Settings().Features.Import {
+		return nil
+	}
+
+	start := time.Now()
+
+	path := filepath.Clean(conf.ImportPath())
+
+	imp := get.Import()
+
+	api.RemoveFromFolderCache(entity.RootImport)
+
+	event.InfoMsg(i18n.MsgCopyingFilesFrom, clean.Log(filepath.Base(path)))
+
+	var opt photoprism.ImportOptions
+	opt.Action = photoprism.ActionAutoImport
+
+	if conf.Settings().Import.Move {
+		opt = photoprism.ImportOptionsMove(path, conf.ImportDest())
+	} else {
+		opt = photoprism.ImportOptionsCopy(path, conf.ImportDest())
+	}
+
+	imported := imp.Start(opt)
+
+	if imported.Processed() == 0 {
+		return nil
+	}
+
+	moments := get.Moments()
+
+	if err := moments.Start(); err != nil {
+		log.Warnf("moments: %s", err)
+	}
+
+	elapsed := time.Since(start)
+	seconds := int(elapsed.Seconds())
+
+	log.Infof("library: imported %s in %s", english.Plural(imported.Processed(), "file", "files"), elapsed)
+
+	event.PublishSuccessMsg(i18n.MsgImportCompletedIn, seconds)
+
+	event.PublishCompleted([]string{"import.completed", "index.completed"}, opt.UID, opt.Action, seconds)
+
+	api.UpdateClientConfig()
+
+	return nil
+}

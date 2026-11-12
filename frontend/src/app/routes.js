@@ -1,6 +1,6 @@
 /*
 
-Copyright (c) 2018 - 2023 PhotoPrism UG. All rights reserved.
+Copyright (c) 2018 - 2026 PhotoPrism UG. All rights reserved.
 
     This program is free software: you can redistribute it and/or modify
     it under Version 3 of the GNU Affero General Public License (the "AGPL"):
@@ -13,7 +13,7 @@ Copyright (c) 2018 - 2023 PhotoPrism UG. All rights reserved.
 
     The AGPL is supplemented by our Trademark and Brand Guidelines,
     which describe how our Brand Assets may be used:
-    <https://www.photoprism.app/trademark>
+    <https://www.photoprism.app/trademark/>
 
 Feel free to send an email to hello@photoprism.app if you have questions,
 want to support our work, or just want to say hello.
@@ -33,75 +33,246 @@ import Labels from "page/labels.vue";
 import People from "page/people.vue";
 import Library from "page/library.vue";
 import Settings from "page/settings.vue";
+import Services from "page/services.vue";
 import Admin from "page/admin.vue";
+import Cluster from "page/cluster.vue";
 import Login from "page/auth/login.vue";
+import Instances from "page/auth/instances.vue";
+import Consent from "page/auth/consent.vue";
 import Discover from "page/discover.vue";
 import About from "page/about/about.vue";
-import Feedback from "page/about/feedback.vue";
 import License from "page/about/license.vue";
 import Help from "page/help.vue";
 import Connect from "page/connect.vue";
-import { $gettext } from "common/vm";
-import { config, session } from "./session";
+import { $gettext, $pgettext } from "common/gettext";
+import { $config, $session } from "./session";
 
 const c = window.__CONFIG__;
 const siteTitle = c.siteTitle ? c.siteTitle : c.name;
+const loginRoute = "login";
+
+// safeReturnTo returns the path, query, and fragment of a return_to value that resolves to the
+// current origin, or an empty string otherwise. The path must not start with "//", as it is resolved
+// again when followed.
+export function safeReturnTo(value) {
+  if (!value || typeof value !== "string") {
+    return "";
+  }
+  const trimmed = value.trim();
+  const here = typeof window !== "undefined" ? window.location?.origin : "";
+  if (!trimmed || !here) {
+    return "";
+  }
+  try {
+    const parsed = new URL(trimmed, here);
+    if (parsed.origin === here && !parsed.pathname.startsWith("//")) {
+      return parsed.pathname + parsed.search + parsed.hash;
+    }
+  } catch {
+    // Fall through to reject.
+  }
+  return "";
+}
 
 export default [
   {
     name: "home",
     path: "/",
-    redirect: "/browse",
+    redirect: () => {
+      return { name: $session.getDefaultRoute() };
+    },
   },
   {
     name: "about",
     path: "/about",
     component: About,
-    meta: { title: $gettext("About"), auth: false },
+    meta: { title: $gettext("About"), requiresAuth: false },
   },
   {
     name: "license",
     path: "/license",
     component: License,
-    meta: { title: $gettext("License"), auth: false },
-  },
-  {
-    name: "feedback",
-    path: "/feedback",
-    component: Feedback,
-    meta: { title: $gettext("Help & Support"), auth: true },
+    meta: { title: $gettext("License"), requiresAuth: false },
   },
   {
     name: "help",
-    path: "/help*",
+    path: "/help/:pathMatch(.*)*",
     component: Help,
-    meta: { title: $gettext("Help & Support"), auth: false },
+    meta: { title: $gettext("Help & Support"), requiresAuth: false },
   },
   {
-    name: "login",
+    name: loginRoute,
     path: "/login",
     component: Login,
-    meta: { title: siteTitle, auth: false, hideNav: true },
+    meta: { title: siteTitle, requiresAuth: false, hideNav: true },
     beforeEnter: (to, from, next) => {
-      if (session.loginRequired()) {
+      // Honor an inbound `return_to` query param so cross-frontend hand-offs
+      // (e.g. the Portal OIDC OP redirecting an unauthenticated user from
+      // /api/v1/oauth/authorize) can land back on the originally-requested URL
+      // after a successful login. The value is recorded the same way the
+      // global router guard records internal deep links, so the rest of
+      // the flow (followLoginRedirectUrl on success) needs no further
+      // changes.
+      const returnTo = safeReturnTo(to.query?.return_to);
+      if (returnTo) {
+        $session.setLoginRedirectUrl(returnTo);
+      }
+
+      if ($session.loginRequired()) {
+        // Auto-OIDC fires only for deep-link arrivals (loginRedirectUrl set
+        // by the global router guard), and only once per browser tab: a prior
+        // attempt flag set on the way out clears here so a failed/abandoned
+        // IdP roundtrip falls back to the local form instead of looping.
+        const oidc = $config.values?.ext?.oidc;
+        const oidcInFlight = $session.consumeOidcAttempt();
+        if (
+          oidc?.enabled &&
+          oidc?.redirect &&
+          oidc?.loginUri &&
+          $session.hasLoginRedirectUrl() &&
+          !$session.consumeLogoutSignal() &&
+          !oidcInFlight
+        ) {
+          $session.markOidcAttempt();
+          $session.followRedirect(oidc.loginUri);
+          next(false);
+          return;
+        }
         next();
-      } else if (config.deny("photos", "search")) {
-        next({ name: "albums" });
+        return;
+      }
+      // Already authenticated (typically returning from the OIDC roundtrip):
+      // hard-navigate to the deep link the router guard recorded so the
+      // stored absolute path (incl. frontend base) is honored verbatim.
+      if ($session.hasLoginRedirectUrl()) {
+        if ($session.loginRedirectLooping()) {
+          // We followed this redirect moments ago and bounced straight back — the
+          // target couldn't authenticate the navigation. Drop it and fall through
+          // to the default route instead of looping.
+          $session.clearLoginRedirectAttempt();
+          $session.clearLoginRedirectUrl();
+          next({ name: $session.getDefaultRoute() });
+        } else {
+          $session.markLoginRedirectAttempt();
+          $session.followLoginRedirectUrl();
+          next(false);
+        }
       } else {
-        next({ name: "browse" });
+        next({ name: $session.getDefaultRoute() });
+      }
+    },
+  },
+  {
+    name: "logout",
+    path: "/logout",
+    meta: { title: siteTitle, requiresAuth: false, hideNav: true },
+    beforeEnter: (to, from, next) => {
+      // Resolve the session kind and landing before sign-out clears the provider:
+      // a cluster-OIDC user returns to the Portal login (or the local form when the
+      // Portal login URL is unknown), everyone else to the local form. The cluster
+      // decision must not depend on the redirect target, or a node without a
+      // persisted Portal login URL would silently skip the cluster-wide sign-out.
+      const isClusterSession = $session.isClusterSession();
+      // RP-initiated logout (OIDC + PHOTOPRISM_OIDC_LOGOUT) returns a provider logout URL
+      // that must be followed AFTER the async DELETE resolves; an OIDC node that is not a
+      // cluster session still needs this so direct /logout entry ends the upstream session,
+      // matching the nav-menu Sign-Out.
+      const rpInitiated = $session.getProvider() === "oidc" && $config.oidcLogout();
+      const redirectUri = $session.logoutRedirectUri();
+      if (isClusterSession || rpInitiated) {
+        // Await the cluster-wide sign-out (peer fan-out + Portal OP cookie clear) BEFORE
+        // redirecting; logoutEverywhere resolves to the provider logout URL when present (it
+        // ends the upstream session), else fall back to the local landing. A standalone OIDC
+        // node has no peers, so the fan-out is a no-op and only the RP-logout follow applies.
+        next(false);
+        $session
+          .logoutEverywhere(true)
+          .then((uri) => $session.followRedirect(uri || redirectUri))
+          .catch(() => $session.followRedirect(redirectUri));
+      } else {
+        // Local: signOut() resets client state synchronously so /login sees an
+        // unauthenticated user; the one-shot logout flag suppresses the next auto-OIDC
+        // bounce, and the DELETE fan-out (current + peers) runs best-effort.
+        $session.signOut();
+        next({ name: loginRoute });
       }
     },
   },
   {
     name: "admin",
-    path: "/admin/*",
+    path: "/admin/:pathMatch(.*)*",
     component: Admin,
     meta: {
       title: $gettext("Settings"),
-      auth: true,
-      admin: true,
+      requiresAuth: true,
       settings: true,
-      background: "application-light",
+      background: "background",
+    },
+    beforeEnter: (to, from, next) => {
+      if ($session.loginRequired()) {
+        next({ name: loginRoute });
+      } else if ($config.deny("users", "access_all")) {
+        next({ name: $session.getDefaultRoute() });
+      } else {
+        next();
+      }
+    },
+  },
+  {
+    name: "cluster",
+    path: "/cluster/:pathMatch(.*)*",
+    component: Cluster,
+    meta: {
+      title: $gettext("Cluster"),
+      requiresAuth: true,
+      settings: false,
+      background: "background",
+    },
+    beforeEnter: (to, from, next) => {
+      if ($session.loginRequired()) {
+        next({ name: loginRoute });
+      } else {
+        // Any logged-in user may enter /cluster — the page filters which
+        // tabs are visible based on per-resource grants (Nodes / Activity
+        // gate on `cluster.access_all` and `cluster.audit`; the My
+        // Instances chooser is visible to everyone). When no tabs remain,
+        // cluster.vue redirects to the user's default route in `created()`.
+        next();
+      }
+    },
+  },
+  {
+    name: "consent",
+    path: "/oauth/consent",
+    component: Consent,
+    meta: {
+      title: $gettext("Connect"),
+      requiresAuth: true,
+      hideNav: true,
+      settings: false,
+      background: "background",
+    },
+  },
+  {
+    name: "instances",
+    path: "/instances",
+    component: Instances,
+    meta: {
+      title: $gettext("Instances"),
+      requiresAuth: true,
+      hideNav: true,
+      settings: false,
+      background: "background",
+    },
+    beforeEnter: (to, from, next) => {
+      // The instance selector is the durable landing page for non-operators;
+      // any signed-in user may enter, and unauthenticated requests fall through
+      // to login (the global guard records the return_to deep link).
+      if ($session.loginRequired()) {
+        next({ name: loginRoute });
+      } else {
+        next();
+      }
     },
   },
   {
@@ -110,7 +281,7 @@ export default [
     component: Connect,
     meta: {
       title: siteTitle,
-      auth: true,
+      requiresAuth: true,
       admin: true,
       settings: true,
     },
@@ -121,7 +292,7 @@ export default [
     component: Connect,
     meta: {
       title: siteTitle,
-      auth: true,
+      requiresAuth: true,
       admin: true,
       settings: true,
     },
@@ -130,12 +301,12 @@ export default [
     name: "browse",
     path: "/browse",
     component: Photos,
-    meta: { title: siteTitle, icon: true, auth: true },
+    meta: { title: siteTitle, icon: true, requiresAuth: true },
     beforeEnter: (to, from, next) => {
-      if (session.loginRequired()) {
-        next({ name: "login" });
-      } else if (config.deny("photos", "search")) {
-        next({ name: "albums" });
+      if ($session.loginRequired()) {
+        next({ name: loginRoute });
+      } else if ($config.deny("photos", "search")) {
+        next({ name: $session.getDefaultRoute() });
       } else {
         next();
       }
@@ -145,186 +316,273 @@ export default [
     name: "all",
     path: "/all",
     component: Photos,
-    meta: { title: siteTitle, auth: true },
+    meta: { title: siteTitle, requiresAuth: true },
     props: { staticFilter: { quality: "0" } },
   },
   {
     name: "photos",
     path: "/photos",
     component: Photos,
-    meta: { title: $gettext("Photos"), auth: true },
+    meta: { title: $gettext("Photos"), requiresAuth: true },
     props: { staticFilter: { photo: "true" } },
   },
   {
     name: "moments",
     path: "/moments",
     component: Albums,
-    meta: { title: $gettext("Moments"), auth: true },
+    meta: { title: $gettext("Moments"), requiresAuth: true },
     props: { view: "moment", defaultOrder: "newest", staticFilter: { type: "moment" } },
   },
   {
     name: "moment",
-    path: "/moments/:uid/:slug",
+    path: "/moments/:album/:slug",
     component: AlbumPhotos,
-    meta: { collName: "Moments", collRoute: "moments", auth: true },
+    meta: { collectionTitle: "Moments", collectionRoute: "moments", requiresAuth: true },
   },
   {
     name: "albums",
     path: "/albums",
     component: Albums,
-    meta: { title: $gettext("Albums"), auth: true },
+    meta: { title: $gettext("Albums"), requiresAuth: true },
     props: { view: "album", defaultOrder: "favorites", staticFilter: { type: "album" } },
   },
   {
     name: "album",
-    path: "/albums/:uid/:slug",
+    path: "/albums/:album/:slug",
     component: AlbumPhotos,
-    meta: { collName: "Albums", collRoute: "albums", auth: true },
+    meta: { collectionTitle: "Albums", collectionRoute: "albums", requiresAuth: true },
   },
   {
     name: "calendar",
     path: "/calendar",
     component: Albums,
-    meta: { title: $gettext("Calendar"), auth: true },
+    meta: { title: $gettext("Calendar"), requiresAuth: true },
     props: { view: "month", defaultOrder: "newest", staticFilter: { type: "month" } },
   },
   {
     name: "month",
-    path: "/calendar/:uid/:slug",
+    path: "/calendar/:album/:slug",
     component: AlbumPhotos,
-    meta: { collName: "Calendar", collRoute: "calendar", auth: true },
+    meta: { collectionTitle: "Calendar", collectionRoute: "calendar", requiresAuth: true },
   },
   {
     name: "folders",
     path: "/folders",
     component: Albums,
-    meta: { title: $gettext("Folders"), auth: true },
+    meta: { title: $gettext("Folders"), requiresAuth: true },
     props: { view: "folder", defaultOrder: "name", staticFilter: { type: "folder" } },
   },
   {
     name: "folder",
-    path: "/folders/:uid/:slug",
+    path: "/folders/:album/:slug",
     component: AlbumPhotos,
-    meta: { collName: "Folders", collRoute: "folders", auth: true },
+    meta: { collectionTitle: "Folders", collectionRoute: "folders", requiresAuth: true },
   },
   {
     name: "unsorted",
     path: "/unsorted",
     component: Photos,
-    meta: { title: $gettext("Unsorted"), auth: true },
+    meta: { title: $gettext("Unsorted"), requiresAuth: true },
     props: { staticFilter: { unsorted: "true" } },
   },
   {
     name: "favorites",
     path: "/favorites",
     component: Photos,
-    meta: { title: $gettext("Favorites"), auth: true },
+    meta: { title: $gettext("Favorites"), requiresAuth: true },
     props: { staticFilter: { favorite: "true" } },
+  },
+  {
+    name: "media",
+    path: "/media",
+    component: Photos,
+    meta: { title: $gettext("Media"), requiresAuth: true },
+    props: { staticFilter: { media: "true" } },
   },
   {
     name: "live",
     path: "/live",
     component: Photos,
-    meta: { title: $gettext("Live"), auth: true },
+    meta: { title: $gettext("Live Photos"), requiresAuth: true },
     props: { staticFilter: { live: "true" } },
   },
   {
     name: "videos",
     path: "/videos",
     component: Photos,
-    meta: { title: $gettext("Videos"), auth: true },
+    meta: { title: $gettext("Videos"), requiresAuth: true },
     props: { staticFilter: { video: "true" } },
+  },
+  {
+    name: "audio",
+    path: "/audio",
+    component: Photos,
+    meta: { title: $gettext("Audio"), requiresAuth: true },
+    props: { staticFilter: { audio: "true" } },
+  },
+  {
+    name: "animated",
+    path: "/animated",
+    component: Photos,
+    meta: { title: $gettext("Animated"), requiresAuth: true },
+    props: { staticFilter: { animated: "true" } },
   },
   {
     name: "review",
     path: "/review",
     component: Photos,
-    meta: { title: $gettext("Review"), auth: true },
+    meta: { title: $gettext("Review"), requiresAuth: true },
     props: { staticFilter: { review: "true" } },
   },
   {
     name: "private",
     path: "/private",
     component: Photos,
-    meta: { title: $gettext("Private"), auth: true },
-    props: { staticFilter: { private: "true" } },
+    meta: { title: $gettext("Private"), requiresAuth: true },
+    props: { staticFilter: { private: "true", public: "" } },
+    beforeEnter: (to, from, next) => {
+      if ($session.loginRequired()) {
+        next({ name: loginRoute });
+      } else if ($config.deny("photos", "access_private")) {
+        next({ name: $session.getDefaultRoute() });
+      } else {
+        next();
+      }
+    },
   },
   {
     name: "archive",
     path: "/archive",
     component: Photos,
-    meta: { title: $gettext("Archive"), auth: true },
-    props: { staticFilter: { archived: "true" } },
+    meta: {
+      title: $pgettext("Noun", "Archive"),
+      requiresAuth: true,
+    },
+    props: { staticFilter: { archived: "true", public: "" } },
+    beforeEnter: (to, from, next) => {
+      if ($session.loginRequired()) {
+        next({ name: loginRoute });
+      } else if ($config.deny("photos", "delete")) {
+        next({ name: $session.getDefaultRoute() });
+      } else {
+        next();
+      }
+    },
   },
   {
     name: "places",
     path: "/places",
     component: Places,
-    meta: { title: $gettext("Places"), auth: true },
+    meta: { title: $gettext("Places"), requiresAuth: true },
   },
   {
-    name: "places_query",
-    path: "/places/:q",
+    name: "places_view",
+    path: "/places/view/:s",
     component: Places,
-    meta: { title: $gettext("Places"), auth: true },
+    meta: { title: $gettext("Places"), requiresAuth: true },
   },
   {
-    name: "places_scope",
-    path: "/places/:s/:q",
-    component: Places,
-    meta: { title: $gettext("Places"), auth: true },
+    name: "places_browse",
+    path: "/places/browse",
+    component: Photos,
+    meta: { title: $gettext("Places"), requiresAuth: true },
+    beforeEnter: (to, from, next) => {
+      if ($session.loginRequired()) {
+        next({ name: loginRoute });
+      } else if ($config.deny("photos", "search")) {
+        next({ name: $session.getDefaultRoute() });
+      } else {
+        next();
+      }
+    },
   },
   {
     name: "states",
     path: "/states",
     component: Albums,
-    meta: { title: $gettext("Places"), auth: true },
+    meta: { title: $gettext("Places"), requiresAuth: true },
     props: { view: "state", defaultOrder: "place", staticFilter: { type: "state" } },
   },
   {
     name: "state",
-    path: "/states/:uid/:slug",
+    path: "/states/:album/:slug",
     component: AlbumPhotos,
-    meta: { collName: "Places", collRoute: "states", auth: true },
+    meta: { collectionTitle: $gettext("Regions"), collectionRoute: "states", requiresAuth: true },
   },
   {
     name: "files",
-    path: "/index/files*",
+    path: "/index/files/:pathMatch(.*)*",
     component: Browse,
-    meta: { title: $gettext("File Browser"), auth: true },
+    meta: { title: $gettext("File Browser"), requiresAuth: true },
+    beforeEnter: (to, from, next) => {
+      if ($session.loginRequired()) {
+        next({ name: loginRoute });
+      } else if ($config.deny("files", "access_library") || $config.deny("files", "access_private")) {
+        next({ name: $session.getDefaultRoute() });
+      } else {
+        next();
+      }
+    },
   },
   {
     name: "hidden",
     path: "/hidden",
     component: Photos,
-    meta: { title: $gettext("Hidden Files"), auth: true },
+    meta: { title: $gettext("Hidden Files"), requiresAuth: true },
     props: { staticFilter: { hidden: "true" } },
+    beforeEnter: (to, from, next) => {
+      if ($session.loginRequired()) {
+        next({ name: loginRoute });
+      } else if ($config.deny("files", "access_library") || $config.deny("files", "access_private")) {
+        next({ name: $session.getDefaultRoute() });
+      } else {
+        next();
+      }
+    },
   },
   {
     name: "errors",
     path: "/errors",
     component: Errors,
-    meta: { title: $gettext("Errors"), auth: true },
+    meta: { title: $gettext("Errors"), requiresAuth: true },
+    beforeEnter: (to, from, next) => {
+      if ($session.loginRequired()) {
+        next({ name: loginRoute });
+      } else if ($config.deny("logs", "access_all")) {
+        next({ name: $session.getDefaultRoute() });
+      } else {
+        next();
+      }
+    },
   },
   {
     name: "labels",
     path: "/labels",
     component: Labels,
-    meta: { title: $gettext("Labels"), auth: true },
+    meta: { title: $gettext("Labels"), requiresAuth: true },
+    beforeEnter: (to, from, next) => {
+      if ($session.loginRequired()) {
+        next({ name: loginRoute });
+      } else if ($config.deny("labels", "search")) {
+        next({ name: $session.getDefaultRoute() });
+      } else {
+        next();
+      }
+    },
   },
   {
     name: "people",
     path: "/people",
     component: People,
-    meta: { title: $gettext("People"), auth: true, background: "application-light" },
+    meta: { title: $gettext("People"), requiresAuth: true, background: "background" },
     beforeEnter: (to, from, next) => {
-      if (!config || !from || !from.name || from.name.startsWith("people")) {
+      if (!$config || !from || !from.name || from.name.startsWith("people")) {
         next();
       } else {
-        config.load().finally(() => {
+        $config.load().finally(() => {
           // Open new faces tab when there are no people.
-          if (config.values.count.people === 0) {
-            if (config.allow("people", "manage")) {
+          if ($config.values.count.people === 0) {
+            if ($config.allow("people", "manage")) {
               next({ name: "people_faces" });
             } else {
               next({ name: "albums" });
@@ -340,28 +598,64 @@ export default [
     name: "people_faces",
     path: "/people/new",
     component: People,
-    meta: { title: $gettext("People"), auth: true, background: "application-light" },
+    meta: { title: $gettext("People"), requiresAuth: true, background: "background" },
+    beforeEnter: (to, from, next) => {
+      if ($session.loginRequired()) {
+        next({ name: loginRoute });
+      } else if ($config.deny("people", "manage")) {
+        next({ name: $session.getDefaultRoute() });
+      } else {
+        next();
+      }
+    },
   },
   {
     name: "library_index",
     path: "/index",
     component: Library,
-    meta: { title: $gettext("Library"), auth: true, background: "application-light" },
+    meta: { title: $gettext("Library"), requiresAuth: true, background: "background" },
     props: { tab: "library_index" },
+    beforeEnter: (to, from, next) => {
+      if ($session.loginRequired()) {
+        next({ name: loginRoute });
+      } else if ($config.deny("files", "manage")) {
+        next({ name: $session.getDefaultRoute() });
+      } else {
+        next();
+      }
+    },
   },
   {
     name: "library_import",
     path: "/import",
     component: Library,
-    meta: { title: $gettext("Library"), auth: true, background: "application-light" },
+    meta: { title: $gettext("Library"), requiresAuth: true, background: "background" },
     props: { tab: "library_import" },
+    beforeEnter: (to, from, next) => {
+      if ($session.loginRequired()) {
+        next({ name: loginRoute });
+      } else if ($config.deny("files", "manage")) {
+        next({ name: $session.getDefaultRoute() });
+      } else {
+        next();
+      }
+    },
   },
   {
     name: "library_logs",
     path: "/logs",
     component: Library,
-    meta: { title: $gettext("Library"), auth: true, background: "application-light" },
+    meta: { title: $gettext("Library"), requiresAuth: true, background: "background" },
     props: { tab: "library_logs" },
+    beforeEnter: (to, from, next) => {
+      if ($session.loginRequired()) {
+        next({ name: loginRoute });
+      } else if ($config.deny("logs", "access_all")) {
+        next({ name: $session.getDefaultRoute() });
+      } else {
+        next();
+      }
+    },
   },
   {
     name: "settings",
@@ -369,24 +663,40 @@ export default [
     component: Settings,
     meta: {
       title: $gettext("Settings"),
-      auth: true,
+      requiresAuth: true,
       settings: true,
-      background: "application-light",
+      background: "background",
     },
-    props: { tab: "settings-general" },
+    props: { tab: "settings_general" },
+  },
+  {
+    name: "settings_content",
+    path: "/settings/content",
+    component: Settings,
+    meta: {
+      title: $gettext("Settings"),
+      requiresAuth: true,
+      settings: true,
+      background: "background",
+    },
+    props: { tab: "settings_content" },
+  },
+  {
+    name: "settings_collections",
+    path: "/settings/collections",
+    component: Settings,
+    meta: {
+      title: $gettext("Settings"),
+      requiresAuth: true,
+      settings: true,
+      background: "background",
+    },
+    props: { tab: "settings_collections" },
   },
   {
     name: "settings_media",
     path: "/settings/media",
-    component: Settings,
-    meta: {
-      title: $gettext("Settings"),
-      auth: true,
-      admin: true,
-      settings: true,
-      background: "application-light",
-    },
-    props: { tab: "settings-media" },
+    redirect: "/settings/content",
   },
   {
     name: "settings_advanced",
@@ -394,24 +704,31 @@ export default [
     component: Settings,
     meta: {
       title: $gettext("Settings"),
-      auth: true,
-      admin: true,
+      requiresAuth: true,
       settings: true,
-      background: "application-light",
+      background: "background",
     },
-    props: { tab: "settings-advanced" },
+    props: { tab: "settings_advanced" },
   },
   {
     name: "settings_services",
     path: "/settings/services",
-    component: Settings,
+    component: Services,
     meta: {
       title: $gettext("Settings"),
-      auth: true,
+      requiresAuth: true,
       settings: true,
-      background: "application-light",
+      background: "background",
     },
-    props: { tab: "settings-services" },
+    beforeEnter: (to, from, next) => {
+      if ($session.loginRequired()) {
+        next({ name: loginRoute });
+      } else if (!$config.feature("services") || $config.deny("services", "manage")) {
+        next({ name: "settings" });
+      } else {
+        next();
+      }
+    },
   },
   {
     name: "settings_account",
@@ -419,42 +736,42 @@ export default [
     component: Settings,
     meta: {
       title: $gettext("Settings"),
-      auth: true,
+      requiresAuth: true,
       settings: true,
-      background: "application-light",
+      background: "background",
     },
-    props: { tab: "settings-account" },
+    props: { tab: "settings_account" },
   },
   {
     name: "discover",
     path: "/discover",
     component: Discover,
-    meta: { title: $gettext("Discover"), auth: true, background: "application-light" },
+    meta: { title: $gettext("Discover"), requiresAuth: true, background: "background" },
     props: { tab: 0 },
   },
   {
     name: "discover_similar",
     path: "/discover/similar",
     component: Discover,
-    meta: { title: $gettext("Discover"), auth: true, background: "application-light" },
+    meta: { title: $gettext("Discover"), requiresAuth: true, background: "background" },
     props: { tab: 1 },
   },
   {
     name: "discover_season",
     path: "/discover/season",
     component: Discover,
-    meta: { title: $gettext("Discover"), auth: true, background: "application-light" },
+    meta: { title: $gettext("Discover"), requiresAuth: true, background: "background" },
     props: { tab: 2 },
   },
   {
     name: "discover_random",
     path: "/discover/random",
     component: Discover,
-    meta: { title: $gettext("Discover"), auth: true, background: "application-light" },
+    meta: { title: $gettext("Discover"), requiresAuth: true, background: "background" },
     props: { tab: 3 },
   },
   {
-    path: "*",
+    path: "/:pathMatch(.*)*",
     redirect: "/albums",
   },
 ];

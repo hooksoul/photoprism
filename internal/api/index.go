@@ -8,20 +8,29 @@ import (
 	"github.com/dustin/go-humanize/english"
 	"github.com/gin-gonic/gin"
 
-	"github.com/photoprism/photoprism/internal/acl"
+	"github.com/photoprism/photoprism/internal/auth/acl"
 	"github.com/photoprism/photoprism/internal/entity"
 	"github.com/photoprism/photoprism/internal/event"
 	"github.com/photoprism/photoprism/internal/form"
-	"github.com/photoprism/photoprism/internal/get"
-	"github.com/photoprism/photoprism/internal/i18n"
 	"github.com/photoprism/photoprism/internal/photoprism"
+	"github.com/photoprism/photoprism/internal/photoprism/get"
 	"github.com/photoprism/photoprism/pkg/clean"
+	"github.com/photoprism/photoprism/pkg/i18n"
+	"github.com/photoprism/photoprism/pkg/log/status"
 	"github.com/photoprism/photoprism/pkg/txt"
 )
 
 // StartIndexing indexes media files in the "originals" folder.
 //
-// POST /api/v1/index
+//	@Summary	start indexing
+//	@Id			StartIndexing
+//	@Tags		Library
+//	@Accept		json
+//	@Produce	json
+//	@Success	200						{object}	i18n.Response
+//	@Failure	400,401,403,413,429,500	{object}	i18n.Response
+//	@Param		options					body		form.IndexOptions	true	"index options"
+//	@Router		/api/v1/index [post]
 func StartIndexing(router *gin.RouterGroup) {
 	router.POST("/index", func(c *gin.Context) {
 		s := Auth(c, acl.ResourcePhotos, acl.ActionUpdate)
@@ -38,22 +47,45 @@ func StartIndexing(router *gin.RouterGroup) {
 			return
 		}
 
+		// Abort if the storage filesystem is critically low on free space. Indexing only
+		// writes sidecars and thumbnails, so the disk-low check is sufficient here; the
+		// FilesQuota gate used by import/upload/avatar/zip/video does not apply because
+		// indexing catalogs existing files rather than adding to the quota.
+		if _, low, _ := conf.StorageLow(); low {
+			event.AuditErr([]string{ClientIP(c), "session %s", "index files", status.InsufficientStorage}, s.RefID)
+			Abort(c, http.StatusInsufficientStorage, i18n.ErrInsufficientStorage)
+			return
+		}
+
 		start := time.Now()
 
-		var f form.IndexOptions
+		var frm form.IndexOptions
 
-		if err := c.BindJSON(&f); err != nil {
+		// Assign and validate request form values.
+		LimitRequestBodyBytes(c, MaxMutationRequestBytes)
+
+		if err := c.BindJSON(&frm); err != nil {
+			if IsRequestBodyTooLarge(err) {
+				AbortRequestTooLarge(c, i18n.ErrBadRequest)
+				return
+			}
+
+			AbortBadRequest(c, err)
+			return
+		}
+
+		// Reject index paths that would escape the originals directory.
+		if _, err := photoprism.ResolveIndexPath(conf.OriginalsPath(), frm.Path); err != nil {
 			AbortBadRequest(c)
 			return
 		}
 
 		// Configure index options.
-		path := conf.OriginalsPath()
 		convert := settings.Index.Convert && conf.SidecarWritable()
 		skipArchived := settings.Index.SkipArchived
 
-		indOpt := photoprism.NewIndexOptions(filepath.Clean(f.Path), f.Rescan, convert, true, false, skipArchived)
-		indOpt.SetUser(s.User())
+		indOpt := photoprism.NewIndexOptions(filepath.Clean(frm.Path), frm.Rescan, convert, true, false, skipArchived, conf)
+		indOpt.SetUser(s.GetUser())
 
 		if len(indOpt.Path) > 1 {
 			event.InfoMsg(i18n.MsgIndexingFiles, clean.Log(indOpt.Path))
@@ -65,7 +97,7 @@ func StartIndexing(router *gin.RouterGroup) {
 		lastRun, lastFound := ind.LastRun()
 		indexStart := time.Now()
 
-		// Start indexing.
+		// Update file index.
 		found, indexed := ind.Start(indOpt)
 
 		// Only run purge and moments if necessary.
@@ -90,22 +122,48 @@ func StartIndexing(router *gin.RouterGroup) {
 				"step":   "purge",
 			})
 
-			// Configure purge options.
-			prgOpt := photoprism.PurgeOptions{
-				Path:   filepath.Clean(f.Path),
+			// Get purge worker instance.
+			w := get.Purge()
+
+			// Purge worker options.
+			opt := photoprism.PurgeOptions{
+				Path:   filepath.Clean(frm.Path),
 				Ignore: found,
 				Force:  forceUpdate,
 			}
 
-			// Start purging.
-			prg := get.Purge()
-
-			if files, photos, updated, err := prg.Start(prgOpt); err != nil {
+			// Start purge to remove missing files from search results.
+			if files, photos, updated, err := w.Start(opt); err != nil {
 				c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{"error": txt.UpperFirst(err.Error())})
 				return
 			} else if updated > 0 {
 				event.InfoMsg(i18n.MsgRemovedFilesAndPhotos, len(files), len(photos))
 				forceUpdate = true
+			}
+		}
+
+		// Delete orphaned index entries, sidecar files and thumbnails?
+		if frm.Cleanup && s.GetUser().IsAdmin() {
+			event.Publish("index.updating", event.Data{
+				"uid":    indOpt.UID,
+				"action": indOpt.Action,
+				"step":   "cleanup",
+			})
+
+			// Get cleanup worker instance.
+			w := get.CleanUp()
+
+			// Cleanup worker options.
+			opt := photoprism.CleanUpOptions{
+				Dry: false,
+			}
+
+			// Start index and cache cleanup.
+			cleanupStart := time.Now()
+			if thumbnails, _, sidecars, err := w.Start(opt); err != nil {
+				log.Errorf("cleanup: %s", err)
+			} else if total := thumbnails + sidecars; total > 0 {
+				log.Infof("cleanup: deleted %s in total [%s]", english.Plural(total, "file", "files"), time.Since(cleanupStart))
 			}
 		}
 
@@ -124,27 +182,33 @@ func StartIndexing(router *gin.RouterGroup) {
 			}
 		}
 
-		elapsed := int(time.Since(start).Seconds())
+		elapsed := time.Since(start)
+		seconds := int(elapsed.Seconds())
 
-		msg := i18n.Msg(i18n.MsgIndexingCompletedIn, elapsed)
+		log.Infof("library: indexed %s in %s", english.Plural(len(found), "file", "files"), elapsed)
 
-		event.Success(msg)
-		event.Publish("index.completed", event.Data{
-			"uid":     indOpt.UID,
-			"action":  indOpt.Action,
-			"path":    path,
-			"seconds": elapsed,
-		})
+		// Report success only if at least one file was indexed.
+		if indexed > 0 {
+			event.PublishSuccessMsg(i18n.MsgIndexingCompletedIn, seconds)
+		}
+
+		event.PublishCompleted([]string{"index.completed"}, indOpt.UID, indOpt.Action, seconds)
 
 		UpdateClientConfig()
 
-		c.JSON(http.StatusOK, i18n.Response{Code: http.StatusOK, Msg: msg})
+		c.JSON(http.StatusOK, i18n.NewResponse(http.StatusOK, i18n.MsgIndexingCompletedIn, seconds))
 	})
 }
 
 // CancelIndexing stops indexing media files in the "originals" folder.
 //
-// DELETE /api/v1/index
+//	@Summary	cancels the active indexing job
+//	@Id			CancelIndexing
+//	@Tags		Library
+//	@Produce	json
+//	@Success	200				{object}	i18n.Response
+//	@Failure	401,403,404,429	{object}	i18n.Response
+//	@Router		/api/v1/index [delete]
 func CancelIndexing(router *gin.RouterGroup) {
 	router.DELETE("/index", func(c *gin.Context) {
 		s := Auth(c, acl.ResourcePhotos, acl.ActionUpdate)

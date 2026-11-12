@@ -4,14 +4,14 @@ import (
 	"fmt"
 	"sort"
 
-	"github.com/urfave/cli"
+	"github.com/urfave/cli/v2"
 
 	"github.com/photoprism/photoprism/internal/form"
-	"github.com/photoprism/photoprism/pkg/report"
+	"github.com/photoprism/photoprism/pkg/txt/report"
 )
 
 // ShowSearchFiltersCommand configures the command name, flags, and action.
-var ShowSearchFiltersCommand = cli.Command{
+var ShowSearchFiltersCommand = &cli.Command{
 	Name:   "search-filters",
 	Usage:  "Displays supported search filters with examples",
 	Flags:  report.CliFlags,
@@ -30,9 +30,11 @@ func showSearchFiltersAction(ctx *cli.Context) error {
 		}
 	})
 
-	result, err := report.RenderFormat(rows, cols, report.CliFormat(ctx))
-
+	format, formatErr := report.CliFormatStrict(ctx)
+	if formatErr != nil {
+		return formatErr
+	}
+	result, err := report.RenderFormat(rows, cols, format)
 	fmt.Println(result)
-
 	return err
 }

@@ -1,38 +1,63 @@
 package photoprism
 
 import (
+	"errors"
 	"fmt"
-	"path/filepath"
 
 	"github.com/dustin/go-humanize/english"
 
-	"github.com/photoprism/photoprism/internal/query"
+	"github.com/photoprism/photoprism/internal/entity"
+	"github.com/photoprism/photoprism/internal/entity/query"
 	"github.com/photoprism/photoprism/pkg/clean"
+	"github.com/photoprism/photoprism/pkg/fs"
+	"github.com/photoprism/photoprism/pkg/log/status"
 )
 
 // IndexRelated indexes a group of related files and returns the result.
 func IndexRelated(related RelatedFiles, ind *Index, o IndexOptions) (result IndexResult) {
 	// Skip if main file is nil.
 	if related.Main == nil {
-		result.Err = fmt.Errorf("index: no main file for %s", clean.Log(related.String()))
+		result.Err = fmt.Errorf("index: no main media file for %s", clean.Log(related.String()))
 		result.Status = IndexFailed
 		return result
+	}
+
+	// Forced reindexing upgrades captures that older versions stored as separate lens/proxy photos.
+	if o.Rescan {
+		if reconcileErr := reconcileInsta360Photos(related); reconcileErr != nil {
+			log.Warnf("index: could not reconcile Insta360 capture %s (%s)", related.MainLogName(), reconcileErr)
+		}
 	}
 
 	done := make(map[string]bool)
 	result = IndexMain(&related, ind, o)
 
-	if result.Failed() {
+	switch {
+	case result.Failed():
 		return result
-	} else if !result.Success() {
+	case !result.Success():
 		// Skip related files if indexing was not completely successful.
 		return result
-	} else if result.Stacked() && related.Len() > 1 {
+	case result.Stacked() && related.Len() > 1:
 		// Show info if main file was stacked and has additional related files.
 		log.Infof("index: %s has %s", related.MainLogName(), english.Plural(related.Count(), "related file", "related files"))
 	}
 
+	// Related files of a new main file are added even if its photo is archived, as it was restored from a backup.
+	if result.Status == IndexAdded {
+		o.SkipArchived = false
+	}
+
 	done[related.Main.FileName()] = true
+	photoUID := result.PhotoUID
+	archived := result.Archived()
+
+	// A skipped main file has no result UID, so its photo and archive state are looked up through its file.
+	if photoUID == "" {
+		var mainArchived bool
+		photoUID, mainArchived = indexedPhoto(related.Main)
+		archived = mainArchived && o.SkipArchived
+	}
 
 	i := 0
 
@@ -50,53 +75,142 @@ func IndexRelated(related RelatedFiles, ind *Index, o IndexOptions) (result Inde
 
 		done[f.FileName()] = true
 
+		// Skip files if the filename extension does not match their mime type,
+		// see https://github.com/photoprism/photoprism/issues/3518 for details.
+		if typeErr := f.CheckType(); typeErr != nil {
+			typeErr = fmt.Errorf("index: skipped %s because it %w", clean.Log(f.RootRelName()), typeErr)
+
+			// The group only fails if it has no other image to show; other related files are optional.
+			if fs.IsPreviewImageExt(f.FileName()) && !related.HasPreview() {
+				result.Err = typeErr
+				result.Status = IndexFailed
+			} else {
+				log.Warn(typeErr)
+			}
+
+			continue
+		}
+
 		// Show warning if sidecar file exceeds size or resolution limit.
-		if limitErr, _ := f.ExceedsBytes(o.ByteLimit); limitErr != nil {
+		if _, limitErr := f.ExceedsBytes(o.ByteLimit); limitErr != nil {
 			log.Warnf("index: %s", limitErr)
-		} else if limitErr, _ = f.ExceedsResolution(o.ResolutionLimit); limitErr != nil {
+		} else if _, limitErr = f.ExceedsResolution(o.ResolutionLimit); limitErr != nil {
 			log.Warnf("index: %s", limitErr)
 		}
 
-		// Extract metadata to a JSON file with Exiftool.
-		if f.NeedsExifToolJson() {
-			if jsonName, err := ind.convert.ToJson(f, false); err != nil {
-				log.Tracef("exiftool: %s", clean.Log(err.Error()))
-				log.Debugf("exiftool: failed parsing %s", clean.Log(f.RootRelName()))
-			} else {
-				log.Debugf("index: created %s", filepath.Base(jsonName))
-			}
+		warnInsta360LensNotVideo("index", f)
+
+		// Create JSON sidecar file, if needed.
+		if jsonErr := f.CreateExifToolJson(ind.convert); jsonErr != nil {
+			log.Warnf("index: %s", clean.Error(jsonErr))
 		}
 
 		// Create JPEG sidecar for media files in other formats so that thumbnails can be created.
-		if o.Convert && f.IsMedia() && !f.HasPreviewImage() {
-			if jpg, err := ind.convert.ToImage(f, false); err != nil {
-				result.Err = fmt.Errorf("index: failed creating preview for %s (%s)", clean.Log(f.RootRelName()), err.Error())
-				result.Status = IndexFailed
-				return result
-			} else {
-				log.Debugf("index: created %s", clean.Log(jpg.BaseName()))
-
-				if err := jpg.CreateThumbnails(ind.thumbPath(), false); err != nil {
-					result.Err = fmt.Errorf("index: failed creating thumbnails for %s (%s)", clean.Log(f.RootRelName()), err.Error())
+		if o.Convert && f.IsMedia() && !f.InSidecar() && !f.HasPreviewImage() && !insta360SkipConvert(f) {
+			// Try to create a preview image; if this fails, log and continue without failing the whole group.
+			if img, imgErr := ind.convert.ToImage(f, false); imgErr != nil {
+				// Stop the run instead of masking a full disk as a generic preview error.
+				if errors.Is(imgErr, status.ErrInsufficientStorage) {
+					ind.abortInsufficientStorage()
+					result.Err = imgErr
 					result.Status = IndexFailed
 					return result
 				}
 
-				related.Files = append(related.Files, jpg)
+				log.Warnf("index: could not create preview image for %s (%s)", clean.Log(f.RootRelName()), imgErr)
+				// Continue indexing other related files without changing the overall success status.
+				continue
+			} else if img == nil {
+				log.Debugf("index: skipped creating preview image for %s", clean.Log(f.RootRelName()))
+			} else {
+				log.Debugf("index: created %s", clean.Log(img.BaseName()))
+
+				// Skip with warning if thumbs could not be created.
+				if thumbsErr := img.GenerateThumbnails(ind.thumbPath(), false); thumbsErr != nil {
+					// Stop the run instead of masking a full disk as a generic thumbnail error.
+					if errors.Is(thumbsErr, status.ErrInsufficientStorage) {
+						ind.abortInsufficientStorage()
+						result.Err = thumbsErr
+						result.Status = IndexFailed
+						return result
+					}
+
+					log.Warnf("index: failed to generate thumbnails for %s (%s)", clean.Log(f.RootRelName()), thumbsErr.Error())
+					// Continue indexing; preview image exists and other related files may still succeed.
+					continue
+				}
+
+				// Add preview image to list of files.
+				img.SetRelatedMain(related.Main)
+				related.Files = append(related.Files, img)
 			}
 		}
 
 		// Index related MediaFile.
+		f.SetRelatedMain(related.Main)
 		res := ind.MediaFile(f, o, "", result.PhotoUID)
+		if photoUID == "" && res.Success() {
+			photoUID = res.PhotoUID
+		}
+
+		// A main file without an indexed row leaves the archive state to the related files.
+		if res.Archived() && res.PhotoUID == photoUID {
+			archived = true
+		}
 
 		// Save file error.
 		if fileUid, err := res.FileError(); err != nil {
-			query.SetFileError(fileUid, err.Error())
+			query.SetFileError(fileUid, clean.Error(err))
 		}
 
 		// Log index result.
 		log.Infof("index: %s related %s file %s", res, f.FileType(), clean.Log(f.RootRelName()))
 	}
 
+	// Reconcile the logical source once the group is done. UserMediaFile already
+	// covered the primary preview and a distinct RAW/HEIC source's sidecars while
+	// indexing it, so this pass only serves incremental sidecar-only updates
+	// where the unchanged preview was filtered out of the list.
+	if o.ImportFaceTags && photoUID != "" && !archived && !related.ContainsPreview() && isXmpFaceSource(related.Main) {
+		// Collect first so a source that declares no region container skips both
+		// the primary-file and marker queries. A declared but empty set still
+		// proceeds: that is what removes markers whose regions the user deleted.
+		if regions, collectErr := collectXmpFaces(related.Main); collectErr != nil {
+			log.Warnf("index: %s while importing xmp face regions for %s", clean.Error(collectErr), related.MainLogName())
+		} else if !regions.Declared {
+			log.Tracef("index: no xmp face regions declared for %s", related.MainLogName())
+		} else if primary, primaryErr := entity.PrimaryFile(photoUID); primaryErr != nil {
+			log.Debugf("index: could not find primary file for xmp faces in %s (%s)", related.MainLogName(), clean.Error(primaryErr))
+		} else if saved, _, applyErr := applyXmpFaceRegions(regions, primary); applyErr != nil {
+			log.Warnf("index: %s while importing xmp face regions for %s", clean.Error(applyErr), related.MainLogName())
+		} else if saved {
+			log.Debugf("index: imported xmp face regions for %s", related.MainLogName())
+		}
+	}
+
 	return result
+}
+
+// indexedPhoto returns the UID of the photo an indexed file belongs to and whether it is archived (not removed),
+// or an empty UID if the file is not indexed or has no photo.
+func indexedPhoto(m *MediaFile) (photoUID string, archived bool) {
+	if m == nil {
+		return "", false
+	}
+
+	var row struct {
+		PhotoUID string
+		Archived bool
+	}
+
+	if res := entity.UnscopedDb().Table(entity.File{}.TableName()).
+		Select("photos.photo_uid, photos.deleted_at IS NOT NULL AND photos.photo_quality > -1 AS archived").
+		Joins("JOIN photos ON photos.id = files.photo_id").
+		Where("files.file_root = ? AND files.file_name = ? AND files.file_missing = ? AND files.deleted_at IS NULL",
+			m.Root(), m.RootRelName(), false).
+		Limit(1).Scan(&row); res.Error != nil || res.RowsAffected == 0 {
+		return "", false
+	}
+
+	return row.PhotoUID, row.Archived
 }

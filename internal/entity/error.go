@@ -1,18 +1,48 @@
 package entity
 
 import (
+	"strings"
+	"sync/atomic"
 	"time"
 
-	"github.com/photoprism/photoprism/internal/event"
 	"github.com/sirupsen/logrus"
+
+	"github.com/photoprism/photoprism/internal/event"
+	"github.com/photoprism/photoprism/internal/mutex"
+	"github.com/photoprism/photoprism/pkg/clean"
 )
+
+// ErrorMessageBytes is the storage limit of the error_message column in bytes,
+// matching its VARBINARY(2048) definition. Messages may contain multi-byte text
+// (e.g. file paths or recovered-panic stack traces), so writes are clipped in the
+// middle by bytes, without splitting a character, so the cause at the end stays.
+const ErrorMessageBytes = 2048
+
+// logEvents is true when events are being recorded in the "errors" database table.
+var logEvents = atomic.Bool{}
+
+// LogWarningsAndErrors starts logging published error and warning
+// events to the errors database table if a database instance is set.
+func LogWarningsAndErrors() {
+	if !HasDbProvider() {
+		return
+	}
+
+	if logEvents.CompareAndSwap(false, true) {
+		if err := mutex.ErrorWorker.Start(); err != nil {
+			// This should not be possible, as the CompareAndSwap should prevent this scenario.
+			return
+		}
+		go Error{}.LogEvents(logrus.WarnLevel)
+	}
+}
 
 // Error represents an error message log.
 type Error struct {
-	ID           uint      `gorm:"primary_key" json:"ID" yaml:"ID"`
-	ErrorTime    time.Time `sql:"index" json:"Time" yaml:"Time"`
-	ErrorLevel   string    `gorm:"type:VARBINARY(32)" json:"Level" yaml:"Level"`
-	ErrorMessage string    `gorm:"type:VARBINARY(2048)" json:"Message" yaml:"Message"`
+	ID           uint      `gorm:"primaryKey;size:32" json:"ID" yaml:"ID"`
+	ErrorTime    time.Time `gorm:"index" json:"Time" yaml:"Time"`
+	ErrorLevel   string    `gorm:"type:bytes;size:32" json:"Level" yaml:"Level"`
+	ErrorMessage string    `gorm:"type:bytes;size:2048" json:"Message" yaml:"Message"`
 }
 
 // Errors represents a list of error log messages.
@@ -23,37 +53,47 @@ func (Error) TableName() string {
 	return "errors"
 }
 
-// LogEvents logs published error events.
-func (Error) LogEvents() {
+// LogEvents writes published events with the specified minimum level to the "errors" database table.
+func (Error) LogEvents(minLevel logrus.Level) {
 	s := event.Subscribe("log.*")
 
 	defer func() {
+		mutex.ErrorWorker.Stop() // Make sure that the worker has been stopped, before swapping the state.
+		logEvents.CompareAndSwap(true, false)
 		event.Unsubscribe(s)
 	}()
 
+	// Wait for log events and write them to the  "errors" table,
+	// as long as a database connection exists.
 	for msg := range s.Receiver {
-		level, ok := msg.Fields["level"]
+		if !mutex.ErrorWorker.Canceled() {
+			var err error
+			var level logrus.Level
 
-		if !ok {
-			continue
+			if val, ok := msg.Fields["level"]; !ok {
+				continue
+			} else if level, err = logrus.ParseLevel(val.(string)); err != nil || level > minLevel {
+				continue
+			}
+
+			errLog := Error{ErrorLevel: level.String()}
+
+			if val, ok := msg.Fields["message"]; ok {
+				errLog.ErrorMessage = clean.ClipMiddle(strings.TrimSpace(val.(string)), ErrorMessageBytes)
+			}
+
+			if val, ok := msg.Fields["time"]; ok {
+				errLog.ErrorTime = val.(time.Time)
+			}
+
+			if HasDbProvider() {
+				Db().Create(&errLog)
+			} else {
+				return
+			}
+		} else {
+			return
+
 		}
-
-		logLevel, err := logrus.ParseLevel(level.(string))
-
-		if err != nil || logLevel >= logrus.InfoLevel {
-			continue
-		}
-
-		newError := Error{ErrorLevel: logLevel.String()}
-
-		if val, ok := msg.Fields["message"]; ok {
-			newError.ErrorMessage = val.(string)
-		}
-
-		if val, ok := msg.Fields["time"]; ok {
-			newError.ErrorTime = val.(time.Time)
-		}
-
-		Db().Create(&newError)
 	}
 }

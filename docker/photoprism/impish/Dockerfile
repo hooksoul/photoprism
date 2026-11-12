@@ -1,7 +1,7 @@
 ##################################################### BUILD STAGE ######################################################
-FROM photoprism/develop:impish as build
+FROM photoprism/develop:impish AS build
 
-# Copyright © 2018 - 2023 PhotoPrism UG. All rights reserved.
+# Copyright © 2018 - 2026 PhotoPrism UG. All rights reserved.
 #
 # Questions? Email us at hello@photoprism.app or visit our website to learn
 # more about our team, products and services: https://www.photoprism.app/
@@ -25,7 +25,7 @@ FROM ubuntu:impish
 # See: https://github.com/opencontainers/image-spec/blob/main/annotations.md
 LABEL org.opencontainers.image.title="PhotoPrism® (Ubuntu 21.10)"
 LABEL org.opencontainers.image.description="Ubuntu 21.10 (Impish Indri)"
-LABEL org.opencontainers.image.url="https://hub.docker.com/repository/docker/photoprism/photoprism"
+LABEL org.opencontainers.image.url="https://hub.docker.com/r/photoprism/photoprism"
 LABEL org.opencontainers.image.source="https://github.com/photoprism/photoprism"
 LABEL org.opencontainers.image.documentation="https://docs.photoprism.app/getting-started/"
 LABEL org.opencontainers.image.authors="PhotoPrism UG <hello@photoprism.app>"
@@ -36,15 +36,19 @@ ARG TARGETARCH
 ARG BUILD_TAG
 
 # Set environment variables, see https://docs.photoprism.app/getting-started/config-options/.
-ENV PHOTOPRISM_ARCH=$TARGETARCH \
+ENV DO_NOT_TRACK=true \
+    ORT_DISABLE_TELEMETRY=1 \
+    PHOTOPRISM_ARCH=$TARGETARCH \
+    PHOTOPRISM_CONTAINER="true" \
     DOCKER_TAG=$BUILD_TAG \
-    DOCKER_ENV="prod" \
-    PS1="\u@$DOCKER_TAG:\w\$ " \
+    PS1="\u@$BUILD_TAG:\w\$ " \
     PATH="/usr/local/sbin:/usr/sbin:/sbin:/usr/local/bin:/usr/bin:/bin:/scripts:/opt/photoprism/bin" \
     LD_LIBRARY_PATH="/usr/local/lib:/usr/lib" \
     TMPDIR="/tmp" \
     DEBIAN_FRONTEND="noninteractive" \
-    TF_CPP_MIN_LOG_LEVEL="2" \
+    TF_CPP_MIN_LOG_LEVEL=4 \
+    TF_ENABLE_ONEDNN_OPTS=1 \
+    MALLOC_ARENA_MAX=2 \
     PROG="photoprism" \
     PHOTOPRISM_ASSETS_PATH="/opt/photoprism/assets" \
     PHOTOPRISM_IMPORT_PATH="/photoprism/import" \
@@ -59,17 +63,13 @@ ENV PHOTOPRISM_ARCH=$TARGETARCH \
     PHOTOPRISM_UPLOAD_NSFW="true" \
     PHOTOPRISM_DETECT_NSFW="false" \
     PHOTOPRISM_EXPERIMENTAL="false" \
-    PHOTOPRISM_SITE_URL="http://photoprism.me:2342/" \
-    PHOTOPRISM_SITE_CAPTION="AI-Powered Photos App" \
-    PHOTOPRISM_SITE_DESCRIPTION="" \
-    PHOTOPRISM_SITE_AUTHOR="" \
+    PHOTOPRISM_SITE_URL="http://localhost:2342/" \
     PHOTOPRISM_HTTP_HOST="0.0.0.0" \
-    PHOTOPRISM_HTTP_PORT=2342 \
+    PHOTOPRISM_HTTP_PORT="2342" \
     PHOTOPRISM_DATABASE_DRIVER="sqlite" \
     PHOTOPRISM_DATABASE_SERVER="" \
     PHOTOPRISM_DATABASE_NAME="photoprism" \
     PHOTOPRISM_DATABASE_USER="photoprism" \
-    PHOTOPRISM_DATABASE_PASSWORD="" \
     PHOTOPRISM_DISABLE_CHOWN="false" \
     PHOTOPRISM_DISABLE_WEBDAV="false" \
     PHOTOPRISM_DISABLE_SETTINGS="false" \
@@ -78,21 +78,14 @@ ENV PHOTOPRISM_ARCH=$TARGETARCH \
     PHOTOPRISM_DISABLE_PLACES="false" \
     PHOTOPRISM_DISABLE_TENSORFLOW="false" \
     PHOTOPRISM_DISABLE_FACES="false" \
-    PHOTOPRISM_DISABLE_CLASSIFICATION="false" \
     PHOTOPRISM_RAW_PRESETS="false" \
-    PHOTOPRISM_THUMB_FILTER="lanczos" \
     PHOTOPRISM_THUMB_UNCACHED="false" \
-    PHOTOPRISM_THUMB_SIZE=2048 \
-    PHOTOPRISM_THUMB_SIZE_UNCACHED=7680 \
-    PHOTOPRISM_JPEG_SIZE=7680 \
-    PHOTOPRISM_JPEG_QUALITY=85 \
-    PHOTOPRISM_WORKERS=0 \
-    PHOTOPRISM_WAKEUP_INTERVAL=900 \
-    PHOTOPRISM_AUTO_INDEX=300 \
-    PHOTOPRISM_AUTO_IMPORT=300
+    PHOTOPRISM_AUTO_INDEX="300" \
+    PHOTOPRISM_AUTO_IMPORT="-1" \
+    PHOTOPRISM_INIT="https"
 
 # Copy dist files and scripts.
-COPY --from=build --chown=root:root --chmod=755 /opt/photoprism/ /opt/photoprism
+COPY --from=build --chown=root:root /opt/photoprism/ /opt/photoprism
 COPY --chown=root:root --chmod=755 /scripts/dist/ /scripts/
 
 # Update base image and add dependencies.
@@ -124,12 +117,10 @@ RUN echo 'APT::Acquire::Retries "3";' > /etc/apt/apt.conf.d/80retries && \
       libavcodec-extra \
     && \
     /scripts/install-darktable.sh && \
-    echo 'alias ll="ls -alh"' >> /etc/skel/.bashrc && \
-    echo 'export PS1="\u@$DOCKER_TAG:\w\$ "' >> /etc/skel/.bashrc && \
-    echo "ALL ALL=(ALL) NOPASSWD:SETENV: /scripts/entrypoint-init.sh" >> /etc/sudoers.d/init && \
-    cp /etc/skel/.bashrc /root/.bashrc && \
+    /scripts/install-bashrc.sh && \
+    /scripts/install-sudoers.sh --image ce && \
+    /scripts/install-dircolors.sh && \
     /scripts/create-users.sh && \
-    cp /scripts/heif-convert.sh /usr/local/bin/heif-convert && \
     install -d -m 0777 -o 1000 -g 1000 \
       /photoprism/originals \
       /photoprism/import \
@@ -141,7 +132,7 @@ RUN echo 'APT::Acquire::Retries "3";' > /etc/apt/apt.conf.d/80retries && \
       /photoprism/storage/cache && \
     /scripts/cleanup.sh
 
-# Default working directory.
+# Set default working directory.
 WORKDIR /photoprism
 
 # Expose HTTP(S) ports.

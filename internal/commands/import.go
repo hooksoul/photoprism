@@ -2,29 +2,29 @@ package commands
 
 import (
 	"context"
-	"errors"
 	"path/filepath"
 	"strings"
 	"time"
 
-	"github.com/urfave/cli"
+	"github.com/dustin/go-humanize/english"
+	"github.com/urfave/cli/v2"
 
 	"github.com/photoprism/photoprism/internal/config"
-	"github.com/photoprism/photoprism/internal/get"
 	"github.com/photoprism/photoprism/internal/photoprism"
-	"github.com/photoprism/photoprism/pkg/clean"
+	"github.com/photoprism/photoprism/internal/photoprism/get"
 )
 
 // ImportCommand configures the command name, flags, and action.
-var ImportCommand = cli.Command{
+var ImportCommand = &cli.Command{
 	Name:      "mv",
 	Aliases:   []string{"import"},
 	Usage:     "Moves media files to originals",
 	ArgsUsage: "[source]",
 	Flags: []cli.Flag{
-		cli.BoolFlag{
-			Name:  "dest, d",
-			Usage: "relative originals `PATH` to which the files should be imported",
+		&cli.StringFlag{
+			Name:    "dest",
+			Aliases: []string{"d"},
+			Usage:   "relative originals `PATH` in which new files should be imported",
 		},
 	},
 	Action: importAction,
@@ -40,12 +40,12 @@ func importAction(ctx *cli.Context) error {
 	defer cancel()
 
 	if err != nil {
-		return err
+		return cli.Exit(err, 1)
 	}
 
 	// very if copy directory exist and is writable
 	if conf.ReadOnly() {
-		return config.ErrReadOnly
+		return cli.Exit(config.ErrReadOnly, 2)
 	}
 
 	conf.InitDb()
@@ -57,22 +57,26 @@ func importAction(ctx *cli.Context) error {
 	if sourcePath == "" {
 		sourcePath = conf.ImportPath()
 	} else {
-		abs, err := filepath.Abs(sourcePath)
+		abs, pathErr := filepath.Abs(sourcePath)
 
-		if err != nil {
-			return err
+		if pathErr != nil {
+			return cli.Exit(pathErr, 2)
 		}
 
 		sourcePath = abs
 	}
 
-	if sourcePath == conf.OriginalsPath() {
-		return errors.New("import path is identical with originals")
+	if err := get.Import().CheckPath(sourcePath); err != nil {
+		return cli.Exit(err, 2)
 	}
 
 	var destFolder string
+
 	if ctx.IsSet("dest") {
-		destFolder = clean.UserPath(ctx.String("dest"))
+		destFolder, err = sanitizeDestinationArg(ctx.String("dest"))
+		if err != nil {
+			return cli.Exit(err, 2)
+		}
 	} else {
 		destFolder = conf.ImportDest()
 	}
@@ -82,11 +86,11 @@ func importAction(ctx *cli.Context) error {
 	w := get.Import()
 	opt := photoprism.ImportOptionsMove(sourcePath, destFolder)
 
-	w.Start(opt)
+	imported := w.Start(opt)
 
 	elapsed := time.Since(start)
 
-	log.Infof("completed in %s", elapsed)
+	log.Infof("library: imported %s in %s", english.Plural(imported.Processed(), "file", "files"), elapsed)
 
 	return nil
 }

@@ -4,12 +4,8 @@ import (
 	"errors"
 	"fmt"
 	"image"
-	"image/png"
-	"os"
 	"path"
 	"path/filepath"
-
-	"github.com/disintegration/imaging"
 
 	"github.com/photoprism/photoprism/pkg/clean"
 	"github.com/photoprism/photoprism/pkg/fs"
@@ -45,7 +41,7 @@ func FileName(hash, thumbPath string, width, height int, opts ...ResampleOption)
 	suffix := Suffix(width, height, opts...)
 	p := path.Join(thumbPath, hash[0:1], hash[1:2], hash[2:3])
 
-	if err := os.MkdirAll(p, fs.ModeDir); err != nil {
+	if err = fs.MkdirAll(p); err != nil {
 		return "", err
 	}
 
@@ -74,38 +70,44 @@ func FromCache(imageFilename, hash, thumbPath string, width, height int, opts ..
 	}
 
 	if fileName, err = FileName(hash, thumbPath, width, height, opts...); err != nil {
-		log.Debugf("thumb: %s in %s (get filename)", err, clean.Log(imageFilename))
+		log.Debugf("thumb: %s in %s (filename)", err, clean.Log(filepath.Base(imageFilename)))
 		return "", err
 	} else if fileName, err = fs.Resolve(fileName); err != nil {
 		return "", ErrNotCached
-	} else if fs.FileExists(fileName) {
+	} else if fs.FileExistsNotEmpty(fileName) {
 		return fileName, nil
 	}
 
 	return "", ErrNotCached
 }
 
-// FromFile creates a new thumbnail with the specified size if it was not found in the cache, and returns the filename.
-func FromFile(imageFilename, hash, thumbPath string, width, height, orientation int, opts ...ResampleOption) (fileName string, err error) {
-	if fileName, err = FromCache(imageFilename, hash, thumbPath, width, height, opts...); err == nil {
+// FromFile generates a new thumbnail with the requested size, if it does not already exist, and returns its filename.
+func FromFile(imageName, hash, thumbPath string, width, height, orientation int, opts ...ResampleOption) (fileName string, err error) {
+	if fileName, err = FromCache(imageName, hash, thumbPath, width, height, opts...); err == nil {
 		return fileName, err
-	} else if err != ErrNotCached {
+	} else if !errors.Is(err, ErrNotCached) {
 		return "", err
+	}
+
+	// Use libvips to generate thumbnails?
+	if Library == LibVips {
+		fileName, _, err = Vips(imageName, nil, hash, thumbPath, width, height, opts...)
+		return fileName, err
 	}
 
 	// Generate thumb cache filename.
 	fileName, err = FileName(hash, thumbPath, width, height, opts...)
 
 	if err != nil {
-		log.Error(err)
+		log.Debugf("thumb: %s in %s (filename)", err, clean.Log(filepath.Base(imageName)))
 		return "", err
 	}
 
-	// Load image from storage.
-	img, err := Open(imageFilename, orientation)
+	// Load image from file.
+	img, err := Open(imageName, orientation)
 
 	if err != nil {
-		log.Debugf("thumb: %s in %s", err, clean.Log(filepath.Base(imageFilename)))
+		log.Debugf("thumb: %s in %s", err, clean.Log(filepath.Base(imageName)))
 		return "", err
 	}
 
@@ -129,17 +131,7 @@ func Create(img image.Image, fileName string, width, height int, opts ...Resampl
 
 	result = Resample(img, width, height, opts...)
 
-	var quality imaging.EncodeOption
-
-	if filepath.Ext(fileName) == "."+string(fs.ImagePNG) {
-		quality = imaging.PNGCompressionLevel(png.DefaultCompression)
-	} else if width <= 150 && height <= 150 {
-		quality = JpegQualitySmall.EncodeOption()
-	} else {
-		quality = JpegQuality.EncodeOption()
-	}
-
-	err = imaging.Save(result, fileName, quality)
+	err = Save(result, fileName, JpegQuality(width, height))
 
 	if err != nil {
 		log.Debugf("thumb: failed to save %s", clean.Log(filepath.Base(fileName)))

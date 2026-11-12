@@ -1,0 +1,393 @@
+package server
+
+import (
+	"errors"
+	"fmt"
+	"net/http"
+	"net/url"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/gin-gonic/gin"
+	"github.com/sirupsen/logrus"
+	"golang.org/x/net/webdav"
+
+	"github.com/photoprism/photoprism/internal/api"
+	"github.com/photoprism/photoprism/internal/config"
+	"github.com/photoprism/photoprism/internal/event"
+	"github.com/photoprism/photoprism/internal/mutex"
+	"github.com/photoprism/photoprism/internal/workers/auto"
+	"github.com/photoprism/photoprism/pkg/clean"
+	"github.com/photoprism/photoprism/pkg/fs"
+	"github.com/photoprism/photoprism/pkg/http/header"
+	"github.com/photoprism/photoprism/pkg/txt"
+)
+
+// WebDAVHandler wraps the http request handler so that it can be customized.
+var WebDAVHandler = func(c *gin.Context, router *gin.RouterGroup, srv *webdav.Handler) {
+	ServeWebDAV(c.Writer, c.Request, srv)
+}
+
+// WebDAV handles requests to the "/originals" and "/import" endpoints.
+func WebDAV(dir string, router *gin.RouterGroup, conf *config.Config) {
+	if router == nil {
+		log.Error("webdav: router is nil")
+		return
+	}
+
+	if conf == nil {
+		log.Error("webdav: conf is nil")
+		return
+	}
+
+	// Native file system restricted to a specific directory.
+	fileSystem := newWebDAVFileSystem(dir)
+	lockSystem := mutex.WebDAV(dir)
+
+	// Request logger function.
+	loggerFunc := func(request *http.Request, err error) {
+		if err != nil {
+			// An upload bounded as it was read leaves a partial file behind, since the
+			// handler copies before the bound trips and does not clean up after itself.
+			if request.Method == header.MethodPut && api.IsRequestBodyTooLarge(err) {
+				if fileName := WebDAVFileName(request, router, conf); fileName != "" {
+					WebDAVRemovePartialUpload(fileName, conf.OriginalsLimitBytes())
+				}
+			}
+
+			// Reported on the console-only system log, which is the operator's channel:
+			// x/net/webdav renders absolute local paths into these messages.
+			switch {
+			case request.Method == header.MethodMkcol && errors.Is(err, os.ErrExist):
+				// MKCOL on an existing collection is a benign probe: sync clients such as
+				// PhotoSync test for a directory before creating it — expected, not a failure.
+				event.SystemDebug([]string{"webdav", "collection %s already exists"}, clean.Log(request.URL.String()))
+			case WebDAVWriteMethod(request.Method):
+				event.SystemError([]string{"webdav", "%s in %s %s"}, clean.ErrorFull(err), clean.Log(request.Method), clean.Log(request.URL.String()))
+			default:
+				event.SystemDebug([]string{"webdav", "%s in %s %s"}, clean.ErrorFull(err), clean.Log(request.Method), clean.Log(request.URL.String()))
+			}
+		} else {
+			// Determine the filename if it is an uploaded file and process custom request headers, if any.
+			if fileName := WebDAVFileName(request, router, conf); fileName != "" {
+				// Flag the uploaded file as favorite if the "X-Favorite" header is set to "1".
+				if request.Header.Get(header.XFavorite) == "1" && canWriteManagedFiles(request.Context()) {
+					WebDAVSetFavoriteFlag(fileName)
+				}
+
+				// Set the file modification time based on the Unix timestamp found in the "X-OC-MTime" header.
+				if fileMtime := txt.Int64(request.Header.Get(header.XModTime)); fileMtime > 0 {
+					WebDAVSetFileMtime(fileName, fileMtime)
+				}
+			}
+
+			switch request.Method {
+			case header.MethodPut, header.MethodMkcol, header.MethodDelete, header.MethodMove, header.MethodCopy, header.MethodProppatch:
+				log.Infof("webdav: %s %s", clean.Log(request.Method), clean.Log(request.URL.String()))
+
+				if router.BasePath() == conf.BaseUri(WebDAVOriginals) {
+					auto.ShouldIndex()
+				} else if router.BasePath() == conf.BaseUri(WebDAVImport) {
+					auto.ShouldImport()
+				}
+			default:
+				log.Tracef("webdav: %s %s", clean.Log(request.Method), clean.Log(request.URL.String()))
+			}
+		}
+	}
+
+	// Create WebDAV request handler.
+	srv := &webdav.Handler{
+		Prefix:     router.BasePath(),
+		FileSystem: fileSystem,
+		LockSystem: lockSystem,
+		Logger:     loggerFunc,
+	}
+
+	// Wrap handler to check quota and permissions.
+	handlerFunc := func(c *gin.Context) {
+		// PATCH is intentionally not supported by the x/net/webdav handler in
+		// PhotoPrism and must return 405 instead of a generic 400 response.
+		if c.Request.Method == header.MethodPatch {
+			c.AbortWithStatus(http.StatusMethodNotAllowed)
+			return
+		}
+
+		// Refuse a separator in the name before anything is created, renamed, or copied.
+		if WebDAVSeparatorInName(c.Request) {
+			// Console-only: the refusal returns before the handler's own logger.
+			event.SystemWarn([]string{"webdav", "%s %s contains a path separator"}, clean.Log(c.Request.Method), clean.Log(c.Request.URL.String()))
+			c.AbortWithStatus(http.StatusBadRequest)
+
+			return
+		}
+
+		// Abort PUT and COPY requests if there
+		// is not enough free storage to upload new files.
+		switch c.Request.Method {
+		case header.MethodPut, header.MethodCopy:
+			if conf.InsufficientStorage() {
+				c.AbortWithStatus(http.StatusInsufficientStorage)
+				return
+			}
+		}
+
+		// Bound an uploaded file to the configured originals size limit, when set. A declared
+		// length over the limit is refused before the handler runs, since it opens the
+		// destination with O_TRUNC; any other body is bounded as it is read.
+		if c.Request.Method == header.MethodPut {
+			if limit := conf.OriginalsLimitBytes(); limit > 0 {
+				if c.Request.ContentLength > limit {
+					// Console-only: the refusal returns before the handler's own logger.
+					event.SystemWarn([]string{"webdav", "%s %s exceeds the originals limit"}, clean.Log(c.Request.Method), clean.Log(c.Request.URL.String()))
+					c.AbortWithStatus(http.StatusRequestEntityTooLarge)
+
+					return
+				}
+
+				api.LimitRequestBodyBytes(c, limit)
+			}
+		}
+
+		// Bound the XML bodies the metadata methods parse into memory. A declared length over the
+		// bound is refused outright; anything else is bounded as it is read, so a body of unknown
+		// length is still accepted.
+		switch c.Request.Method {
+		case header.MethodLock, header.MethodPropfind, header.MethodProppatch:
+			if c.Request.ContentLength > api.MaxWebDAVMetadataRequestBytes {
+				// Reported on the console-only system log, since the refusal returns before the
+				// handler's own logger runs, and at the level that logger gives the method.
+				level := logrus.DebugLevel
+
+				if WebDAVWriteMethod(c.Request.Method) {
+					level = logrus.WarnLevel
+				}
+
+				event.System(level, []string{"webdav", "%s %s exceeds the metadata limit"}, clean.Log(c.Request.Method), clean.Log(c.Request.URL.String()))
+				c.AbortWithStatus(http.StatusRequestEntityTooLarge)
+
+				return
+			}
+
+			api.LimitRequestBodyBytes(c, api.MaxWebDAVMetadataRequestBytes)
+		}
+
+		// Clamp the requested LOCK lifetime so a client cannot mint infinite or
+		// excessively long-lived locks; the lock system enforces the same cap.
+		WebDAVClampLockTimeout(c.Request)
+
+		// Invoke handler callback.
+		WebDAVHandler(c, router, srv)
+	}
+
+	// handleRead registers WebDAV methods used for browsing and downloading.
+	handleRead := func(path string, h func(*gin.Context)) {
+		router.Handle(header.MethodHead, path, h)
+		router.Handle(header.MethodGet, path, h)
+		router.Handle(header.MethodPost, path, h)
+		router.Handle(header.MethodOptions, path, h)
+		router.Handle(header.MethodPropfind, path, h)
+	}
+
+	// handleWrite registers WebDAV methods to may modify the file system.
+	handleWrite := func(path string, h func(*gin.Context)) {
+		router.Handle(header.MethodPut, path, h)
+		router.Handle(header.MethodDelete, path, h)
+		router.Handle(header.MethodMkcol, path, h)
+		router.Handle(header.MethodCopy, path, h)
+		router.Handle(header.MethodMove, path, h)
+		router.Handle(header.MethodLock, path, h)
+		router.Handle(header.MethodUnlock, path, h)
+		router.Handle(header.MethodProppatch, path, h)
+	}
+
+	// handleUnsupported registers methods that should always return 405.
+	handleUnsupported := func(path string, h func(*gin.Context)) {
+		router.Handle(header.MethodPatch, path, h)
+	}
+
+	// Register both base and wildcard routes to avoid automatic slash redirects
+	// on collection roots such as "/originals" and "/import".
+	for _, route := range []string{"", "/*path"} {
+		handleRead(route, handlerFunc)
+		handleUnsupported(route, func(c *gin.Context) {
+			c.AbortWithStatus(http.StatusMethodNotAllowed)
+		})
+
+		// Only supported with read-only mode disabled.
+		if conf.ReadOnly() {
+			handleWrite(route, func(c *gin.Context) {
+				c.AbortWithStatus(http.StatusMethodNotAllowed)
+			})
+		} else {
+			handleWrite(route, handlerFunc)
+		}
+	}
+}
+
+// WebDAVSeparatorInName reports whether a request would create, rename, or copy a name holding
+// a backslash. Refuse it rather than normalizing it: the upstream handler treats the character
+// as ordinary, so any rewrite here would name a different file than the one it opens.
+func WebDAVSeparatorInName(request *http.Request) bool {
+	switch request.Method {
+	case header.MethodPut, header.MethodMkcol:
+		return strings.Contains(request.URL.Path, "\\")
+	case header.MethodMove, header.MethodCopy:
+		// The destination is a URL, so compare the decoded path the handler will resolve.
+		u, err := url.Parse(request.Header.Get("Destination"))
+		return err == nil && strings.Contains(u.Path, "\\")
+	}
+
+	return false
+}
+
+// WebDAVClampLockTimeout rewrites the LOCK "Timeout" request header so the lock the
+// upstream handler grants — and the lifetime it reports back — cannot exceed
+// mutex.WebDAVMaxLockLifetime. Clamping the header keeps the granted timeout the client
+// sees consistent with what is actually enforced, so conformant clients refresh in time.
+func WebDAVClampLockTimeout(request *http.Request) {
+	if request == nil || request.Method != header.MethodLock {
+		return
+	}
+
+	// A negative cap disables clamping (infinite locks allowed).
+	maxLifetime := mutex.WebDAVMaxLockLifetime
+	if maxLifetime < 0 {
+		return
+	}
+
+	// The upstream handler parses only the first comma-separated timeout value.
+	first := request.Header.Get(header.Timeout)
+	if i := strings.IndexByte(first, ','); i >= 0 {
+		first = first[:i]
+	}
+	first = strings.TrimSpace(first)
+
+	maxSeconds := int64(maxLifetime / time.Second)
+	capped := fmt.Sprintf("Second-%d", maxSeconds)
+
+	switch {
+	case first == "" || strings.EqualFold(first, "Infinite"):
+		// Absent or infinite request: grant the capped lifetime instead.
+		request.Header.Set(header.Timeout, capped)
+	case strings.HasPrefix(first, "Second-"):
+		// Numeric request: clamp only when it exceeds the cap, leave malformed
+		// values untouched so the upstream handler still rejects them.
+		if n, err := strconv.ParseInt(first[len("Second-"):], 10, 64); err == nil && n > maxSeconds {
+			request.Header.Set(header.Timeout, capped)
+		}
+	}
+}
+
+// WebDAVFileName determines the name and path of an uploaded file and returns its name if it exists.
+func WebDAVFileName(request *http.Request, router *gin.RouterGroup, conf *config.Config) (fileName string) {
+	// Check if this is a PUT request, as used for file uploads.
+	if request.Method != header.MethodPut {
+		return ""
+	}
+
+	basePath := router.BasePath()
+
+	// Determine the absolute file path based on the request URL and the configuration.
+	switch basePath {
+	case conf.BaseUri(WebDAVOriginals):
+		// Resolve the requested path safely under OriginalsPath.
+		rel := strings.TrimPrefix(request.URL.Path, basePath)
+		// Make relative if a leading slash remains after trimming the base.
+		rel = strings.TrimLeft(rel, "/\\")
+		if name, err := joinUnderBase(conf.OriginalsPath(), rel); err == nil {
+			fileName = name
+		} else {
+			return ""
+		}
+	case conf.BaseUri(WebDAVImport):
+		// Resolve the requested path safely under ImportPath.
+		rel := strings.TrimPrefix(request.URL.Path, basePath)
+		rel = strings.TrimLeft(rel, "/\\")
+		if name, err := joinUnderBase(conf.ImportPath(), rel); err == nil {
+			fileName = name
+		} else {
+			return ""
+		}
+	default:
+		return ""
+	}
+
+	// Check if the file actually exists and return an empty string otherwise.
+	if !fs.FileExists(fileName) {
+		return ""
+	}
+
+	return fileName
+}
+
+// joinUnderBase resolves a relative request name under baseDir using the shared
+// safe-join, so WebDAV uploads cannot escape the originals or import directory.
+// Absolute paths, Windows-style volume names, drive-letter prefixes, and
+// parent-directory traversal are rejected, with containment verified via
+// filepath.Rel rather than a string prefix.
+func joinUnderBase(baseDir, rel string) (string, error) {
+	return fs.SafeJoin(baseDir, rel)
+}
+
+// WebDAVRemovePartialUpload deletes an upload that the configured size limit cut short.
+// A body stopped by that bound is exactly size bytes, so any other size, or a name that is not
+// a regular file, belongs to something this request did not write and is left alone.
+func WebDAVRemovePartialUpload(fileName string, size int64) {
+	// #nosec G703 fileName is resolved under the mount root by WebDAVFileName via joinUnderBase.
+	if info, err := os.Lstat(fileName); err != nil || !info.Mode().IsRegular() || info.Size() != size {
+		log.Tracef("webdav: kept %s, not an incomplete upload", clean.Log(filepath.Base(fileName)))
+		return
+	}
+
+	// #nosec G703 the check above establishes that this name holds this request's partial upload.
+	switch err := os.Remove(fileName); {
+	case err == nil:
+		log.Infof("webdav: removed incomplete upload %s", clean.Log(filepath.Base(fileName)))
+	case !errors.Is(err, os.ErrNotExist):
+		// Reported on the console: the error renders the absolute file path.
+		event.SystemError([]string{"webdav", "%s"}, clean.ErrorFull(err))
+	}
+}
+
+// WebDAVSetFavoriteFlag adds the favorite flag to files uploaded via WebDAV.
+func WebDAVSetFavoriteFlag(fileName string) {
+	yamlName := fs.AbsPrefix(fileName, false) + fs.ExtYml
+
+	// Abort if YAML file already exists to avoid overwriting metadata.
+	if fs.FileExists(yamlName) {
+		log.Warnf("webdav: %s already exists", clean.Log(filepath.Base(yamlName)))
+		return
+	}
+
+	// Make sure directory exists.
+	if err := fs.MkdirAll(filepath.Dir(yamlName)); err != nil {
+		// Reported on the console: the error renders the absolute sidecar path.
+		event.SystemError([]string{"webdav", "%s"}, clean.ErrorFull(err))
+		return
+	}
+
+	// Write YAML data to file.
+	if err := fs.WriteFile(yamlName, []byte("Favorite: true\n"), fs.ModeConfigFile); err != nil {
+		// Reported on the console: the error renders the absolute sidecar path.
+		event.SystemError([]string{"webdav", "%s"}, clean.ErrorFull(err))
+		return
+	}
+
+	// Log success.
+	log.Infof("webdav: flagged %s as favorite", clean.Log(filepath.Base(fileName)))
+}
+
+// WebDAVSetFileMtime updaters the file modification time based on a Unix timestamp string.
+func WebDAVSetFileMtime(fileName string, mtimeUnix int64) {
+	if mtime := time.Unix(mtimeUnix, 0); mtimeUnix <= 0 || mtime.IsZero() || time.Now().Before(mtime) {
+		log.Warnf("webdav: invalid mtime provided for %s", clean.Log(filepath.Base(fileName)))
+	} else if mtimeErr := os.Chtimes(fileName, time.Time{}, mtime); mtimeErr != nil {
+		log.Warnf("webdav: failed to set mtime for %s", clean.Log(filepath.Base(fileName)))
+	} else {
+		log.Infof("webdav: set mtime for %s", clean.Log(filepath.Base(fileName)))
+	}
+}

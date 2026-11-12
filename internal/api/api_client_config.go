@@ -5,27 +5,77 @@ import (
 
 	"github.com/gin-gonic/gin"
 
+	"github.com/photoprism/photoprism/internal/auth/acl"
+	"github.com/photoprism/photoprism/internal/config"
+	"github.com/photoprism/photoprism/internal/entity"
 	"github.com/photoprism/photoprism/internal/event"
-	"github.com/photoprism/photoprism/internal/get"
+	"github.com/photoprism/photoprism/internal/photoprism/get"
+	"github.com/photoprism/photoprism/pkg/http/header"
 )
+
+// stripBroadcastTokens clears the session tokens from a client config before it is broadcast.
+// The config.updated event reaches every connected client, so a value carried on it would overwrite
+// individual session tokens; clients refresh theirs from the X-Preview-Token and X-Download-Token
+// response headers instead.
+func stripBroadcastTokens(cfg *config.ClientConfig) *config.ClientConfig {
+	cfg.PreviewToken = ""
+	cfg.DownloadToken = ""
+
+	return cfg
+}
 
 // UpdateClientConfig publishes updated client configuration values over the websocket connections.
 func UpdateClientConfig() {
-	event.Publish("config.updated", event.Data{"config": get.Config().ClientUser(false)})
+	if !entity.HasDbProvider() {
+		return
+	}
+
+	conf := get.Config()
+	if conf == nil {
+		return
+	}
+
+	clientConfig := stripBroadcastTokens(conf.ClientUser(false))
+
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				log.Warnf("api: failed to publish updated client config (%v)", r)
+			}
+		}()
+
+		event.Publish("config.updated", event.Data{"config": clientConfig})
+	}()
 }
 
 // GetClientConfig returns the client configuration values as JSON.
 //
-// GET /api/v1/config
+//	@Summary	get client configuration
+//	@Id			GetClientConfig
+//	@Tags		Config
+//	@Produce	json
+//	@Success	200	{object}	gin.H
+//	@Failure	401	{object}	i18n.Response
+//	@Router		/api/v1/config [get]
 func GetClientConfig(router *gin.RouterGroup) {
 	router.GET("/config", func(c *gin.Context) {
-		s := Session(SessionID(c))
+		// Prevent CDNs from caching this endpoint.
+		if header.IsCdn(c.Request) {
+			AbortNotFound(c)
+			return
+		}
+
 		conf := get.Config()
 
-		if s == nil {
-			c.JSON(http.StatusOK, conf.ClientPublic())
-		} else {
+		if s := AuthAny(c, acl.ResourceConfig, acl.Permissions{acl.ActionView}); s.Valid() {
 			c.JSON(http.StatusOK, conf.ClientSession(s))
+			return
+		} else if conf.DisableFrontend() {
+			AbortUnauthorized(c)
+			return
 		}
+
+		// Return public client config for loading the web frontend
+		c.JSON(http.StatusOK, conf.ClientPublic())
 	})
 }

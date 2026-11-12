@@ -3,17 +3,20 @@ package entity
 import (
 	"sync"
 
-	"github.com/jinzhu/gorm"
+	"gorm.io/gorm"
+
+	"github.com/photoprism/photoprism/pkg/dsn"
+	"github.com/photoprism/photoprism/pkg/media"
 	"github.com/photoprism/photoprism/pkg/rnd"
 )
 
 var photoMergeMutex = sync.Mutex{}
 
-// ResolvePrimary ensures there is only one primary file for a photo.
+// ResolvePrimary ensures only one associated file remains marked as primary, delegating to the file helper.
 func (m *Photo) ResolvePrimary() error {
 	var file File
 
-	if err := Db().Where("file_primary = 1 AND photo_id = ?", m.ID).
+	if err := Db().Where("file_primary = TRUE AND photo_id = ?", m.ID).
 		Order("file_width DESC, file_hdr DESC").
 		First(&file).Error; err == nil && file.ID > 0 {
 		return file.ResolvePrimary()
@@ -22,7 +25,7 @@ func (m *Photo) ResolvePrimary() error {
 	return nil
 }
 
-// Stackable tests if the photo may be stacked.
+// Stackable reports whether the photo participates in stacking workflows.
 func (m *Photo) Stackable() bool {
 	if !m.HasID() || m.PhotoStack == IsUnstacked || m.PhotoName == "" {
 		return false
@@ -31,7 +34,7 @@ func (m *Photo) Stackable() bool {
 	return true
 }
 
-// Identical returns identical photos that can be merged.
+// Identical returns candidate photos that can be merged with the current one based on metadata and/or UUID.
 func (m *Photo) Identical(includeMeta, includeUuid bool) (identical Photos, err error) {
 	if !m.Stackable() {
 		return identical, nil
@@ -76,7 +79,7 @@ func (m *Photo) Identical(includeMeta, includeUuid bool) (identical Photos, err 
 	return identical, nil
 }
 
-// Merge photo with identical ones.
+// Merge collapses identical photos into a single original, reassigning files and associations while marking duplicates deleted.
 func (m *Photo) Merge(mergeMeta, mergeUuid bool) (original Photo, merged Photos, err error) {
 	photoMergeMutex.Lock()
 	defer photoMergeMutex.Unlock()
@@ -96,42 +99,111 @@ func (m *Photo) Merge(mergeMeta, mergeUuid bool) (original Photo, merged Photos,
 
 	for i, merge := range identical {
 		if i == 0 {
-			original = merge
+			original = *merge
 			log.Debugf("photo: merging id %d with %d identical", original.ID, len(identical)-1)
 			continue
 		}
 
-		deleted := TimeStamp()
+		deleted := Now()
 
-		logResult(UnscopedDb().Exec("UPDATE files SET photo_id = ?, photo_uid = ?, file_primary = 0 WHERE photo_id = ?", original.ID, original.PhotoUID, merge.ID))
-		logResult(UnscopedDb().Exec("UPDATE photos SET photo_quality = -1, deleted_at = ? WHERE id = ?", TimeStamp(), merge.ID))
+		logResult(UnscopedDb().Exec("UPDATE files SET photo_id = ?, photo_uid = ?, file_primary = FALSE WHERE photo_id = ?", original.ID, original.PhotoUID, merge.ID))
+		logResult(UnscopedDb().Exec("UPDATE photos SET photo_quality = -1, deleted_at = ? WHERE id = ?", Now(), merge.ID))
 
 		switch DbDialect() {
-		case MySQL:
+		case dsn.DialectMySQL:
 			logResult(UnscopedDb().Exec("UPDATE IGNORE photos_keywords SET photo_id = ? WHERE photo_id = ?", original.ID, merge.ID))
 			logResult(UnscopedDb().Exec("UPDATE IGNORE photos_labels SET photo_id = ? WHERE photo_id = ?", original.ID, merge.ID))
 			logResult(UnscopedDb().Exec("UPDATE IGNORE photos_albums SET photo_uid = ? WHERE photo_uid = ?", original.PhotoUID, merge.PhotoUID))
-		case SQLite3:
+		case dsn.DialectSQLite:
 			logResult(UnscopedDb().Exec("UPDATE OR IGNORE photos_keywords SET photo_id = ? WHERE photo_id = ?", original.ID, merge.ID))
 			logResult(UnscopedDb().Exec("UPDATE OR IGNORE photos_labels SET photo_id = ? WHERE photo_id = ?", original.ID, merge.ID))
 			logResult(UnscopedDb().Exec("UPDATE OR IGNORE photos_albums SET photo_uid = ? WHERE photo_uid = ?", original.PhotoUID, merge.PhotoUID))
+		case dsn.DialectPostgreSQL:
+			// Like the statements above, rows that would duplicate one of the original are left unchanged.
+			logResult(UnscopedDb().Exec("UPDATE photos_keywords SET photo_id = ? WHERE photo_id = ? AND NOT EXISTS "+
+				"(SELECT 1 FROM photos_keywords k WHERE k.photo_id = ? AND k.keyword_id = photos_keywords.keyword_id)", original.ID, merge.ID, original.ID))
+			logResult(UnscopedDb().Exec("UPDATE photos_labels SET photo_id = ? WHERE photo_id = ? AND NOT EXISTS "+
+				"(SELECT 1 FROM photos_labels l WHERE l.photo_id = ? AND l.label_id = photos_labels.label_id)", original.ID, merge.ID, original.ID))
+			logResult(UnscopedDb().Exec("UPDATE photos_albums SET photo_uid = ? WHERE photo_uid = ? AND NOT EXISTS "+
+				"(SELECT 1 FROM photos_albums a WHERE a.photo_uid = ? AND a.album_uid = photos_albums.album_uid)", original.PhotoUID, merge.PhotoUID, original.PhotoUID))
 		default:
 			log.Warnf("sql: unsupported dialect %s", DbDialect())
 		}
 
-		merge.DeletedAt = &deleted
+		merge.DeletedAt = DeletedAtTime(deleted)
 		merge.PhotoQuality = -1
 
 		merged = append(merged, merge)
 	}
 
+	if updateErr := original.SyncMediaTypeFromFiles(SrcFile); updateErr != nil {
+		log.Warnf("merge: %s while syncing media type of %s", updateErr, original.String())
+	}
+
 	if original.ID != m.ID {
-		deleted := TimeStamp()
-		m.DeletedAt = &deleted
+		deleted := Now()
+		m.DeletedAt = DeletedAtTime(deleted)
 		m.PhotoQuality = -1
+	} else {
+		m.PhotoType = original.PhotoType
+		m.TypeSrc = original.TypeSrc
 	}
 
 	File{PhotoID: original.ID, PhotoUID: original.PhotoUID}.RegenerateIndex()
 
 	return original, merged, err
+}
+
+// SyncMediaTypeFromFiles updates PhotoType to the highest-priority media type of active non-sidecar files.
+func (m *Photo) SyncMediaTypeFromFiles(typeSrc string) error {
+	if m == nil || !m.HasID() {
+		return nil
+	}
+
+	// Keep explicit user/admin overrides untouched.
+	if SrcPriority[m.TypeSrc] > SrcPriority[typeSrc] {
+		return nil
+	}
+
+	var mediaTypes []string
+
+	if err := UnscopedDb().
+		Model(&File{}).
+		Where("photo_id = ? AND file_missing = FALSE AND file_sidecar = FALSE AND deleted_at IS NULL", m.ID).
+		Pluck("media_type", &mediaTypes).Error; err != nil {
+		return err
+	}
+
+	bestType := media.Image
+	found := false
+
+	for _, mediaType := range mediaTypes {
+		t := media.Type(mediaType)
+
+		if !t.IsMain() {
+			continue
+		}
+
+		if !found || media.Priority[t] > media.Priority[bestType] {
+			bestType = t
+			found = true
+		}
+	}
+
+	// Do not change the current type when no eligible main media file exists.
+	if !found {
+		return nil
+	}
+
+	previousType := m.MediaType()
+	m.SetMediaType(bestType, typeSrc)
+
+	if m.MediaType() == previousType {
+		return nil
+	}
+
+	return m.Updates(Values{
+		"PhotoType": m.PhotoType,
+		"TypeSrc":   m.TypeSrc,
+	})
 }

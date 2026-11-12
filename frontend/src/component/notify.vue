@@ -1,53 +1,69 @@
 <template>
-  <v-snackbar
-      id="p-notify"
-      v-model="visible"
-      :color="color"
-      :timeout="0"
-      :class="textColor"
-      :bottom="true" 
-  >
-    <span :dir="!rtl ? 'let' : 'rtl'">{{ text }}</span>
-    <v-btn
-        :class="textColor + ' pr-0'"
-        icon
-        flat
-        @click="close"
-    >
-      <v-icon :class="textColor">close</v-icon>
-    </v-btn>
-  </v-snackbar>
+  <teleport to="body">
+    <div id="notify">
+      <transition name="fade-transition">
+        <div v-if="visible" :class="'p-notify--' + message.color" class="p-notify v-snackbar" role="alert" @click.stop.prevent="showNext">
+          <div class="v-snackbar__wrapper">
+            <span class="v-snackbar__underlay"></span>
+            <div class="v-snackbar__content">
+              <i
+                v-if="message.icon"
+                :class="['text-' + message.color, 'mdi-' + message.icon]"
+                class="mdi v-icon notranslate p-notify__icon"
+                aria-hidden="true"
+              ></i>
+              <div class="p-notify__text">
+                {{ message.text }}
+              </div>
+              <i :class="'text-on-' + message.color" class="mdi-close mdi v-icon notranslate p-notify__close" aria-hidden="true"></i>
+            </div>
+          </div>
+        </div>
+      </transition>
+    </div>
+  </teleport>
 </template>
 <script>
-import Event from 'pubsub-js';
+import { Tp } from "common/gettext";
 
 export default {
-  name: 'PNotify',
+  name: "PNotify",
   data() {
     return {
-      text: '',
-      color: 'primary',
-      textColor: '',
       visible: false,
+      snackbar: true,
       messages: [],
-      lastMessageId: 1,
-      lastMessage: '',
-      subscriptionId: '',
-      rtl: this.$rtl,
+      message: {
+        icon: "",
+        color: "transparent",
+        text: "",
+        delay: this.defaultDelay,
+        timer: 0,
+      },
+      lastText: "",
+      lastId: 1,
+      subscriptionId: "",
+      defaultColor: "info",
+      defaultDelay: 2000,
+      warningDelay: 3000,
+      errorDelay: 6000,
     };
   },
   created() {
-    this.subscriptionId = Event.subscribe('notify', this.onNotify);
+    this.subscriptionId = this.$event.subscribe("notify", this.onNotify);
   },
-  destroyed() {
-    Event.unsubscribe(this.subscriptionId);
+  beforeUnmount() {
+    this.messages = [];
+    this.visible = false;
+    this.$event.unsubscribe(this.subscriptionId);
   },
   methods: {
-    onNotify: function (ev, data) {
-      const type = ev.split('.')[1];
+    onNotify(ev, data) {
+      const type = ev.split(".")[1];
 
-      // Get the message.
-      let m = data.message;
+      // Render in the current UI language when the backend sent a message id (the English source
+      // string); otherwise fall back to the pre-rendered message string as-is.
+      let m = data.messageId ? Tp(data.messageId, this.isolateParams(data.messageParams)) : data.message;
 
       // Skip empty messages.
       if (!m || !m.length) {
@@ -61,20 +77,20 @@ export default {
         return;
       }
 
-      // First letter of the message should be uppercase.
-      m = m.replace(/^./, m[0].toUpperCase());
+      // First letter of the message should be uppercase, also when it starts with an isolated name.
+      m = m.replace(/^([\u2066-\u2068]*)(.)/, (_, isolates, c) => isolates + c.toUpperCase());
 
       switch (type) {
-        case 'warning':
+        case "warning":
           this.addWarningMessage(m);
           break;
-        case 'error':
+        case "error":
           this.addErrorMessage(m);
           break;
-        case 'success':
+        case "success":
           this.addSuccessMessage(m);
           break;
-        case 'info':
+        case "info":
           this.addInfoMessage(m);
           break;
         default:
@@ -82,63 +98,88 @@ export default {
       }
     },
 
-    addWarningMessage: function (message) {
-      this.addMessage('warning', 'black--text', message, 3000);
+    // isolateParams isolates string parameters, such as album titles, from the message around them.
+    isolateParams(params) {
+      return Array.isArray(params) ? params.map((p) => (typeof p === "string" ? this.$util.isolate(p) : p)) : params;
     },
 
-    addErrorMessage: function (message) {
-      this.addMessage('error', 'white--text', message, 8000);
+    addSuccessMessage(message) {
+      this.addMessage("success", "check-circle", message, this.defaultDelay);
     },
 
-    addSuccessMessage: function (message) {
-      this.addMessage('success', 'white--text', message, 2000);
+    addInfoMessage(message) {
+      this.addMessage("info", "information-outline", message, this.defaultDelay);
     },
 
-    addInfoMessage: function (message) {
-      this.addMessage('info', 'white--text', message, 2000);
+    addWarningMessage(message) {
+      this.addMessage("warning", "alert", message, this.warningDelay);
     },
 
-    addMessage: function (color, textColor, message, delay) {
-      if (message === this.lastMessage) return;
+    addErrorMessage(message) {
+      this.addMessage("error", "alert-circle-outline", message, this.errorDelay);
+    },
 
-      this.lastMessageId++;
-      this.lastMessage = message;
+    addMessage(color, icon, text, delay) {
+      if (!text || text === this.lastText) {
+        return;
+      }
+
+      this.lastId++;
+      this.lastText = text;
+      let timer = 0;
 
       const m = {
-        'id': this.lastMessageId,
-        'color': color,
-        'textColor': textColor,
-        'delay': delay,
-        'message': message
+        id: this.lastId,
+        color,
+        icon,
+        text,
+        delay,
+        timer,
       };
 
       this.messages.push(m);
 
       if (!this.visible) {
-        this.show();
+        this.showNext();
       }
     },
-
-    close: function () {
-      this.visible = false;
-      this.show();
-    },
-    show: function () {
+    showNext() {
       const message = this.messages.shift();
+      if (this.message.timer > 0) {
+        clearTimeout(this.message.timer);
+      }
 
       if (message) {
-        this.text = message.message;
-        this.color = message.color;
-        this.textColor = message.textColor;
+        this.message = message;
+
+        if (!this.message.icon) {
+          this.message.icon = "";
+        }
+
+        if (!this.message.color) {
+          this.message.color = this.defaultColor;
+        }
+
+        if (!this.message.delay || this.message.delay <= 0) {
+          this.message.delay = this.defaultDelay;
+        }
+
+        if (!this.snackbar) {
+          this.snackbar = true;
+        }
+
         this.visible = true;
 
-        setTimeout(() => {
-          this.lastMessage = '';
-          this.show();
-        }, message.delay);
+        this.message.timer = setTimeout(() => {
+          this.lastText = "";
+          this.message.timer = 0;
+          this.showNext();
+        }, this.message.delay);
       } else {
+        this.lastText = "";
         this.visible = false;
-        this.text = '';
+        this.message.text = "";
+        this.message.timer = 0;
       }
     },
   },

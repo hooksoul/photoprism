@@ -1,19 +1,23 @@
 package entity
 
 import (
-	"github.com/photoprism/photoprism/pkg/clean"
-	"github.com/urfave/cli"
+	"github.com/urfave/cli/v2"
 
 	"github.com/photoprism/photoprism/internal/form"
+	"github.com/photoprism/photoprism/pkg/authn"
+	"github.com/photoprism/photoprism/pkg/clean"
 )
 
-// SetValuesFromCli updates the entity values from a CLI context and validates them.
+// SetValuesFromCli updates user fields based on CLI flags and invalidates sessions after privilege changes.
 func (m *User) SetValuesFromCli(ctx *cli.Context) error {
 	frm := form.NewUserFromCli(ctx)
 
+	// see https://cheatsheetseries.owasp.org/cheatsheets/Session_Management_Cheat_Sheet.html#renew-the-session-id-after-any-privilege-level-change
+	privilegeLevelChange := false
+
 	// Email address.
 	if ctx.IsSet("email") {
-		m.UserEmail = frm.Email()
+		m.SetEmail(frm.Email())
 	}
 
 	// Display name.
@@ -24,44 +28,115 @@ func (m *User) SetValuesFromCli(ctx *cli.Context) error {
 	// User role.
 	if ctx.IsSet("role") {
 		m.SetRole(frm.Role())
+		privilegeLevelChange = true
+	}
+
+	// Authentication Provider.
+	if ctx.IsSet("auth") {
+		m.SetProvider(frm.Provider())
+		privilegeLevelChange = true
+	}
+
+	// Authentication ID, which is set after validation, since setting it clears the same ID on other accounts.
+	if ctx.IsSet("auth-id") {
+		if frm.AuthID == "" {
+			m.AuthID = ""
+			m.AuthIssuer = ""
+		}
+		privilegeLevelChange = true
+	}
+
+	// Authentication Issuer URL, e.g. the Portal base URL when adopting an
+	// account into a cluster OIDC identity. Pinning it scopes the link to that
+	// issuer instead of matching any provider that asserts the same subject.
+	if ctx.IsSet("auth-issuer") {
+		m.AuthIssuer = frm.AuthIssuer
+		privilegeLevelChange = true
 	}
 
 	// Super-admin status.
 	if ctx.IsSet("superadmin") {
 		m.SuperAdmin = frm.SuperAdmin
+		privilegeLevelChange = true
 	}
 
 	// Disable login (Web UI)?
 	if ctx.IsSet("no-login") {
 		m.CanLogin = frm.CanLogin
+		privilegeLevelChange = true
 	}
 
 	// Allow the use of WebDAV?
 	if ctx.IsSet("webdav") {
 		m.WebDAV = frm.WebDAV
+		privilegeLevelChange = true
+	}
+
+	// Allow the use of MCP?
+	if ctx.IsSet("mcp") {
+		m.MCP = frm.MCPSetting()
+		privilegeLevelChange = true
 	}
 
 	// Set custom attributes?
 	if ctx.IsSet("attr") {
 		m.UserAttr = frm.Attr()
+		privilegeLevelChange = true
+	}
+
+	// Authorization scope.
+	if ctx.IsSet("scope") {
+		m.UserScope = frm.Scope()
+		privilegeLevelChange = true
 	}
 
 	// Originals base folder.
 	if ctx.IsSet("base-path") {
 		m.SetBasePath(frm.BasePath)
+		privilegeLevelChange = true
 	}
 
 	// Sub-folder for uploads.
 	if ctx.IsSet("upload-path") {
 		m.SetUploadPath(frm.UploadPath)
+		privilegeLevelChange = true
 	}
 
-	return m.Validate()
+	// Disable two-factor authentication.
+	if ctx.IsSet("disable-2fa") && m.Method().Is(authn.Method2FA) {
+		m.SetMethod(authn.MethodDefault)
+		privilegeLevelChange = true
+	}
+
+	// Validate properties.
+	if err := m.Validate(); err != nil {
+		// Invalid.
+		return err
+	}
+
+	if ctx.IsSet("auth-id") && frm.AuthID != "" {
+		m.SetAuthID(frm.AuthID, m.AuthIssuer)
+	}
+
+	if privilegeLevelChange {
+		// Revoke all user sessions after a privilege level change,
+		// except for app passwords and client access tokens.
+		m.RevokeDerivedSessions(nil)
+	}
+
+	return nil
 }
 
-// RestoreFromCli restored the account from a CLI context.
+// RestoreFromCli restores a deleted account from CLI input and optionally sets a new password.
 func (m *User) RestoreFromCli(ctx *cli.Context, newPassword string) (err error) {
-	m.DeletedAt = nil
+	// Validate the new password before restoring the account.
+	if newPassword != "" {
+		if err = ValidatePasswordLength(newPassword); err != nil {
+			return err
+		}
+	}
+
+	m.DeletedAt = DeletedAt{}
 
 	// Set values.
 	if err = m.SetValuesFromCli(ctx); err != nil {

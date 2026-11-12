@@ -7,18 +7,17 @@ import (
 	"strings"
 	"time"
 	"unicode"
-
-	"github.com/araddon/dateparse"
+	"unicode/utf8"
 
 	"github.com/photoprism/photoprism/pkg/clean"
 	"github.com/photoprism/photoprism/pkg/txt"
 )
 
 // Serialize returns a string containing all non-empty fields and values of a struct.
-func Serialize(f interface{}, all bool) string {
+func Serialize(f any, all bool) string {
 	v := reflect.ValueOf(f)
 
-	if v.Kind() == reflect.Ptr {
+	if v.Kind() == reflect.Pointer {
 		v = v.Elem()
 	}
 
@@ -59,7 +58,7 @@ func Serialize(f interface{}, all bool) string {
 				}
 			case string:
 				if val := strings.ReplaceAll(fieldValue.String(), "\"", ""); val != "" {
-					if strings.ContainsAny(val, " :'()[]-+`") {
+					if strings.ContainsAny(val, " :'()[]-+`") || strings.ContainsFunc(val, unicode.IsSpace) {
 						q = append(q, fmt.Sprintf("%s:\"%s\"", fieldName, val))
 					} else {
 						q = append(q, fmt.Sprintf("%s:%s", fieldName, val))
@@ -78,9 +77,68 @@ func Serialize(f interface{}, all bool) string {
 	return strings.Join(q, " ")
 }
 
+// Unserialize parses a query string into the provided SearchForm implementation.
 func Unserialize(f SearchForm, q string) (result error) {
-	var key, value []rune
+	_, result = unserialize(f, q)
+	return result
+}
+
+// FilterValue returns the value of a key in a serialized filter as written, with its quotes removed but without
+// the cleaning applied when the filter is parsed into a search form. A value whose quote is not closed, as in a
+// filter that was cut off, or that ends at whitespace other than the space Serialize separates values with, is
+// not returned, since it may be part of a longer value.
+func FilterValue(q, key string) (value string) {
+	var k, v []rune
 	var escaped, isKeyValue bool
+
+	// flush keeps the value of the current token if it has the key and ends at sep.
+	flush := func(sep rune) {
+		if isKeyValue && strings.EqualFold(string(k), key) {
+			if escaped || sep != ' ' && sep != 0 {
+				value = ""
+			} else {
+				value = string(v)
+			}
+		}
+
+		k, v = k[:0], v[:0]
+		escaped, isKeyValue = false, false
+	}
+
+	for _, char := range strings.TrimFunc(q, func(r rune) bool { return r == ' ' }) {
+		switch {
+		case unicode.IsSpace(char) && !escaped:
+			flush(char)
+		case char == ':' && !escaped:
+			isKeyValue = true
+		case char == '"':
+			escaped = !escaped
+		case isKeyValue:
+			v = append(v, char)
+		default:
+			k = append(k, char)
+		}
+	}
+
+	flush(0)
+
+	return value
+}
+
+// UnserializeFilter parses a stored filter like Unserialize, and reports whether removing NUL bytes and invalid
+// UTF-8 left nothing usable of the filter or of one of its values, so it can match nothing.
+func UnserializeFilter(f SearchForm, q string) (noMatch bool, err error) {
+	_, usable := clean.SearchFilter(q)
+	noMatch, err = unserialize(f, q)
+
+	return noMatch || !usable, err
+}
+
+// unserialize parses a query string into the provided SearchForm, skipping NUL bytes and invalid UTF-8, and
+// reports whether the value of a string filter consisted only of those, so it can match nothing.
+func unserialize(f SearchForm, q string) (noMatch bool, result error) {
+	var key, value []rune
+	var escaped, isKeyValue, dropped bool
 
 	v := reflect.ValueOf(f)
 
@@ -107,27 +165,29 @@ func Unserialize(f SearchForm, q string) (result error) {
 
 	f.SetQuery("")
 
-	q = strings.TrimSpace(q) + "\n"
-
 	var queryStrings []string
 
-	for _, char := range q {
-		if unicode.IsSpace(char) && !escaped {
-			if isKeyValue {
-				formName := strings.ToLower(string(key))
-				fieldName := fieldNames[formName]
+	// flush sets the field named by the current token, or keeps the token as a query string.
+	flush := func() {
+		if isKeyValue {
+			formName := strings.ToLower(string(key))
+			fieldName := fieldNames[formName]
 
-				field := formValues.FieldByNameFunc(func(name string) bool {
-					return strings.EqualFold(name, fieldName)
-				})
+			field := formValues.FieldByNameFunc(func(name string) bool {
+				return strings.EqualFold(name, fieldName)
+			})
 
-				stringValue := string(value)
+			stringValue := string(value)
 
-				if fieldName != "" && fieldName != "-" && field.CanSet() {
+			if fieldName != "" && fieldName != "-" && field.CanSet() {
+				// A value whose removed bytes leave nothing usable matches nothing, whatever the field type.
+				if dropped && !clean.SearchUsable(stringValue) {
+					noMatch = true
+				} else {
 					switch field.Interface().(type) {
 					case time.Time:
-						if timeValue, err := dateparse.ParseAny(stringValue); err != nil {
-							result = err
+						if timeValue := txt.ParseTimeUTC(stringValue); stringValue != "" && timeValue.IsZero() {
+							result = fmt.Errorf("invalid %s date", formName)
 						} else {
 							field.Set(reflect.ValueOf(timeValue))
 						}
@@ -144,39 +204,61 @@ func Unserialize(f SearchForm, q string) (result error) {
 							field.SetInt(int64(intValue))
 						}
 					case uint, uint8, uint16, uint32, uint64:
-						if intValue, err := strconv.Atoi(stringValue); err != nil {
+						bitSize := field.Type().Bits()
+						if uintValue, err := strconv.ParseUint(stringValue, 10, int(bitSize)); err != nil {
 							result = err
 						} else {
-							field.SetUint(uint64(intValue))
+							field.SetUint(uintValue)
 						}
 					case string:
-						field.SetString(clean.SearchString(stringValue))
+						searchValue := clean.SearchString(stringValue)
+						noMatch = noMatch || dropped && !clean.SearchUsable(searchValue)
+						field.SetString(searchValue)
 					case bool:
 						field.SetBool(txt.Bool(stringValue))
 					default:
 						result = fmt.Errorf("unsupported type: %s", formName)
 					}
-				} else {
-					result = fmt.Errorf("unknown filter: %s", formName)
 				}
-			} else if len(strings.TrimSpace(string(key))) > 0 {
-				queryStrings = append(queryStrings, strings.TrimSpace(string(key)))
+			} else {
+				result = fmt.Errorf("unknown filter: %s", formName)
 			}
+		} else if len(strings.TrimSpace(string(key))) > 0 {
+			queryStrings = append(queryStrings, strings.TrimSpace(string(key)))
+		}
 
-			escaped = false
-			isKeyValue = false
-			key = key[:0]
-			value = value[:0]
-		} else if char == ':' && !escaped {
+		escaped = false
+		isKeyValue = false
+		dropped = false
+		key = key[:0]
+		value = value[:0]
+	}
+
+	q = strings.TrimSpace(q)
+
+	for i, char := range q {
+		// NUL bytes and invalid UTF-8 are skipped, and an invalid byte decodes as a one-byte RuneError.
+		if char == 0 || char == utf8.RuneError && !strings.HasPrefix(q[i:], string(utf8.RuneError)) {
+			dropped = dropped || isKeyValue
+			continue
+		}
+
+		switch {
+		case unicode.IsSpace(char) && !escaped:
+			flush()
+		case char == ':' && !escaped:
 			isKeyValue = true
-		} else if char == '"' {
+		case char == '"':
 			escaped = !escaped
-		} else if isKeyValue {
+		case isKeyValue:
 			value = append(value, char)
-		} else {
+		default:
 			key = append(key, unicode.ToLower(char))
 		}
 	}
+
+	// The last token ends with the string, also if its quote is not closed.
+	flush()
 
 	if len(queryStrings) > 0 {
 		f.SetQuery(clean.SearchQuery(strings.Join(queryStrings, " ")))
@@ -186,5 +268,5 @@ func Unserialize(f SearchForm, q string) (result error) {
 		log.Warnf("form: failed parsing search query")
 	}
 
-	return result
+	return noMatch, result
 }

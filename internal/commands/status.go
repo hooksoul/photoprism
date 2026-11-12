@@ -1,25 +1,29 @@
 package commands
 
 import (
+	"context"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/tidwall/gjson"
-	"github.com/urfave/cli"
+	"github.com/urfave/cli/v2"
 
 	"github.com/photoprism/photoprism/internal/config"
+	"github.com/photoprism/photoprism/pkg/http/dns"
 )
 
 // StatusCommand configures the command name, flags, and action.
-var StatusCommand = cli.Command{
+var StatusCommand = &cli.Command{
 	Name:   "status",
 	Usage:  "Checks if the Web server is running",
 	Action: statusAction,
 }
 
-// statusAction checks if the web server is running.
+// statusAction checks if the Web server is running.
 func statusAction(ctx *cli.Context) error {
 	conf := config.NewConfig(ctx)
 
@@ -32,27 +36,36 @@ func statusAction(ctx *cli.Context) error {
 	// interrupt reading of the Response.Body.
 	client := &http.Client{Timeout: 10 * time.Second}
 
-	url := fmt.Sprintf("http://%s:%d/api/v1/status", conf.HttpHost(), conf.HttpPort())
+	// Connect to unix socket?
+	if unixSocket := conf.HttpSocket(); unixSocket != nil {
+		client.Transport = &http.Transport{
+			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+				return net.Dial(unixSocket.Scheme, unixSocket.Path)
+			},
+		}
+	}
 
-	req, err := http.NewRequest(http.MethodGet, url, nil)
+	endpointUrl := buildStatusEndpoint(conf)
+
+	req, err := http.NewRequest(http.MethodGet, endpointUrl, nil)
 
 	if err != nil {
 		return err
 	}
 
-	var status string
+	var response string
 
-	if resp, err := client.Do(req); err != nil {
-		return fmt.Errorf("cannot connect to %s:%d", conf.HttpHost(), conf.HttpPort())
+	if resp, reqErr := client.Do(req); reqErr != nil { //nolint:gosec // endpointUrl is built from local config values.
+		return fmt.Errorf("cannot connect to %s", statusAddress(conf))
 	} else if resp.StatusCode != 200 {
-		return fmt.Errorf("server running at %s:%d, bad status %d\n", conf.HttpHost(), conf.HttpPort(), resp.StatusCode)
-	} else if body, err := io.ReadAll(resp.Body); err != nil {
-		return err
+		return fmt.Errorf("server running at %s, bad status %d", statusAddress(conf), resp.StatusCode)
+	} else if body, readErr := io.ReadAll(resp.Body); readErr != nil {
+		return readErr
 	} else {
-		status = string(body)
+		response = string(body)
 	}
 
-	message := gjson.Get(status, "status").String()
+	message := gjson.Get(response, "status").String()
 
 	if message != "" {
 		fmt.Println(message)
@@ -61,4 +74,32 @@ func statusAction(ctx *cli.Context) error {
 	}
 
 	return nil
+}
+
+// statusAddress returns the configured server address for status messages, which is the Unix socket
+// path if one is used.
+func statusAddress(conf *config.Config) string {
+	if socket := conf.HttpSocket(); socket != nil {
+		return socket.Path
+	}
+
+	return dns.JoinHostPort(conf.HttpHost(), conf.HttpPort())
+}
+
+// buildStatusEndpoint returns the status endpoint URL, preferring the public
+// SiteUrl (which carries the correct scheme) and falling back to the local
+// HTTP host/port. When a Unix socket is configured, an http+unix style URL is
+// used so the custom transport can dial the socket.
+func buildStatusEndpoint(conf *config.Config) string {
+	if socket := conf.HttpSocket(); socket != nil {
+		return fmt.Sprintf("%s://%s/api/v1/status", socket.Scheme, strings.TrimPrefix(socket.Path, "/"))
+	}
+
+	siteUrl := strings.TrimRight(conf.SiteUrl(), "/")
+
+	if siteUrl != "" {
+		return siteUrl + "/api/v1/status"
+	}
+
+	return fmt.Sprintf("http://%s/api/v1/status", dns.JoinHostPort(conf.HttpHost(), conf.HttpPort()))
 }

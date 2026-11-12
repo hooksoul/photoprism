@@ -1,31 +1,35 @@
 package entity
 
 import (
-	"github.com/jinzhu/gorm"
+	"gorm.io/gorm"
+
 	"github.com/photoprism/photoprism/internal/event"
-	"github.com/photoprism/photoprism/internal/maps"
+	"github.com/photoprism/photoprism/internal/service/maps"
 	"github.com/photoprism/photoprism/pkg/txt"
 )
 
-// altCountryNames defines mapping between different names for the same country
+// altCountryNames captures alternate spellings mapped to canonical country names.
 var altCountryNames = map[string]string{
-	"United States of America": "USA",
-	"United States":            "USA",
+	"us":                       "United States",
+	"usa":                      "United States",
+	"US":                       "United States",
+	"USA":                      "United States",
+	"United States of America": "United States",
 	"":                         "Unknown",
 }
 
 // Countries represents a list of countries.
 type Countries []Country
 
-// Country represents a country location, used for labeling photos.
+// Country represents a country entry used for labeling photos and locations.
 type Country struct {
-	ID                 string `gorm:"type:VARBINARY(2);primary_key" json:"ID" yaml:"ID"`
-	CountrySlug        string `gorm:"type:VARBINARY(160);unique_index;" json:"Slug" yaml:"-"`
-	CountryName        string `gorm:"type:VARCHAR(160);" json:"Name" yaml:"Name,omitempty"`
-	CountryDescription string `gorm:"type:VARCHAR(2048);" json:"Description,omitempty" yaml:"Description,omitempty"`
-	CountryNotes       string `gorm:"type:VARCHAR(1024);" json:"Notes,omitempty" yaml:"Notes,omitempty"`
-	CountryPhoto       *Photo `json:"-" yaml:"-"`
-	CountryPhotoID     uint   `json:"-" yaml:"-"`
+	ID                 string `gorm:"type:bytes;size:2;primaryKey" json:"ID" yaml:"ID"`
+	CountrySlug        string `gorm:"type:bytes;size:160;uniqueIndex:uix_countries_country_slug;" json:"Slug" yaml:"-"`
+	CountryName        string `gorm:"size:160;" json:"Name" yaml:"Name,omitempty"`
+	CountryDescription string `gorm:"size:2048;" json:"Description,omitempty" yaml:"Description,omitempty"`
+	CountryNotes       string `gorm:"size:1024;" json:"Notes,omitempty" yaml:"Notes,omitempty"`
+	CountryPhoto       *Photo `gorm:"-:migration" json:"-" yaml:"-"`
+	CountryPhotoID     uint   `gorm:"size:32" json:"-" yaml:"-"`
 	New                bool   `gorm:"-" json:"-" yaml:"-"`
 }
 
@@ -34,19 +38,19 @@ func (Country) TableName() string {
 	return "countries"
 }
 
-// UnknownCountry is defined here to use it as a default
+// UnknownCountry is the fallback entry used when no country code is known.
 var UnknownCountry = Country{
 	ID:          UnknownID,
 	CountryName: maps.CountryNames[UnknownID],
 	CountrySlug: UnknownID,
 }
 
-// CreateUnknownCountry is used to initialize the database with the default country
+// CreateUnknownCountry ensures the fallback country exists in the database.
 func CreateUnknownCountry() {
 	UnknownCountry = *FirstOrCreateCountry(&UnknownCountry)
 }
 
-// NewCountry creates a new country, with default country code if not provided
+// NewCountry creates a new Country entity, normalizing name and slug.
 func NewCountry(countryCode string, countryName string) *Country {
 	if countryCode == "" {
 		return &UnknownCountry
@@ -85,7 +89,8 @@ func FirstOrCreateCountry(m *Country) *Country {
 		return &result
 	} else if createErr := m.Create(); createErr == nil {
 		if !m.Unknown() {
-			event.EntitiesCreated("countries", []*Country{m})
+			// Content channels carry only stable identities, never entity fields; publish the country code.
+			event.EntitiesCreated("countries", []string{m.ID})
 
 			event.Publish("count.countries", event.Data{
 				"count": 1,
@@ -104,7 +109,7 @@ func FirstOrCreateCountry(m *Country) *Country {
 }
 
 // AfterCreate sets the New column used for database callback
-func (m *Country) AfterCreate(scope *gorm.Scope) error {
+func (m *Country) AfterCreate(tx *gorm.DB) error {
 	m.New = true
 	return nil
 }

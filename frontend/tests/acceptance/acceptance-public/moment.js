@@ -7,8 +7,19 @@ import ContextMenu from "../page-model/context-menu";
 import Photo from "../page-model/photo";
 import Page from "../page-model/page";
 import AlbumDialog from "../page-model/dialog-album";
+import { helperBeforeFixture, helperBeforeEach, helperAfterEach } from "../page-model/helpers";
 
-fixture`Test moments`.page`${testcafeconfig.url}`;
+fixture`Test moments`
+  .page`${testcafeconfig.url}`
+  .beforeEach(async t => {
+    await helperBeforeEach(t);
+  })
+  .afterEach(async t => {
+    await helperAfterEach(t);
+  })
+  .before(async ctx => {
+    await helperBeforeFixture(ctx);
+  });
 
 const menu = new Menu();
 const album = new Album();
@@ -18,94 +29,96 @@ const photo = new Photo();
 const page = new Page();
 const albumdialog = new AlbumDialog();
 
-test.meta("testID", "moments-001").meta({ mode: "public" })(
-  "Common: Update moment details",
-  async (t) => {
-    await menu.openPage("moments");
-    await toolbar.search("Nature");
-    const AlbumUid = await album.getNthAlbumUid("all", 0);
+test.meta("testID", "moments-001").meta({ mode: "public" })("Common: Update moment details", async (t) => {
+  await menu.openPage("moments");
+  await toolbar.search("Nature");
+  const AlbumUid = await album.getNthAlbumUid("all", 0);
 
-    await t.expect(page.cardTitle.nth(0).innerText).contains("Nature");
+  await t.expect(page.cardTitle.nth(0).innerText).contains("Nature");
 
-    await t.click(page.cardTitle.nth(0));
+  await t.click(page.cardTitle.nth(0));
 
-    await t
-      .expect(albumdialog.title.value)
-      .eql("Nature & Landscape")
-      .expect(albumdialog.location.value)
-      .eql("")
-      .expect(albumdialog.description.value)
-      .eql("")
-      .expect(albumdialog.category.value)
-      .eql("");
+  await t
+    .expect(albumdialog.title.value)
+    .eql("Nature & Landscape")
+    .expect(albumdialog.location.value)
+    .eql("")
+    .expect(albumdialog.description.value)
+    .eql("")
+    .expect(albumdialog.category.value)
+    .eql("");
 
-    await t
-      .typeText(albumdialog.title, "Winter", { replace: true })
-      .typeText(albumdialog.location, "Snow-Land", { replace: true })
-      .typeText(albumdialog.description, "We went to ski")
-      .typeText(albumdialog.category, "Mountains")
-      .pressKey("enter")
-      .click(albumdialog.dialogSave);
+  await t
+    .typeText(albumdialog.title, "Winter", { replace: true })
+    .typeText(albumdialog.location, "Snow-Land", { replace: true })
+    .typeText(albumdialog.description, "We went to ski")
+    .typeText(albumdialog.category, "Mountains")
+    .pressKey("enter")
+    .click(albumdialog.dialogSave);
 
-    await t
-      .expect(page.cardTitle.nth(0).innerText)
-      .contains("Winter")
-      .expect(page.cardDescription.nth(0).innerText)
-      .contains("We went to ski")
-      .expect(Selector("div.caption").nth(1).innerText)
-      .contains("Mountains")
-      .expect(Selector("div.caption").nth(2).innerText)
-      .contains("Snow-Land");
+  await t
+    .expect(page.cardTitle.nth(0).innerText)
+    .contains("Winter")
+    .expect(page.cardDescription.nth(0).innerText)
+    .contains("We went to ski")
+    .expect(Selector("button.meta-category").innerText)
+    .contains("Mountains")
+    .expect(Selector("button.meta-location").innerText)
+    .contains("Snow-Land");
 
-    await album.openNthAlbum(0);
+  await album.openNthAlbum(0);
 
-    await t.expect(toolbar.toolbarSecondTitle.innerText).contains("Winter");
-    await t.expect(toolbar.toolbarDescription.innerText).contains("We went to ski");
+  await t.expect(toolbar.toolbarSecondTitle.innerText).contains("Winter");
+  await t.expect(toolbar.toolbarDescription.innerText).contains("We went to ski");
 
-    await menu.openPage("moments");
-    if (t.browser.platform === "mobile") {
-      await toolbar.search("category:Mountains");
-    } else {
-      await toolbar.setFilter("category", "Mountains");
-    }
-
-    await t.expect(page.cardTitle.nth(0).innerText).contains("Winter");
-
-    await album.openAlbumWithUid(AlbumUid);
-    await toolbar.triggerToolbarAction("edit");
-
-    await t
-      .expect(albumdialog.description.value)
-      .eql("We went to ski")
-      .expect(albumdialog.category.value)
-      .eql("Mountains")
-      .expect(albumdialog.location.value)
-      .eql("Snow-Land");
-
-    await t
-      .typeText(albumdialog.title, "Nature & Landscape", { replace: true })
-      .click(albumdialog.category)
-      .pressKey("ctrl+a delete")
-      .pressKey("enter")
-      .click(albumdialog.description)
-      .pressKey("ctrl+a delete")
-      .pressKey("enter")
-      .click(albumdialog.location)
-      .pressKey("ctrl+a delete")
-      .pressKey("enter")
-      .click(albumdialog.dialogSave);
-    await menu.openPage("moments");
-    await toolbar.search("Nature");
-
-    await t
-      .expect(page.cardTitle.nth(0).innerText)
-      .contains("Nature & Landscape")
-      .expect(page.cardDescription.innerText)
-      .notContains("We went to ski")
-      .expect(Selector("div.caption").nth(0).innerText)
-      .notContains("Snow-Land");
+  await menu.openPage("moments");
+  if (t.browser.platform === "mobile") {
+    await toolbar.search("category:Mountains");
+  } else {
+    await toolbar.setFilter("category", "Mountains");
   }
-);
+
+  await t.expect(page.cardTitle.nth(0).innerText).contains("Winter");
+
+  await album.openAlbumWithUid(AlbumUid);
+  await toolbar.triggerToolbarAction("edit");
+
+  await t
+    .expect(albumdialog.description.value)
+    .eql("We went to ski")
+    .expect(albumdialog.category.value)
+    .eql("Mountains")
+    .expect(albumdialog.location.value)
+    .eql("Snow-Land");
+
+  await t
+    .typeText(albumdialog.title, "Nature & Landscape", { replace: true })
+    .click(albumdialog.category)
+    .click(albumdialog.category)
+    .pressKey("ctrl+a delete")
+    .click(albumdialog.description)
+    .pressKey("ctrl+a delete")
+    .pressKey("enter")
+    .click(albumdialog.location)
+    .pressKey("ctrl+a delete")
+    .pressKey("enter")
+    .click(albumdialog.dialogSave);
+  await menu.openPage("moments");
+  await toolbar.search("Nature");
+
+  await t
+    .expect(page.cardTitle.nth(0).innerText)
+    .contains("Nature & Landscape")
+    .expect(page.cardDescription.exists)
+    .notOk()
+    .expect(Selector("button.meta-location").exists)
+    .notOk();
+
+  await album.openAlbumWithUid(AlbumUid);
+  await toolbar.triggerToolbarAction("edit");
+  await t.expect(albumdialog.category.value).eql("");
+  await t.click(albumdialog.dialogCancel);
+});
 
 test.meta("testID", "moments-002").meta({ mode: "public" })(
   "Common: Create, Edit, delete sharing link for moment",
@@ -119,15 +132,25 @@ test.meta("testID", "moments-003").meta({ mode: "public" })(
   async (t) => {
     await menu.openPage("albums");
     const AlbumCount = await album.getAlbumCount("all");
+    await toolbar.search("Holiday");
+    const HolidayAlbumUid = await album.getNthAlbumUid("all", 0);
+    await album.openAlbumWithUid(HolidayAlbumUid);
+    const InitialPhotoCountHoliday = await photo.getPhotoCount("all");
     await menu.openPage("moments");
-    const FirstMomentUid = await album.getNthAlbumUid("all", 0);
-    await album.openAlbumWithUid(FirstMomentUid);
+    await toolbar.search("Greece 2019");
+    const GreeceMomentUid = await album.getAlbumUidByTitle("Greece 2019");
+    await album.openAlbumWithUid(GreeceMomentUid);
     const PhotoCountInMoment = await photo.getPhotoCount("all");
     const FirstPhotoUid = await photo.getNthPhotoUid("image", 0);
     const SecondPhotoUid = await photo.getNthPhotoUid("image", 1);
+    const ThirdPhotoUid = await photo.getNthPhotoUid("image", 2);
+    const FourthPhotoUid = await photo.getNthPhotoUid("image", 3);
+    const FifthPhotoUid = await photo.getNthPhotoUid("image", 4);
+    const SixthPhotoUid = await photo.getNthPhotoUid("image", 5);
+    const SeventhPhotoUid = await photo.getNthPhotoUid("image", 6);
     await menu.openPage("moments");
-    await album.selectAlbumFromUID(FirstMomentUid);
-    await contextmenu.triggerContextMenuAction("clone", "NotYetExistingAlbumForMoment");
+    await album.selectAlbumFromUID(GreeceMomentUid);
+    await contextmenu.triggerContextMenuAction("clone", ["Holiday", "NotYetExistingAlbumForMoment"]); // NotYetExistingAlbumForMoment happens to be long enough to be the middle of the text box (which causes it to be removed when Holiday is added), so put it second.
     await menu.openPage("albums");
     const AlbumCountAfterCreation = await album.getAlbumCount("all");
 
@@ -147,11 +170,40 @@ test.meta("testID", "moments-003").meta({ mode: "public" })(
     await contextmenu.triggerContextMenuAction("delete", "");
     const AlbumCountAfterDelete = await album.getAlbumCount("all");
 
+    await album.openAlbumWithUid(HolidayAlbumUid);
+    await photo.selectPhotoFromUID(FirstPhotoUid);
+    await photo.selectPhotoFromUID(SecondPhotoUid);
+    await photo.selectPhotoFromUID(ThirdPhotoUid);
+    await photo.selectPhotoFromUID(FourthPhotoUid);
+    await photo.selectPhotoFromUID(FifthPhotoUid);
+    await photo.selectPhotoFromUID(SixthPhotoUid);
+    await photo.selectPhotoFromUID(SeventhPhotoUid);
+    await contextmenu.triggerContextMenuAction("remove", "");
+
+    const PhotoCountHolidayAfterDelete = await photo.getPhotoCount("all");
+
+    await t.expect(PhotoCountHolidayAfterDelete).eql(InitialPhotoCountHoliday);
+
     await t.expect(AlbumCountAfterDelete).eql(AlbumCount);
 
     await menu.openPage("moments");
-    await album.openAlbumWithUid(FirstMomentUid);
+    await album.openAlbumWithUid(GreeceMomentUid);
     await photo.checkPhotoVisibility(FirstPhotoUid, true);
     await photo.checkPhotoVisibility(SecondPhotoUid, true);
+  }
+);
+
+test.meta("testID", "moments-004").meta({ type: "short", mode: "public" })(
+  "Common: Verify moment sort options",
+  async (t) => {
+    await menu.openPage("moments");
+    await album.checkSortOptions("moment");
+  }
+);
+
+test.meta("testID", "moments-005").meta({ type: "short", mode: "public" })(
+  "Common: Set album cover from Moments Page",
+  async (t) => {
+    await page.testSetAlbumCover("moments");
   }
 );

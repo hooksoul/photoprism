@@ -1,11 +1,11 @@
 package entity
 
-// Category of labels regroups labels with the same or a similar meaning using a main/root label
+// Category links labels to a root label representing the shared meaning.
 type Category struct {
-	LabelID    uint `gorm:"primary_key;auto_increment:false"`
-	CategoryID uint `gorm:"primary_key;auto_increment:false"`
-	Label      *Label
-	Category   *Label
+	LabelID    uint   `gorm:"primaryKey;autoIncrement:false;size:32"`
+	CategoryID uint   `gorm:"primaryKey;autoIncrement:false;size:32"`
+	Label      *Label `gorm:"-:migration"`
+	Category   *Label `gorm:"-:migration"`
 }
 
 // TableName returns the entity table name.

@@ -4,20 +4,21 @@ import (
 	"context"
 	"time"
 
-	"github.com/urfave/cli"
+	"github.com/urfave/cli/v2"
 
 	"github.com/photoprism/photoprism/internal/entity"
 	"github.com/photoprism/photoprism/internal/workers"
 )
 
 // OptimizeCommand configures the command name, flags, and action.
-var OptimizeCommand = cli.Command{
+var OptimizeCommand = &cli.Command{
 	Name:  "optimize",
 	Usage: "Maintains titles, estimates, and other metadata",
 	Flags: []cli.Flag{
-		cli.BoolFlag{
-			Name:  "force, f",
-			Usage: "update all, including recently optimized",
+		&cli.BoolFlag{
+			Name:    "force",
+			Aliases: []string{"f"},
+			Usage:   "update all, including recently optimized",
 		},
 	},
 	Action: optimizeAction,
@@ -54,7 +55,7 @@ func optimizeAction(ctx *cli.Context) error {
 		interval = 0
 	}
 
-	if err := worker.Start(delay, interval, force); err != nil {
+	if err = worker.Start(delay, interval, force); err != nil {
 		return err
 	} else {
 		elapsed := time.Since(start)

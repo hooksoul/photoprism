@@ -1,190 +1,175 @@
 <template>
-  <div v-infinite-scroll="loadMore" class="p-page p-page-subjects" style="user-select: none"
-       :infinite-scroll-disabled="scrollDisabled" :infinite-scroll-distance="scrollDistance"
-       :infinite-scroll-listen-for-event="'scrollRefresh'">
-
-    <v-form ref="form" class="p-people-search" lazy-validation dense @submit.prevent="updateQuery()">
-      <v-toolbar dense flat class="page-toolbar" color="secondary-light pa-0">
-        <v-text-field v-if="canSearch" :value="filter.q"
-                      solo hide-details clearable overflow single-line validate-on-blur
-                      class="input-search background-inherit elevation-0"
-                      :label="$gettext('Search')"
-                      prepend-inner-icon="search"
-                      browser-autocomplete="off"
-                      autocorrect="off"
-                      autocapitalize="none"
-                      color="secondary-dark"
-                      @change="(v) => {updateFilter({'q': v})}"
-                      @keyup.enter.native="(e) => updateQuery({'q': e.target.value})"
-                      @click:clear="() => {updateQuery({'q': ''})}"
+  <div class="p-page p-page-subjects not-selectable">
+    <v-form ref="form" validate-on="invalid-input" class="p-people-search" @submit.prevent="updateQuery()">
+      <v-toolbar density="compact" class="page-toolbar" color="secondary-light">
+        <v-text-field
+          v-if="canSearch"
+          :model-value="filter.q"
+          hide-details
+          clearable
+          single-line
+          overflow
+          rounded
+          validate-on="invalid-input"
+          :placeholder="$gettext('Search')"
+          prepend-inner-icon="mdi-magnify"
+          autocomplete="off"
+          autocorrect="off"
+          autocapitalize="none"
+          color="surface-variant"
+          density="compact"
+          class="input-search input-search--focus background-inherit elevation-0"
+          @update:model-value="
+            (v) => {
+              updateFilter({ q: v });
+            }
+          "
+          @keyup.enter="() => updateQuery()"
+          @click:clear="
+            () => {
+              updateQuery({ q: '' });
+            }
+          "
         ></v-text-field>
 
-        <v-divider vertical></v-divider>
-
-        <v-btn icon overflow flat depressed color="secondary-dark" class="action-reload" :title="$gettext('Reload')" @click.stop="refresh()">
-          <v-icon>refresh</v-icon>
-        </v-btn>
+        <v-btn :title="$gettext('Refresh')" icon="mdi-refresh" class="action-reload" @click.stop="refresh"></v-btn>
 
         <template v-if="canManage">
-        <v-btn v-if="!filter.hidden" icon class="action-show-hidden" :title="$gettext('Show hidden')" @click.stop="onShowHidden()">
-          <v-icon>visibility</v-icon>
-        </v-btn>
-        <v-btn v-else icon class="action-exclude-hidden" :title="$gettext('Exclude hidden')" @click.stop="onExcludeHidden()">
-          <v-icon>visibility_off</v-icon>
-        </v-btn>
+          <v-btn v-if="!filter.hidden" :title="$gettext('Show hidden')" icon="mdi-eye" class="action-show-hidden" @click.stop="onShowHidden"> </v-btn>
+          <v-btn v-else :title="$gettext('Exclude hidden')" icon="mdi-eye-off" class="action-exclude-hidden" @click.stop="onExcludeHidden()"> </v-btn>
         </template>
       </v-toolbar>
     </v-form>
 
-    <v-container v-if="loading" fluid class="pa-4">
-      <v-progress-linear color="secondary-dark" :indeterminate="true"></v-progress-linear>
-    </v-container>
-    <v-container v-else fluid class="pa-0">
-      <p-subject-clipboard :refresh="refresh" :selection="selection"
-                           :clear-selection="clearSelection"></p-subject-clipboard>
+    <div v-if="loading" class="p-page__loading">
+      <p-loading></p-loading>
+    </div>
+    <div v-else style="min-height: 100vh" class="p-page__content">
+      <p-people-clipboard :refresh="refresh" :selection="selection" :clear-selection="clearSelection"></p-people-clipboard>
 
-      <p-scroll-top></p-scroll-top>
+      <p-scroll :load-more="loadMore" :load-disabled="scrollDisabled" :load-distance="scrollDistance" :loading="loading"></p-scroll>
 
-      <v-container grid-list-xs fluid class="pa-2">
-        <v-alert
-            :value="results.length === 0"
-            color="secondary-dark" icon="lightbulb_outline" class="no-results ma-2 opacity-70" outline
-        >
-          <h3 class="body-2 ma-0 pa-0">
-            <translate>No people found</translate>
-          </h3>
-          <p class="body-1 mt-2 mb-0 pa-0">
-            <translate>Try again using other filters or keywords.</translate>
-            <translate>You may rescan your library to find additional faces.</translate>
-            <translate>Recognition starts after indexing has been completed.</translate>
-          </p>
+      <div v-if="results.length === 0" class="pa-3">
+        <v-alert color="surface-variant" icon="mdi-lightbulb-outline" class="no-results" variant="outlined">
+          <div class="font-weight-bold">
+            {{ $gettext(`No people found`) }}
+          </div>
+          <div class="mt-2">
+            {{ $gettext(`Try again using other filters or keywords.`) }}
+            {{ $gettext(`You may rescan your library to find additional faces.`) }}
+            {{ $gettext(`Recognition starts after indexing has been completed.`) }}
+          </div>
         </v-alert>
-        <v-layout row wrap class="search-results subject-results cards-view"
-                  :class="{'select-results': selection.length > 0}">
-          <v-flex
-              v-for="(model, index) in results"
-              :key="model.UID"
-              xs6 sm4 md3 lg2 xxl1 d-flex
-          >
-            <v-card tile
-                    :data-uid="model.UID"
-                    style="user-select: none"
-                    class="result card"
-                    :class="model.classes(selection.includes(model.UID))"
-                    :to="model.route(view)"
-                    @contextmenu.stop="onContextMenu($event, index)"
+      </div>
+      <div v-else class="v-row search-results subject-results cards-view" :class="{ 'select-results': selection.length > 0 }">
+        <div v-for="(m, index) in results" :key="m.UID" class="v-col-6 v-col-sm-4 v-col-md-3 v-col-xl-2">
+          <div :data-uid="m.UID" class="result not-selectable" :class="m.classes(selection.includes(m.UID))" @contextmenu.stop="onContextMenu($event, index)">
+            <v-img
+              :src="m.thumbnailUrl('tile_320')"
+              :alt="m.Name"
+              aspect-ratio="1"
+              class="preview not-selectable"
+              @touchstart.passive="input.touchStart($event, index)"
+              @touchend.stop="onClick($event, index)"
+              @mousedown.stop.prevent="input.mouseDown($event, index)"
+              @click.stop.prevent="onClick($event, index)"
             >
-              <div class="card-background card"></div>
-              <v-img
-                  :src="model.thumbnailUrl('tile_320')"
-                  :alt="model.Name"
-                  :transition="false"
-                  aspect-ratio="1"
-                  style="user-select: none"
-                  class="card darken-1 clickable"
-                  @touchstart.passive="input.touchStart($event, index)"
-                  @touchend.stop.prevent="onClick($event, index)"
-                  @mousedown.stop.prevent="input.mouseDown($event, index)"
-                  @click.stop.prevent="onClick($event, index)"
+              <v-btn
+                v-if="canManage"
+                :ripple="false"
+                class="input-hidden"
+                icon
+                variant="text"
+                density="comfortable"
+                position="absolute"
+                @touchstart.stop="input.touchStart($event, index)"
+                @touchend.stop="onToggleHidden($event, index)"
+                @touchmove.stop.prevent
+                @click.stop.prevent="onToggleHidden($event, index)"
               >
-                <v-btn v-if="canManage" :ripple="false" :depressed="false" class="input-hidden"
-                       icon flat small absolute
-                       @touchstart.stop.prevent="input.touchStart($event, index)"
-                       @touchend.stop.prevent="onToggleHidden($event, index)"
-                       @touchmove.stop.prevent
-                       @click.stop.prevent="onToggleHidden($event, index)">
-                  <v-icon color="white" class="select-on" :title="$gettext('Show')">visibility_off</v-icon>
-                  <v-icon color="white" class="select-off" :title="$gettext('Hide')">clear</v-icon>
-                </v-btn>
-                <v-btn :ripple="false"
-                       icon flat absolute
-                       class="input-select"
-                       @touchstart.stop.prevent="input.touchStart($event, index)"
-                       @touchend.stop.prevent="onSelect($event, index)"
-                       @touchmove.stop.prevent
-                       @click.stop.prevent="onSelect($event, index)">
-                  <v-icon color="white" class="select-on">check_circle</v-icon>
-                  <v-icon color="white" class="select-off">radio_button_off</v-icon>
-                </v-btn>
+                <v-icon color="white" class="select-on" :title="$gettext('Show')">mdi-eye-off</v-icon>
+                <v-icon color="white" class="select-off" :title="$gettext('Hide')">mdi-close</v-icon>
+              </v-btn>
+              <v-btn
+                :ripple="false"
+                icon
+                variant="text"
+                position="absolute"
+                class="input-select"
+                @touchstart.stop="input.touchStart($event, index)"
+                @touchend.stop="onSelect($event, index)"
+                @touchmove.stop.prevent
+                @click.stop.prevent="onSelect($event, index)"
+              >
+                <v-icon color="white" class="select-on">mdi-check-circle</v-icon>
+                <v-icon color="white" class="select-off">mdi-radiobox-blank</v-icon>
+              </v-btn>
 
-                <v-btn :ripple="false"
-                       icon flat absolute
-                       class="input-favorite"
-                       @touchstart.stop.prevent="input.touchStart($event, index)"
-                       @touchend.stop.prevent="toggleLike($event, index)"
-                       @touchmove.stop.prevent
-                       @click.stop.prevent="toggleLike($event, index)">
-                  <v-icon color="#FFD600" class="select-on">star</v-icon>
-                  <v-icon color="white" class="select-off">star_border</v-icon>
-                </v-btn>
-              </v-img>
+              <v-btn
+                :ripple="false"
+                icon
+                variant="text"
+                position="absolute"
+                class="input-favorite"
+                @touchstart.stop="input.touchStart($event, index)"
+                @touchend.stop="toggleLike($event, index)"
+                @touchmove.stop.prevent
+                @click.stop.prevent="toggleLike($event, index)"
+              >
+                <v-icon icon="mdi-star" color="favorite" class="select-on"></v-icon>
+                <v-icon icon="mdi-star-outline" color="white" class="select-off"></v-icon>
+              </v-btn>
+            </v-img>
 
-              <v-card-title primary-title class="pa-3 card-details" style="user-select: none;" @click.stop.prevent="">
-                <v-edit-dialog
-                    v-if="canManage"
-                    :return-value.sync="model.Name"
-                    lazy
-                    class="inline-edit"
-                    @save="onSave(model)"
-                >
-                  <span v-if="model.Name" class="body-2 ma-0">
-                      {{ model.Name }}
-                  </span>
-                  <span v-else>
-                      <v-icon>edit</v-icon>
-                  </span>
-                  <template #input>
-                    <v-text-field
-                        v-model="model.Name"
-                        :rules="[titleRule]"
-                        :readonly="readonly"
-                        :label="$gettext('Name')"
-                        color="secondary-dark"
-                        class="input-rename background-inherit elevation-0"
-                        single-line autofocus solo hide-details
-                    ></v-text-field>
-                  </template>
-                </v-edit-dialog>
-                <span v-else class="body-2 ma-0">
-                  {{ model.Name }}
-                </span>
-              </v-card-title>
+            <div class="meta" @click.stop.prevent="">
+              <div v-if="canManage" class="meta-title inline-edit clickable" @click.stop.prevent="edit(m)">
+                <bdi>{{ $util.balanceBidi(m.Name) }}</bdi>
+              </div>
+              <div v-else class="meta-title">
+                <bdi>{{ $util.balanceBidi(m.Name) }}</bdi>
+              </div>
 
-              <v-card-text primary-title class="pb-2 pt-0 card-details" style="user-select: none;"
-                           @click.stop.prevent="">
-                <div v-if="model.About" class="caption mb-2" :title="$gettext('About')">
-                  {{ model.About | truncate(100) }}
-                </div>
+              <div v-if="m.About" class="meta-about text-truncate" :title="$gettext('About')">
+                {{ m.About }}
+              </div>
 
-                <div class="caption mb-2">
-                  <button v-if="model.PhotoCount === 1">
-                    <translate>Contains one picture.</translate>
-                  </button>
-                  <button v-else-if="model.PhotoCount > 0">
-                    <translate :translate-params="{n: model.PhotoCount}">Contains %{n} pictures.</translate>
-                  </button>
-                </div>
-              </v-card-text>
-            </v-card>
-          </v-flex>
-        </v-layout>
-      </v-container>
-    </v-container>
-    <p-people-merge-dialog lazy :show="merge.show" :subj1="merge.subj1" :subj2="merge.subj2" @cancel="onCancelMerge"
-                           @confirm="onMerge"></p-people-merge-dialog>
+              <div v-if="m.PhotoCount === 1" class="meta-count" @click.stop.prevent="">
+                {{ $gettext(`Contains one picture.`) }}
+              </div>
+              <div v-else-if="m.PhotoCount > 0" class="meta-count" @click.stop.prevent="">
+                {{ $gettext(`Contains %{n} pictures.`, { n: m.PhotoCount }) }}
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <p-people-edit-dialog :visible="dialog.edit" :person="model" @close="dialog.edit = false" @confirm="onSave"></p-people-edit-dialog>
+    <p-people-merge-dialog :visible="merge.visible" :subj1="merge.subj1" :subj2="merge.subj2" @close="onCancelMerge" @confirm="onMerge"></p-people-merge-dialog>
   </div>
 </template>
 
 <script>
 import Subject from "model/subject";
-import Event from "pubsub-js";
 import RestModel from "model/rest";
-import {MaxItems} from "common/clipboard";
-import Notify from "common/notify";
-import {ClickLong, ClickShort, Input, InputInvalid} from "common/input";
+import typeaheadCache from "common/typeahead-cache";
+import { MaxItems } from "common/clipboard";
+import $notify from "common/notify";
+import { ClickLong, ClickShort, Input, InputInvalid } from "common/input";
+import { getAppStorage } from "common/storage";
+import { ACTION_CREATED, ACTION_UPDATED, ACTION_DELETED } from "common/event";
+import PLoading from "component/loading.vue";
+
+const appStorage = getAppStorage();
+
+// Maximum number of affected entities reloaded in place per event;
+// larger batches set the dirty flag and are refetched lazily instead.
+const maxLiveRefetch = 50;
 
 export default {
-  name: 'PPageSubjects',
+  name: "PPageSubjects",
+  components: { PLoading },
   props: {
     staticFilter: {
       type: Object,
@@ -195,48 +180,59 @@ export default {
   data() {
     const query = this.$route.query;
     const routeName = this.$route.name;
-    const q = query['q'] ? query['q'] : '';
-    const hidden = query['hidden'] ? query['hidden'] : '';
+    const q = query["q"] ? query["q"] : "";
+    const hidden = query["hidden"] ? query["hidden"] : "";
     const order = this.sortOrder();
 
     return {
       canView: this.$config.allow("people", "view"),
       canSearch: this.$config.allow("people", "search"),
       canManage: this.$config.allow("people", "manage"),
-      view: 'all',
+      view: "all",
       config: this.$config.values,
       subscriptions: [],
       listen: false,
       dirty: false,
       results: [],
       scrollDisabled: true,
-      scrollDistance: window.innerHeight*2,
+      scrollDistance: window.innerHeight * 2,
       loading: true,
       batchSize: Subject.batchSize(),
       offset: 0,
       page: 0,
       selection: [],
       settings: {},
-      filter:  {q, hidden, order},
+      filter: { q, hidden, order },
       lastFilter: {},
       routeName: routeName,
-      titleRule: v => v.length <= this.$config.get("clip") || this.$gettext("Name too long"),
       input: new Input(),
       lastId: "",
       merge: {
+        visible: false,
         subj1: null,
         subj2: null,
-        show: false,
       },
+      dialog: {
+        edit: false,
+      },
+      model: new Subject(false),
     };
   },
   computed: {
-    readonly: function() {
+    readonly: function () {
       return this.busy || this.loading;
     },
   },
   watch: {
-    '$route'() {
+    // Events received while the tab was hidden only set the dirty flag. Switching
+    // tabs leaves the filter unchanged, so search() below returns early without
+    // refreshing; a list that went stale while hidden is refreshed here instead.
+    active(value) {
+      if (value && this.dirty) {
+        this.refresh();
+      }
+    },
+    $route() {
       // Tab inactive?
       if (!this.active) {
         // Ignore event.
@@ -251,55 +247,108 @@ export default {
       this.filter.order = this.sortOrder();
 
       this.search();
-    }
+    },
   },
   created() {
     this.search();
 
-    this.subscriptions.push(Event.subscribe("subjects", (ev, data) => this.onUpdate(ev, data)));
+    this.subscriptions.push(this.$event.subscribe("subjects", (ev, data) => this.onUpdate(ev, data)));
 
-    this.subscriptions.push(Event.subscribe("touchmove.top", () => this.refresh()));
-    this.subscriptions.push(Event.subscribe("touchmove.bottom", () => this.loadMore()));
+    this.subscriptions.push(this.$event.subscribe("touchmove.top", () => this.refresh()));
+    this.subscriptions.push(this.$event.subscribe("touchmove.bottom", () => this.loadMore()));
   },
-  destroyed() {
+  beforeUnmount() {
     for (let i = 0; i < this.subscriptions.length; i++) {
-      Event.unsubscribe(this.subscriptions[i]);
+      this.$event.unsubscribe(this.subscriptions[i]);
     }
   },
   methods: {
-    onSave(m) {
-      if (!this.canManage || !m.Name || m.Name.trim() === "") {
-        // Refuse to save empty name.
+    // notifyResultCount announces how many rows the last search returned, and says nothing for the
+    // tab the user is not looking at. Both tabs are mounted eagerly and search when they are created,
+    // so the hidden one would otherwise report "No people found" over the list that is on screen.
+    notifyResultCount() {
+      if (!this.active) {
         return;
       }
 
-      const existing = this.$config.getPerson(m.Name);
-
-      if (!existing) {
-        this.busy = true;
-        m.update().finally(() => {
-          this.busy = false;
-        });
-      } else if (existing.UID !== m.UID) {
-        this.merge.subj1 = m;
-        this.merge.subj2 = existing;
-        this.merge.show = true;
+      if (!this.results.length) {
+        this.$notify.warn(this.$gettext("No people found"));
+      } else if (this.results.length === 1) {
+        this.$notify.info(this.$gettext("One person found"));
+      } else {
+        this.$notify.info(this.$gettext("%{n} people found", { n: this.results.length }));
       }
     },
+    edit(subject) {
+      if (!subject) {
+        return;
+      } else if (!this.canManage) {
+        this.$router.push(subject.route(this.view));
+        return;
+      }
+
+      this.model = subject;
+      this.dialog.edit = true;
+    },
+    onSave(m) {
+      if (this.busy || !this.canManage || !m.Name || m.Name.trim() === "") {
+        // Refuse to save an empty name or re-enter while a save is in flight.
+        return;
+      }
+
+      // Mark busy before the async lookup so the dialog cannot be re-submitted
+      // while the people cache resolves (cold cache / mid-flight eviction).
+      this.busy = true;
+
+      // Look up an existing person with the same name through the shared people
+      // cache to detect a merge (a different subject already owns the name).
+      const name = m.Name.toLowerCase();
+      typeaheadCache
+        .getPeople()
+        .then((people) => {
+          const existing = people.find((p) => p.Name && p.Name.toLowerCase() === name) || null;
+          if (!existing || existing.UID === m.UID) {
+            m.update()
+              .then(() => {
+                // Seed the shared people cache with the renamed person so
+                // suggestion consumers reflect it without waiting for the WS
+                // event. This rename seed lives here, not in Subject.update(),
+                // because update() also backs hide()/show() — seeding there
+                // would re-add hidden people to the suggestion list. m.UID and
+                // m.Name are populated (the merge check above already uses them).
+                typeaheadCache.upsertPerson({ UID: m.UID, Name: m.Name });
+                this.$notify.success(this.$gettext("Changes successfully saved"));
+              })
+              .finally(() => {
+                this.busy = false;
+                this.dialog.edit = false;
+              });
+          } else {
+            this.busy = false;
+            this.merge.subj1 = m;
+            this.merge.subj2 = existing;
+            this.dialog.edit = false;
+            this.merge.visible = true;
+          }
+        })
+        .catch(() => {
+          this.busy = false;
+        });
+    },
     onCancelMerge() {
-      this.merge.subj1.Name = this.merge.subj1.originalValue("Name");
-      this.merge.show = false;
+      this.merge.visible = false;
       this.merge.subj1 = null;
       this.merge.subj2 = null;
     },
     onMerge() {
-      if(!this.canManage) {
+      if (!this.canManage) {
         return;
       }
 
       this.busy = true;
-      this.merge.show = false;
-      this.$notify.blockUI();
+      this.merge.visible = false;
+      this.dialog.edit = false;
+      this.$notify.blockUI("busy");
       this.merge.subj1.update().finally(() => {
         this.busy = false;
         this.merge.subj1 = null;
@@ -309,7 +358,7 @@ export default {
       });
     },
     searchCount() {
-      const offset = parseInt(window.localStorage.getItem("subjects_offset"));
+      const offset = parseInt(appStorage.getItem("people.recognized.offset"));
 
       if (this.offset > 0 || !offset) {
         return this.batchSize;
@@ -322,10 +371,10 @@ export default {
     },
     setOffset(offset) {
       this.offset = offset;
-      window.localStorage.setItem("subjects_offset", offset);
+      appStorage.setItem("people.recognized.offset", offset);
     },
     toggleLike(ev, index) {
-      if(!this.canManage) {
+      if (!this.canManage) {
         return;
       }
 
@@ -366,7 +415,7 @@ export default {
         this.addSelection(models[i].getId());
       }
 
-      return (rangeEnd - rangeStart) + 1;
+      return rangeEnd - rangeStart + 1;
     },
     onSelect(ev, index) {
       const inputType = this.input.eval(ev, index);
@@ -410,21 +459,21 @@ export default {
       }
     },
     onShowHidden() {
-      if(!this.canManage) {
+      if (!this.canManage) {
         return;
       }
 
       this.showHidden("yes");
     },
     onExcludeHidden() {
-      if(!this.canManage) {
+      if (!this.canManage) {
         return;
       }
 
       this.showHidden("");
     },
     showHidden(value) {
-      if(!this.canManage) {
+      if (!this.canManage) {
         return;
       }
 
@@ -432,7 +481,7 @@ export default {
       this.updateQuery();
     },
     onToggleHidden(ev, index) {
-      if(!this.canManage) {
+      if (!this.canManage) {
         return;
       }
 
@@ -458,7 +507,7 @@ export default {
 
       if (pos === -1) {
         if (this.selection.length >= MaxItems) {
-          Notify.warn(this.$gettext("Can't select more items"));
+          $notify.warn(this.$gettext("Can't select more items"));
           return;
         }
 
@@ -474,7 +523,7 @@ export default {
         this.lastId = "";
       } else {
         if (this.selection.length >= MaxItems) {
-          Notify.warn(this.$gettext("Can't select more items"));
+          $notify.warn(this.$gettext("Can't select more items"));
           return;
         }
 
@@ -516,33 +565,36 @@ export default {
         Object.assign(params, this.staticFilter);
       }
 
-      Subject.search(params).then(resp => {
-        this.results = this.dirty ? resp.models : this.results.concat(resp.models);
+      Subject.search(params)
+        .then((resp) => {
+          this.results = this.dirty ? resp.models : this.results.concat(resp.models);
 
-        this.scrollDisabled = (resp.count < resp.limit);
+          this.scrollDisabled = resp.count < resp.limit;
 
-        if (this.scrollDisabled) {
-          this.setOffset(resp.offset);
-          if (this.results.length > 1) {
-            this.$notify.info(this.$gettextInterpolate(this.$gettext("All %{n} people loaded"), {n: this.results.length}));
-          }
-        } else {
-          this.setOffset(resp.offset + resp.limit);
-          this.page++;
-
-          this.$nextTick(() => {
-            if (this.$root.$el.clientHeight <= window.document.documentElement.clientHeight + 300) {
-              this.$emit("scrollRefresh");
+          if (this.scrollDisabled) {
+            this.setOffset(resp.offset);
+            if (this.results.length > 1) {
+              this.$notify.info(this.$gettext("All %{n} people loaded", { n: this.results.length }));
             }
-          });
-        }
-      }).catch(() => {
-        this.scrollDisabled = false;
-      }).finally(() => {
-        this.dirty = false;
-        this.loading = false;
-        this.listen = true;
-      });
+          } else {
+            this.setOffset(resp.offset + resp.limit);
+            this.page++;
+
+            this.$nextTick(() => {
+              if (this.$root.$el.clientHeight <= window.document.documentElement.clientHeight + 300) {
+                this.loadMore();
+              }
+            });
+          }
+        })
+        .catch(() => {
+          this.scrollDisabled = false;
+        })
+        .finally(() => {
+          this.dirty = false;
+          this.loading = false;
+          this.listen = true;
+        });
     },
     updateSettings(props) {
       if (!props || typeof props !== "object" || props.target) {
@@ -561,7 +613,7 @@ export default {
             this.settings[key] = value;
         }
 
-        window.localStorage.setItem("people_"+key, this.settings[key]);
+        appStorage.setItem("people.recognized." + key, this.settings[key]);
       }
     },
     updateFilter(props) {
@@ -586,11 +638,11 @@ export default {
       this.updateFilter(props);
 
       if (this.loading || !this.active) {
-        return;
+        return false;
       }
 
       const query = {
-        view: this.settings.view
+        view: this.settings.view,
       };
 
       Object.assign(query, this.filter);
@@ -602,10 +654,12 @@ export default {
       }
 
       if (JSON.stringify(this.$route.query) === JSON.stringify(query)) {
-        return;
+        return false;
       }
 
-      this.$router.replace({query: query});
+      this.$router.replace({ query: query });
+
+      return true;
     },
     searchParams() {
       const params = {
@@ -624,14 +678,29 @@ export default {
     refresh(props) {
       this.updateSettings(props);
 
-      if (this.loading || !this.active) return;
+      // Do not refresh results if the view is already loading
+      // or should not be listening for events.
+      if (this.loading || !this.active || !this.listen) {
+        return;
+      }
 
-      this.loading = true;
-      this.page = 0;
+      // Make sure enough results are loaded to maintain the scroll position.
+      if (this.page > 2) {
+        this.page = this.page - 1;
+      } else {
+        this.page = 1;
+      }
+
+      // Flag results as dirty to force a refresh.
       this.dirty = true;
+
+      // Enable infinite scrolling if it was disabled.
       this.scrollDisabled = false;
 
       this.loadMore();
+    },
+    reset() {
+      this.results = [];
     },
     search() {
       /**
@@ -639,7 +708,7 @@ export default {
        * back-navigation. We therefore reset the remembered scroll-position
        * in any other scenario
        */
-      if (!window.backwardsNavigationDetected) {
+      if (!this.$view.wasBackwardNavigation()) {
         this.setOffset(0);
       }
 
@@ -647,7 +716,7 @@ export default {
 
       // Don't query the same data more than once
       if (JSON.stringify(this.lastFilter) === JSON.stringify(this.filter)) {
-        this.$nextTick(() => this.$emit("scrollRefresh"));
+        // this.$nextTick(() => this.$emit("scrollRefresh"));
         return;
       }
 
@@ -660,60 +729,109 @@ export default {
 
       const params = this.searchParams();
 
-      Subject.search(params).then(resp => {
-        this.offset = resp.limit;
-        this.results = resp.models;
+      Subject.search(params)
+        .then((resp) => {
+          this.offset = resp.limit;
+          this.results = resp.models;
 
-        this.scrollDisabled = (resp.count < resp.limit);
+          this.scrollDisabled = resp.count < resp.limit;
 
-        if (this.scrollDisabled) {
-          if (!this.results.length) {
-            this.$notify.warn(this.$gettext("No people found"));
-          } else if (this.results.length === 1) {
-            this.$notify.info(this.$gettext("One person found"));
+          if (this.scrollDisabled) {
+            this.notifyResultCount();
           } else {
-            this.$notify.info(this.$gettextInterpolate(this.$gettext("%{n} people found"), {n: this.results.length}));
+            this.$nextTick(() => {
+              if (this.$root.$el.clientHeight <= window.document.documentElement.clientHeight + 300) {
+                this.loadMore();
+              }
+            });
           }
-        } else {
-          this.$notify.info(this.$gettext('More than 20 people found'));
+        })
+        .catch(() => {
+          this.reset();
+        })
+        .finally(() => {
+          this.dirty = false;
+          this.loading = false;
+          this.listen = true;
+        });
+    },
+    // refetchResults reloads the affected entries through the scoped
+    // search API and patches the loaded results in place, so a single
+    // edit costs one uid-filtered query instead of re-running the full
+    // result query. Larger batches fall back to the dirty flag and are
+    // refetched lazily on the next return-to-view.
+    refetchResults(uids) {
+      const affected = uids.filter((uid) => this.results.some((m) => m.UID === uid));
 
-          this.$nextTick(() => {
-            if (this.$root.$el.clientHeight <= window.document.documentElement.clientHeight + 300) {
-              this.$emit("scrollRefresh");
+      if (affected.length === 0) {
+        return;
+      }
+
+      if (affected.length > maxLiveRefetch) {
+        this.dirty = true;
+        return;
+      }
+
+      // Carries the list's own visibility, or the refetch answers a narrower question than the list
+      // asked: with hidden people shown, a uid-scoped search without it drops the row being patched.
+      Subject.search({ uid: affected.join("|"), count: affected.length, hidden: this.filter.hidden })
+        .then((resp) => {
+          const found = new Set();
+
+          resp.models.forEach((values) => {
+            found.add(values.UID);
+
+            const model = this.results.find((m) => m.UID === values.UID);
+
+            if (model) {
+              for (let key in values) {
+                // Null is a value here, not a missing field: a cleared column arrives as one, and
+                // the loaded model has to take it for the list to match the row.
+                if (key !== "UID" && values.hasOwnProperty(key) && (values[key] === null || typeof values[key] !== "object")) {
+                  model[key] = values[key];
+                }
+              }
             }
           });
-        }
-      }).finally(() => {
-        this.dirty = false;
-        this.loading = false;
-        this.listen = true;
-      });
+
+          // Rows the scoped search no longer returns are not visible to
+          // this session anymore — drop them like a full refresh would.
+          affected
+            .filter((uid) => !found.has(uid))
+            .forEach((uid) => {
+              const index = this.results.findIndex((m) => m.UID === uid);
+
+              if (index >= 0) {
+                this.results.splice(index, 1);
+              }
+
+              this.removeSelection(uid);
+            });
+        })
+        .catch(() => {
+          this.dirty = true;
+        });
     },
     onUpdate(ev, data) {
-      if (!this.listen) return;
+      if (!this.listen) {
+        return;
+      }
 
       if (!data || !data.entities || !Array.isArray(data.entities)) {
         return;
       }
 
-      const type = ev.split('.')[1];
+      const type = ev.split(".")[1];
 
       switch (type) {
-        case 'updated':
-          for (let i = 0; i < data.entities.length; i++) {
-            const values = data.entities[i];
-            const model = this.results.find((m) => m.UID === values.UID);
+        case ACTION_UPDATED:
+          // subjects.updated is a lightweight UID-only signal that carries
+          // no entity fields; affected entries are reloaded through the
+          // scoped search API and patched in place.
+          this.refetchResults(data.entities);
 
-            if (model) {
-              for (let key in values) {
-                if (values.hasOwnProperty(key) && values[key] != null && typeof values[key] !== "object") {
-                  model[key] = values[key];
-                }
-              }
-            }
-          }
           break;
-        case 'deleted':
+        case ACTION_DELETED:
           this.dirty = true;
 
           for (let i = 0; i < data.entities.length; i++) {
@@ -728,13 +846,13 @@ export default {
           }
 
           break;
-        case 'created':
+        case ACTION_CREATED:
           this.dirty = true;
           break;
         default:
           console.warn("unexpected event type", ev);
       }
-    }
+    },
   },
 };
 </script>

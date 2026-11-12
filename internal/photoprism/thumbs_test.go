@@ -2,19 +2,16 @@ package photoprism
 
 import (
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 
-	"github.com/disintegration/imaging"
-
-	"github.com/photoprism/photoprism/internal/classify"
 	"github.com/photoprism/photoprism/internal/config"
 	"github.com/photoprism/photoprism/internal/entity"
-	"github.com/photoprism/photoprism/internal/face"
-	"github.com/photoprism/photoprism/internal/nsfw"
 	"github.com/photoprism/photoprism/internal/thumb"
+	"github.com/photoprism/photoprism/pkg/fs"
 )
 
 func TestResample_Start(t *testing.T) {
@@ -22,27 +19,24 @@ func TestResample_Start(t *testing.T) {
 		t.Skip("skipping test in short mode.")
 	}
 
-	conf := config.TestConfig()
+	cfg := config.TestConfig()
 
-	if err := conf.CreateDirectories(); err != nil {
+	if err := cfg.CreateDirectories(); err != nil {
 		t.Fatal(err)
 	}
 
-	conf.InitializeTestData()
+	initErr := cfg.InitializeTestData()
+	assert.NoError(t, initErr)
 
-	tf := classify.New(conf.AssetsPath(), conf.DisableTensorFlow())
-	nd := nsfw.New(conf.NSFWModelPath())
-	fn := face.NewNet(conf.FaceNetModelPath(), "", conf.DisableTensorFlow())
-	convert := NewConvert(conf)
+	convert := NewConvert(cfg)
+	ind := NewIndex(cfg, convert, NewFiles(), NewPhotos())
 
-	ind := NewIndex(conf, tf, nd, fn, convert, NewFiles(), NewPhotos())
-
-	imp := NewImport(conf, ind, convert)
-	opt := ImportOptionsMove(conf.ImportPath(), "")
+	imp := NewImport(cfg, ind, convert)
+	opt := ImportOptionsMove(cfg.ImportPath(), "")
 
 	imp.Start(opt)
 
-	rs := NewThumbs(conf)
+	rs := NewThumbs(cfg)
 
 	err := rs.Start("", true, false)
 
@@ -51,27 +45,67 @@ func TestResample_Start(t *testing.T) {
 	}
 }
 
-func TestThumb_Filename(t *testing.T) {
-	conf := config.TestConfig()
+func TestThumbs_DirHonorsPPIgnore(t *testing.T) {
+	cfg := config.NewMinimalTestConfig(t.TempDir())
 
-	thumbsPath := conf.CachePath() + "/_tmp"
+	oldCfg := Config()
+	SetConfig(cfg)
+
+	t.Cleanup(func() {
+		SetConfig(oldCfg)
+	})
+
+	dir := t.TempDir()
+
+	ignoreName := filepath.Join(dir, fs.PPIgnoreFilename)
+	if err := os.WriteFile(ignoreName, []byte("*.jpg\n"), fs.ModeFile); err != nil {
+		t.Fatal(err)
+	}
+
+	jpgData, err := os.ReadFile("testdata/2018-04-12 19_24_49.jpg")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	imageName := filepath.Join(dir, "ignored.jpg")
+	// The destination is a fixed test filename under t.TempDir().
+	if err = os.WriteFile(imageName, jpgData, fs.ModeFile); err != nil { //nolint:gosec
+		t.Fatal(err)
+	}
+
+	done, err := NewThumbs(cfg).Dir(dir, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, ok := done[imageName]; !ok {
+		t.Fatalf("expected %s to be tracked in done map", imageName)
+	}
+
+	assert.False(t, done[imageName].Processed())
+}
+
+func TestThumb_Filename(t *testing.T) {
+	c := config.TestConfig()
+
+	thumbsPath := c.CachePath() + "/_tmp"
 
 	defer os.RemoveAll(thumbsPath)
 
-	if err := conf.CreateDirectories(); err != nil {
+	if err := c.CreateDirectories(); err != nil {
 		t.Error(err)
 	}
 
-	t.Run("", func(t *testing.T) {
+	t.Run("Success", func(t *testing.T) {
 		filename, err := thumb.FileName("99988", thumbsPath, 150, 150, thumb.ResampleFit, thumb.ResampleNearestNeighbor)
 
 		if err != nil {
 			t.Fatal(err)
 		}
 
-		assert.True(t, strings.HasSuffix(filename, "/storage/testdata/cache/_tmp/9/9/9/99988_150x150_fit.jpg"))
+		assert.True(t, strings.HasSuffix(filename, "/testdata/cache/_tmp/9/9/9/99988_150x150_fit.jpg"))
 	})
-	t.Run("hash too short", func(t *testing.T) {
+	t.Run("InvalidHash", func(t *testing.T) {
 		_, err := thumb.FileName("999", thumbsPath, 150, 150, thumb.ResampleFit, thumb.ResampleNearestNeighbor)
 
 		if err == nil {
@@ -80,21 +114,21 @@ func TestThumb_Filename(t *testing.T) {
 
 		assert.Equal(t, "thumb: file hash is empty or too short (999)", err.Error())
 	})
-	t.Run("invalid width", func(t *testing.T) {
+	t.Run("InvalidWidth", func(t *testing.T) {
 		_, err := thumb.FileName("99988", thumbsPath, -4, 150, thumb.ResampleFit, thumb.ResampleNearestNeighbor)
 		if err == nil {
 			t.FailNow()
 		}
 		assert.Equal(t, "thumb: width exceeds limit (-4)", err.Error())
 	})
-	t.Run("invalid height", func(t *testing.T) {
+	t.Run("InvalidHeight", func(t *testing.T) {
 		_, err := thumb.FileName("99988", thumbsPath, 200, -1, thumb.ResampleFit, thumb.ResampleNearestNeighbor)
 		if err == nil {
 			t.FailNow()
 		}
 		assert.Equal(t, "thumb: height exceeds limit (-1)", err.Error())
 	})
-	t.Run("empty thumbpath", func(t *testing.T) {
+	t.Run("EmptyPath", func(t *testing.T) {
 		path := ""
 		_, err := thumb.FileName("99988", path, 200, 150, thumb.ResampleFit, thumb.ResampleNearestNeighbor)
 		if err == nil {
@@ -105,19 +139,19 @@ func TestThumb_Filename(t *testing.T) {
 }
 
 func TestThumb_FromFile(t *testing.T) {
-	conf := config.TestConfig()
+	c := config.TestConfig()
 
-	thumbsPath := conf.CachePath() + "/_tmp"
+	thumbsPath := c.CachePath() + "/_tmp"
 
 	defer os.RemoveAll(thumbsPath)
 
-	if err := conf.CreateDirectories(); err != nil {
+	if err := c.CreateDirectories(); err != nil {
 		t.Error(err)
 	}
 
-	t.Run("valid parameter", func(t *testing.T) {
+	t.Run("ValidParameter", func(t *testing.T) {
 		file := &entity.File{
-			FileName: conf.ExamplesPath() + "/elephants.jpg",
+			FileName: c.SamplesPath() + "/elephants.jpg",
 			FileHash: "1234568889",
 		}
 
@@ -125,10 +159,9 @@ func TestThumb_FromFile(t *testing.T) {
 		assert.Nil(t, err)
 		assert.FileExists(t, thumbnail)
 	})
-
-	t.Run("hash too short", func(t *testing.T) {
+	t.Run("HashTooShort", func(t *testing.T) {
 		file := &entity.File{
-			FileName: conf.ExamplesPath() + "/elephants.jpg",
+			FileName: c.SamplesPath() + "/elephants.jpg",
 			FileHash: "123",
 		}
 
@@ -140,7 +173,7 @@ func TestThumb_FromFile(t *testing.T) {
 
 		assert.Equal(t, "thumb: invalid file hash 123", err.Error())
 	})
-	t.Run("filename too short", func(t *testing.T) {
+	t.Run("FilenameTooShort", func(t *testing.T) {
 		file := &entity.File{
 			FileName: "xxx",
 			FileHash: "12367890",
@@ -152,8 +185,7 @@ func TestThumb_FromFile(t *testing.T) {
 			t.Error("error is nil")
 		}
 	})
-
-	t.Run("rotate-6.tiff", func(t *testing.T) {
+	t.Run("RotateSixTiff", func(t *testing.T) {
 		fileName := "testdata/rotate/6.tiff"
 
 		file, err := NewMediaFile(fileName)
@@ -193,14 +225,14 @@ func TestThumb_Create(t *testing.T) {
 		t.Error(err)
 	}
 
-	t.Run("valid parameter", func(t *testing.T) {
+	t.Run("ValidParameter", func(t *testing.T) {
 		expectedFilename, err := thumb.FileName("12345", thumbsPath, 150, 150, thumb.ResampleFit, thumb.ResampleNearestNeighbor)
 
 		if err != nil {
 			t.Error(err)
 		}
 
-		img, err := imaging.Open(conf.ExamplesPath()+"/elephants.jpg", imaging.AutoOrientation(true))
+		img, _, err := fs.DecodeImageFile(conf.SamplesPath() + "/elephants.jpg")
 
 		if err != nil {
 			t.Errorf("cannot open original: %s", err)
@@ -220,14 +252,14 @@ func TestThumb_Create(t *testing.T) {
 
 		assert.FileExists(t, expectedFilename)
 	})
-	t.Run("invalid width", func(t *testing.T) {
+	t.Run("InvalidWidth", func(t *testing.T) {
 		expectedFilename, err := thumb.FileName("12345", thumbsPath, 150, 150, thumb.ResampleFit, thumb.ResampleNearestNeighbor)
 
 		if err != nil {
 			t.Error(err)
 		}
 
-		img, err := imaging.Open(conf.ExamplesPath()+"/elephants.jpg", imaging.AutoOrientation(true))
+		img, _, err := fs.DecodeImageFile(conf.SamplesPath() + "/elephants.jpg")
 
 		if err != nil {
 			t.Errorf("cannot open original: %s", err)
@@ -245,15 +277,14 @@ func TestThumb_Create(t *testing.T) {
 		bounds := thumbnail.Bounds()
 		assert.NotEqual(t, 150, bounds.Dx())
 	})
-
-	t.Run("invalid height", func(t *testing.T) {
+	t.Run("InvalidHeight", func(t *testing.T) {
 		expectedFilename, err := thumb.FileName("12345", thumbsPath, 150, 150, thumb.ResampleFit, thumb.ResampleNearestNeighbor)
 
 		if err != nil {
 			t.Error(err)
 		}
 
-		img, err := imaging.Open(conf.ExamplesPath()+"/elephants.jpg", imaging.AutoOrientation(true))
+		img, _, err := fs.DecodeImageFile(conf.SamplesPath() + "/elephants.jpg")
 
 		if err != nil {
 			t.Errorf("cannot open original: %s", err)

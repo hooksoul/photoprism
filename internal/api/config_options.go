@@ -1,42 +1,55 @@
 package api
 
 import (
+	"errors"
 	"net/http"
-	"os"
-	"path/filepath"
 
 	"github.com/gin-gonic/gin"
-	"gopkg.in/yaml.v2"
 
-	"github.com/photoprism/photoprism/internal/acl"
+	"github.com/photoprism/photoprism/internal/auth/acl"
+	"github.com/photoprism/photoprism/internal/config"
 	"github.com/photoprism/photoprism/internal/entity"
-	"github.com/photoprism/photoprism/internal/get"
 	"github.com/photoprism/photoprism/internal/mutex"
+	"github.com/photoprism/photoprism/internal/photoprism/get"
 	"github.com/photoprism/photoprism/pkg/clean"
-	"github.com/photoprism/photoprism/pkg/fs"
+	"github.com/photoprism/photoprism/pkg/i18n"
 )
 
 // GetConfigOptions returns backend config options.
 //
-// GET /api/v1/config/options
+//	@Summary	returns backend config options
+//	@Id			GetConfigOptions
+//	@Tags		Config, Settings
+//	@Produce	json
+//	@Success	200			{object}	config.Options
+//	@Failure	401,403,429	{object}	i18n.Response
+//	@Router		/api/v1/config/options [get]
 func GetConfigOptions(router *gin.RouterGroup) {
 	router.GET("/config/options", func(c *gin.Context) {
-		s := Auth(c, acl.ResourceConfig, acl.AccessAll)
+		s := AuthAccess(c, acl.ResourceConfig, acl.ActionView, acl.Permissions{acl.AccessAll})
 		conf := get.Config()
 
-		// Abort if permission was not granted.
+		// Abort if permission is not granted.
 		if s.Invalid() || conf.Public() || conf.DisableSettings() {
 			AbortForbidden(c)
 			return
 		}
 
-		c.JSON(http.StatusOK, conf.Options())
+		c.JSON(http.StatusOK, conf.RedactedOptions())
 	})
 }
 
 // SaveConfigOptions updates backend config options.
 //
-// POST /api/v1/config/options
+//	@Summary	updates backend config options
+//	@Id			SaveConfigOptions
+//	@Tags		Config, Settings
+//	@Accept		json
+//	@Produce	json
+//	@Success	200						{object}	config.Options
+//	@Failure	400,401,403,413,429,500	{object}	i18n.Response
+//	@Param		options					body		config.Options	true	"properties to be updated (only submit values that should be changed)"
+//	@Router		/api/v1/config/options [post]
 func SaveConfigOptions(router *gin.RouterGroup) {
 	router.POST("/config/options", func(c *gin.Context) {
 		s := Auth(c, acl.ResourceConfig, acl.ActionManage)
@@ -47,73 +60,50 @@ func SaveConfigOptions(router *gin.RouterGroup) {
 			return
 		}
 
-		fileName := conf.OptionsYaml()
+		v := make(entity.Values)
 
-		if fileName == "" {
-			log.Errorf("config: empty options.yml file path")
-			AbortSaveFailed(c)
-			return
-		}
-
-		type valueMap map[string]interface{}
-
-		v := make(valueMap)
-
-		if fs.FileExists(fileName) {
-			yamlData, err := os.ReadFile(fileName)
-
-			if err != nil {
-				log.Errorf("config: failed loading values from %s (%s)", clean.Log(fileName), err)
-				c.AbortWithStatusJSON(http.StatusInternalServerError, err)
-				return
-			}
-
-			if err := yaml.Unmarshal(yamlData, v); err != nil {
-				log.Warnf("config: failed parsing values in %s (%s)", clean.Log(fileName), err)
-				c.AbortWithStatusJSON(http.StatusInternalServerError, err)
-				return
-			}
-		}
+		LimitRequestBodyBytes(c, MaxSettingsRequestBytes)
 
 		if err := c.BindJSON(&v); err != nil {
-			log.Errorf("config: %s (bind json)", err)
-			AbortBadRequest(c)
+			if IsRequestBodyTooLarge(err) {
+				AbortRequestTooLarge(c, i18n.ErrBadRequest)
+				return
+			}
+
+			AbortBadRequest(c, err)
 			return
 		}
 
-		yamlData, err := yaml.Marshal(v)
-
-		if err != nil {
-			log.Errorf("config: %s (marshal yaml)", err)
-			c.AbortWithStatusJSON(http.StatusInternalServerError, err)
-			return
+		// Only options the API returns may be set through it.
+		if removed := config.RemoveUnsupportedOptionValues(v); len(removed) > 0 {
+			log.Debugf("config: ignored %s in options update", clean.LogNames(removed))
 		}
 
-		// Make sure directory exists.
-		if err := os.MkdirAll(filepath.Dir(fileName), fs.ModeDir); err != nil {
-			log.Errorf("config: failed creating config path %s (%s)", filepath.Dir(fileName), err)
-			c.AbortWithStatusJSON(http.StatusInternalServerError, err)
-			return
+		// A value returned redacted and sent back unchanged sets nothing.
+		if removed := conf.RemoveRedactedOptionValues(v); len(removed) > 0 {
+			log.Debugf("config: ignored unchanged %s in options update", clean.LogNames(removed))
 		}
 
-		// Write YAML data to file.
-		if err := os.WriteFile(fileName, yamlData, fs.ModeFile); err != nil {
-			log.Errorf("config: failed writing values to %s (%s)", clean.Log(fileName), err)
-			c.AbortWithStatusJSON(http.StatusInternalServerError, err)
-			return
-		}
+		if _, err := conf.SaveOptionsPatch(v); err != nil {
+			// A value that does not fit the option it sets is the request's fault, not the server's.
+			if errors.Is(err, config.ErrInvalidOptionValue) {
+				AbortBadRequest(c, err)
+				return
+			} else if errors.Is(err, config.ErrOptionsTooLarge) {
+				log.Warnf("config: options not saved because the options file would exceed its size limit")
+				AbortRequestTooLarge(c, i18n.ErrFileTooLarge)
+				return
+			}
 
-		// Reload options.
-		if err := conf.Options().Load(fileName); err != nil {
-			log.Warnf("config: failed loading values from %s (%s)", clean.Log(fileName), err)
-			c.AbortWithStatusJSON(http.StatusInternalServerError, err)
+			log.Errorf("config: failed saving options patch (%s)", clean.Error(err))
+			AbortSaveFailed(c)
 			return
 		}
 
 		// Set restart flag.
 		mutex.Restart.Store(true)
 
-		// Propagate changes.
+		// Update package defaults.
 		conf.Propagate()
 
 		// Flush session cache and update client config.
@@ -121,6 +111,6 @@ func SaveConfigOptions(router *gin.RouterGroup) {
 		UpdateClientConfig()
 
 		// Return updated config options.
-		c.JSON(http.StatusOK, conf.Options())
+		c.JSON(http.StatusOK, conf.RedactedOptions())
 	})
 }

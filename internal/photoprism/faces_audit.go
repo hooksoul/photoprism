@@ -1,16 +1,24 @@
 package photoprism
 
 import (
-	"github.com/dustin/go-humanize/english"
+	"crypto/sha1" //nolint:gosec // SHA1 is kept for backward-compatible audit hashing.
+	"encoding/base32"
+	"fmt"
+	"math"
 
+	"github.com/dustin/go-humanize/english"
+	"gorm.io/gorm"
+
+	"github.com/photoprism/photoprism/internal/ai/face"
 	"github.com/photoprism/photoprism/internal/entity"
-	"github.com/photoprism/photoprism/internal/face"
-	"github.com/photoprism/photoprism/internal/query"
+	"github.com/photoprism/photoprism/internal/entity/query"
 	"github.com/photoprism/photoprism/pkg/clean"
 )
 
 // Audit face clusters and subjects.
-func (w *Faces) Audit(fix bool) (err error) {
+func (w *Faces) Audit(fix bool, subjUID string) (err error) {
+	w.auditProvenance()
+
 	invalidFaces, invalidSubj, err := query.MarkersWithNonExistentReferences()
 
 	if err != nil {
@@ -23,10 +31,14 @@ func (w *Faces) Audit(fix bool) (err error) {
 		log.Errorf("faces: %s (find subjects)", err)
 	}
 
-	if n := len(subj); n == 0 {
-		log.Infof("faces: found no subjects")
+	if subjUID == "" {
+		if n := len(subj); n == 0 {
+			log.Infof("faces: found no subjects")
+		} else {
+			log.Infof("faces: found %s", english.Plural(n, "subject", "subjects"))
+		}
 	} else {
-		log.Infof("faces: found %s", english.Plural(n, "subject", "subjects"))
+		log.Infof("faces: auditing subject %s (%s)", entity.SubjNames.Log(subjUID), clean.Log(subjUID))
 	}
 
 	// Fix non-existent marker subjects references?
@@ -51,32 +63,108 @@ func (w *Faces) Audit(fix bool) (err error) {
 		log.Infof("faces: removed %d / %d markers with non-existent faces", removed, n)
 	}
 
+	// Normalize stored face embeddings and distances as needed.
+	if _, _, _, err := w.normalizeStoredEmbeddings(fix); err != nil {
+		return err
+	}
+
+	// Measured before the collision pass below reads the clusters, so a cluster whose extent was
+	// missing is checked against the others at the distance it actually reaches.
+	if _, err := w.recomputeMissingRadius(fix, subjUID); err != nil {
+		return err
+	}
+
 	conflicts := 0
 	resolved := 0
 
-	faces, ids, err := query.FacesByID(true, false, false, false)
+	// Counted beside the pairs: a handful of people account for hundreds of them, and only
+	// the people are something an operator acts on.
+	conflictClusters := make(map[string]bool)
+	conflictSubjects := make(map[string]bool)
+
+	faces, ids, err := query.FacesByID(false, false, false, false)
 
 	if err != nil {
 		return err
 	}
 
-	// Remembers matched combinations.
-	done := make(map[string]bool, len(ids)*len(ids))
+	if subjUID != "" {
+		filtered := make(query.FaceMap, len(faces))
+		filteredIDs := make(query.IDs, 0, len(ids))
 
-	// Find face assignment collisions.
-	for _, i := range ids {
-		for _, j := range ids {
-			var f1, f2 entity.Face
-
-			if f, ok := faces[i]; ok {
-				f1 = f
-			} else {
+		for _, id := range ids {
+			faceEntry := faces[id]
+			if faceEntry.SubjUID != subjUID {
 				continue
 			}
 
-			if f, ok := faces[j]; ok {
-				f2 = f
-			} else {
+			filtered[id] = faceEntry
+			filteredIDs = append(filteredIDs, id)
+		}
+
+		faces = filtered
+		ids = filteredIDs
+
+		if len(ids) == 0 {
+			log.Infof("faces: found no clusters for subject %s", entity.SubjNames.Log(subjUID))
+		}
+	}
+
+	stubborn := make([]entity.Face, 0)
+	stubbornIDs := make([]string, 0)
+
+	for _, id := range ids {
+		if entry, ok := faces[id]; ok {
+			if entry.MergeRetry > 0 {
+				stubborn = append(stubborn, entry)
+				stubbornIDs = append(stubbornIDs, entry.ID)
+			}
+		}
+	}
+
+	if len(stubborn) > 0 {
+		counts, countErr := query.MarkerCountsByFaceIDs(stubbornIDs)
+
+		switch {
+		case countErr != nil:
+			logErr("faces", "marker counts", countErr)
+		case subjUID != "":
+			log.Warnf("faces: %s awaiting merge for subject %s", english.Plural(len(stubborn), "manual cluster", "manual clusters"), entity.SubjNames.Log(subjUID))
+			for _, entry := range stubborn {
+				log.Warnf("faces: cluster %s retry=%d markers=%d notes=%s", entry.ID, entry.MergeRetry, counts[entry.ID], clean.Log(entry.MergeNotes))
+			}
+		default:
+			log.Warnf("faces: %s pending manual cluster merge – use 'photoprism faces audit --subject=<uid>' for details", english.Plural(len(stubborn), "manual cluster", "manual clusters"))
+		}
+	}
+
+	// Remembers matched combinations.
+	done := make(map[string]bool, len(ids)*len(ids))
+
+	// Face.Match reads the receiver's vector through a cache that a value copied out of the
+	// map starts empty, so re-reading both sides inside the inner loop parsed the same JSON
+	// once per pair. The outer face is copied once per pass and re-adopted after a refresh,
+	// and the inner vectors are decoded up front, which makes it one parse per cluster.
+	embeddings := make(map[string]face.Embedding, len(ids))
+
+	for _, id := range ids {
+		if f, ok := faces[id]; ok {
+			embeddings[id] = f.Embedding()
+		}
+	}
+
+	// Find face assignment collisions.
+	for _, i := range ids {
+		f1, ok := faces[i]
+
+		if !ok {
+			continue
+		}
+
+		for _, j := range ids {
+			f2, ok := faces[j]
+
+			if !ok {
 				continue
 			}
 
@@ -88,28 +176,32 @@ func (w *Faces) Audit(fix bool) (err error) {
 			}
 
 			// Compare face 1 with face 2.
-			if matched, dist := f1.Match(face.Embeddings{f2.Embedding()}); matched {
+			if matched, dist := f1.Match(face.Embeddings{embeddings[j]}, f2.EmbedModel); matched {
 				if f1.SubjUID == f2.SubjUID {
+					continue
+				}
+
+				// A collision whose radius cannot narrow f1 is recorded at most once and not reported again.
+				if f1.CollisionNoted(dist) {
+					done[matchId] = true
 					continue
 				}
 
 				conflicts++
 
-				r := f1.SampleRadius + face.MatchDist
+				conflictClusters[f1.ID] = true
+				conflictClusters[f2.ID] = true
 
-				log.Infof("faces: face %s has ambiguous subject at dist %f, Ø %f from %d samples, collision Ø %f", f1.ID, dist, r, f1.Samples, f1.CollisionRadius)
-
-				if f1.SubjUID != "" {
-					log.Infof("faces: face %s belongs to subject %s (%s %s)", f1.ID, entity.SubjNames.Log(f1.SubjUID), f1.SubjUID, entity.SrcString(f1.FaceSrc))
-				} else {
-					log.Infof("faces: face %s has no subject assigned (%s)", f1.ID, entity.SrcString(f1.FaceSrc))
+				for _, uid := range []string{f1.SubjUID, f2.SubjUID} {
+					if uid != "" {
+						conflictSubjects[uid] = true
+					}
 				}
 
-				if f2.SubjUID != "" {
-					log.Infof("faces: face %s belongs to subject %s (%s %s)", f2.ID, entity.SubjNames.Log(f2.SubjUID), f2.SubjUID, entity.SrcString(f2.FaceSrc))
-				} else {
-					log.Infof("faces: face %s has no subject assigned (%s)", f2.ID, entity.SrcString(f2.FaceSrc))
-				}
+				// One line per pair rather than three, and at debug level: after a migration
+				// this reports hundreds of unsettled pairs, which buries every other finding.
+				// photoprism faces conflicts prints them as a table, on demand.
+				log.Debugf("%s", ambiguousPairMessage(f1, f2, dist))
 
 				// Skip fix?
 				if !fix {
@@ -117,7 +209,7 @@ func (w *Faces) Audit(fix bool) (err error) {
 				}
 
 				// Resolve.
-				success, failed := f1.ResolveCollision(face.Embeddings{f2.Embedding()})
+				success, failed := f1.ResolveCollision(face.Embeddings{embeddings[j]}, f2.EmbedModel)
 
 				// Failed?
 				if failed != nil {
@@ -131,6 +223,12 @@ func (w *Faces) Audit(fix bool) (err error) {
 					resolved++
 					faces, _, err = query.FacesByID(true, false, false, false)
 					logErr("faces", "refresh", err)
+
+					// ResolveCollision narrowed this cluster, and every later comparison in
+					// this pass has to see that rather than the row it started from.
+					if f, ok := faces[i]; ok {
+						f1 = f
+					}
 				} else {
 					log.Infof("faces: conflict resolution for %s not successful, face %s still has collisions with other persons", entity.SubjNames.Log(f1.SubjUID), f1.ID)
 				}
@@ -141,32 +239,180 @@ func (w *Faces) Audit(fix bool) (err error) {
 	}
 
 	// Show conflict resolution results.
-	if conflicts == 0 {
+	switch {
+	case conflicts == 0:
 		log.Infof("faces: found no ambiguous subjects")
-	} else if !fix {
-		log.Infof("faces: found %s", english.Plural(conflicts, "ambiguous subject", "ambiguous subjects"))
-	} else {
-		log.Infof("faces: found %s, %d resolved", english.Plural(conflicts, "ambiguous subject", "ambiguous subjects"), resolved)
+	case !fix:
+		log.Infof("faces: found %s", ambiguousPairSummary(conflicts, len(conflictClusters), len(conflictSubjects)))
+	default:
+		log.Infof("faces: found %s, %d resolved", ambiguousPairSummary(conflicts, len(conflictClusters), len(conflictSubjects)), resolved)
 	}
 
-	// Show remaining issues.
-	if markers, err := query.MarkersWithSubjectConflict(); err != nil {
+	// After a migration the clusters compared here are freshly built and mostly at the maximum
+	// distance they may accept, and matching settles most of them: this is a ceiling, not a state.
+	if conflicts > 0 {
+		log.Infof("faces: this is counted before matching settles the clusters, so it is provisional - use 'photoprism faces conflicts' to list the pairs")
+	}
+
+	// Show remaining issues, over every cluster including the hidden and ignored ones: a marker
+	// pointing at one of those is matched rather than dangling, and a row that really does not
+	// exist is reported by MarkersWithNonExistentReferences above.
+	allFaces, _, err := query.FacesByID(false, false, true, true)
+
+	if err != nil {
+		logErr("faces", "find clusters", err)
+	} else if markers, err := query.MarkersWithSubjectConflict(); err != nil {
 		logErr("faces", "find marker conflicts", err)
 	} else {
+		anonymous := 0
+		rejected := 0
+		xmp := 0
+
 		for _, m := range markers {
 			if m.FaceID == "" {
-				log.Warnf("faces: marker %s has an empty face id - possible bug", m.MarkerUID)
-			} else if f, ok := faces[m.FaceID]; !ok {
-				log.Warnf("faces: marker %s has invalid face %s of subject %s (%s)", m.MarkerUID, m.FaceID, entity.SubjNames.Log(f.SubjUID), f.SubjUID)
-			} else if m.SubjUID != "" {
-				log.Infof("faces: marker %s with %s subject %s (%s) conflicts with face %s (%s) of subject %s (%s)", m.MarkerUID, entity.SrcString(m.SubjSrc), entity.SubjNames.Log(m.SubjUID), m.SubjUID, m.FaceID, entity.SrcString(f.FaceSrc), entity.SubjNames.Log(f.SubjUID), f.SubjUID)
-			} else if m.MarkerName != "" {
-				log.Infof("faces: marker %s with %s subject name %s conflicts with face %s (%s) of subject %s (%s)", m.MarkerUID, entity.SrcString(m.SubjSrc), clean.Log(m.MarkerName), m.FaceID, entity.SrcString(f.FaceSrc), entity.SubjNames.Log(f.SubjUID), f.SubjUID)
-			} else {
-				log.Infof("faces: marker %s with unknown subject (%s) conflicts with face %s (%s) of subject %s (%s)", m.MarkerUID, entity.SrcString(m.SubjSrc), m.FaceID, entity.SrcString(f.FaceSrc), entity.SubjNames.Log(f.SubjUID), f.SubjUID)
+				log.Warnf("faces: marker %s has an empty face id - you may have found a bug", m.MarkerUID)
+				continue
+			}
+
+			faceEntry, ok := allFaces[m.FaceID]
+
+			// A run scoped to one subject reports the markers that subject is part of, on either
+			// side of the conflict, and leaves everybody else's alone.
+			if subjUID != "" && m.SubjUID != subjUID && (!ok || faceEntry.SubjUID != subjUID) {
+				continue
+			}
+
+			if !ok {
+				msg := fmt.Sprintf("faces: marker %s references missing face %s while subject is %s (%s)", m.MarkerUID, m.FaceID, entity.SubjNames.Log(m.SubjUID), m.SubjUID)
+				if fix {
+					updates := entity.Values{"face_id": "", "face_dist": -1.0, "matched_at": nil, "marker_review": true}
+
+					if err := entity.Db().Model(&entity.Marker{}).
+						Where("marker_uid = ?", m.MarkerUID).
+						UpdateColumns(updates).Error; err != nil {
+						log.Errorf("faces: failed clearing face reference for marker %s (%s)", m.MarkerUID, err)
+					} else {
+						log.Warnf("%s – cleared face reference for reprocessing", msg)
+					}
+				} else {
+					log.Warnf("%s", msg)
+				}
+				continue
+			}
+
+			// A marker whose name a person removed belongs to its cluster without taking its subject.
+			if m.RejectedMatch() {
+				rejected++
+				log.Debugf("faces: marker %s has no name in cluster %s after a person removed it", clean.Log(m.MarkerUID), clean.Log(m.FaceID))
+				continue
+			}
+
+			// An XMP name labels only its own marker, so it may differ from the cluster's person.
+			if m.SubjSrc == entity.SrcXmp && faceEntry.SubjUID != "" {
+				xmp++
+				continue
+			}
+
+			markerSubject := entity.SubjNames.Log(m.SubjUID)
+			faceSubject := entity.SubjNames.Log(faceEntry.SubjUID)
+
+			if faceEntry.SubjUID == "" {
+				// A marker whose subject the matcher assigned must not name its cluster, or one
+				// guess would spread over every other marker in it. This is what SetFace produces.
+				if !m.NamesFace() {
+					anonymous++
+					continue
+				}
+
+				msg := fmt.Sprintf("faces: marker %s with %s subject %s (%s) points to face %s without a subject", m.MarkerUID, entity.SrcString(m.SubjSrc), markerSubject, m.SubjUID, m.FaceID)
+
+				if fix {
+					updates := entity.Values{"face_id": "", "face_dist": -1.0, "matched_at": nil, "marker_review": true}
+					if err := entity.Db().Model(&entity.Marker{}).
+						Where("marker_uid = ?", m.MarkerUID).
+						UpdateColumns(updates).Error; err != nil {
+						log.Errorf("faces: failed clearing marker %s (%s)", m.MarkerUID, err)
+					} else {
+						log.Warnf("%s – cleared face reference for reprocessing", msg)
+					}
+				} else {
+					log.Warnf("%s", msg)
+				}
+				continue
+			}
+
+			switch {
+			case m.SubjUID != faceEntry.SubjUID:
+				dist := -1.0
+				if emb := m.Embeddings(); !emb.Empty() {
+					dist = minEmbeddingDistance(faceEntry.Embedding(), emb)
+				}
+
+				msg := fmt.Sprintf("faces: marker %s with %s subject %s (%s) conflicts with face %s (%s) of subject %s (%s)",
+					m.MarkerUID, entity.SrcString(m.SubjSrc), markerSubject, m.SubjUID,
+					m.FaceID, entity.SrcString(faceEntry.FaceSrc), faceSubject, faceEntry.SubjUID)
+
+				switch {
+				case !fix:
+					log.Warnf("%s", msg)
+					continue
+				case entity.SrcSubjects[m.SubjSrc] >= entity.SrcPriority[entity.SrcBatch]:
+					updates := entity.Values{"face_id": "", "face_dist": -1.0, "matched_at": nil, "marker_review": true}
+
+					if err := entity.Db().Model(&entity.Marker{}).
+						Where("marker_uid = ?", m.MarkerUID).
+						UpdateColumns(updates).Error; err != nil {
+						log.Errorf("faces: failed keeping manual subject for marker %s (%s)", m.MarkerUID, err)
+					} else {
+						log.Warnf("%s – kept manual subject and cleared conflicting face id", msg)
+					}
+					continue
+				default:
+					updates := entity.Values{
+						"subj_uid":      faceEntry.SubjUID,
+						"subj_src":      entity.SrcAuto,
+						"marker_review": false,
+					}
+
+					if dist >= 0 {
+						updates["face_dist"] = dist
+					}
+
+					if err := entity.Db().Model(&entity.Marker{}).
+						Where("marker_uid = ?", m.MarkerUID).
+						UpdateColumns(updates).Error; err != nil {
+						log.Errorf("faces: failed aligning marker %s with face %s (%s)", m.MarkerUID, m.FaceID, err)
+					} else {
+						log.Infof("faces: updated marker %s to match face %s subject %s (%s)", m.MarkerUID, m.FaceID, faceSubject, faceEntry.SubjUID)
+					}
+				}
+			case m.MarkerName != "":
+				log.Infof("faces: marker %s with %s subject name %s conflicts with face %s (%s) of subject %s (%s)", m.MarkerUID, entity.SrcString(m.SubjSrc), clean.Log(m.MarkerName), m.FaceID, entity.SrcString(faceEntry.FaceSrc), faceSubject, faceEntry.SubjUID)
+			default:
+				log.Infof("faces: marker %s with unknown subject (%s) conflicts with face %s (%s) of subject %s (%s)", m.MarkerUID, entity.SrcString(m.SubjSrc), m.FaceID, entity.SrcString(faceEntry.FaceSrc), faceSubject, faceEntry.SubjUID)
 			}
 
 		}
+
+		if anonymous > 0 {
+			log.Infof("faces: %s carry a subject the matcher assigned, whose cluster is unnamed as a result",
+				english.Plural(anonymous, "marker", "markers"))
+		}
+
+		if xmp > 0 {
+			log.Infof("faces: found %s with an XMP name in a cluster named after someone else",
+				english.Plural(xmp, "marker", "markers"))
+		}
+
+		if rejected > 0 {
+			log.Infof("faces: found %s whose name a person removed, left unnamed in a named cluster",
+				english.Plural(rejected, "marker", "markers"))
+		}
+	}
+
+	// Reported rather than fixed: naming them is what a completed recognition run does.
+	if _, err := w.auditConsensus(subjUID); err != nil {
+		logErr("faces", "find clusters to name", err)
 	}
 
 	// Find and fix orphan face clusters.
@@ -196,4 +442,549 @@ func (w *Faces) Audit(fix bool) (err error) {
 	}
 
 	return nil
+}
+
+// auditConsensus reports the unnamed clusters a completed recognition run names after the person
+// their votes agree on, optionally only those of one subject, and returns how many there are.
+func (w *Faces) auditConsensus(subjUID string) (int, error) {
+	candidates, err := query.ConsensusFaces(w.conf.FaceClusterCore())
+
+	if err != nil {
+		return 0, err
+	}
+
+	n := 0
+
+	for _, c := range candidates {
+		if subjUID != "" && c.SubjUID != subjUID {
+			continue
+		}
+
+		n++
+
+		log.Debugf("faces: cluster %s qualifies to be named after %s, %d of %d markers agree, %d matched", clean.Log(c.FaceID), entity.SubjNames.Log(c.SubjUID), c.Votes, c.Valid, c.Matched)
+	}
+
+	switch {
+	case n > 0:
+		log.Infof("faces: found %s whose recognized faces agree on one person, which a completed recognition run names",
+			english.Plural(n, "unnamed cluster", "unnamed clusters"))
+	case subjUID != "":
+		log.Infof("faces: found no unnamed clusters whose recognized faces agree on %s", entity.SubjNames.Log(subjUID))
+	default:
+		log.Infof("faces: found no unnamed clusters whose recognized faces agree on one person")
+	}
+
+	return n, nil
+}
+
+// ambiguousPairMessage describes two clusters that accept each other while naming different people.
+// The distance is reported against what the first one accepts, since that is the bar that decided
+// the pair, and the sample count says how much evidence it rests on.
+func ambiguousPairMessage(f1, f2 entity.Face, dist float64) string {
+	return fmt.Sprintf("faces: face %s (%s) has an ambiguous subject with face %s (%s) at dist %f, Ø %f from %d samples, collision Ø %f",
+		f1.ID, faceSubjectLabel(f1), f2.ID, faceSubjectLabel(f2), dist, f1.AcceptDist(), f1.Samples, f1.CollisionRadius)
+}
+
+// faceSubjectLabel names the subject a cluster carries, or reports that it carries none.
+func faceSubjectLabel(f entity.Face) string {
+	if f.SubjUID == "" {
+		return fmt.Sprintf("no subject, %s", entity.SrcString(f.FaceSrc))
+	}
+
+	return fmt.Sprintf("subject %s %s, %s", entity.SubjNames.Log(f.SubjUID), f.SubjUID, entity.SrcString(f.FaceSrc))
+}
+
+// ambiguousPairSummary reports how many pairs were found, and across how many clusters and people.
+// The three differ by an order of magnitude after a migration, and only the last is actionable.
+func ambiguousPairSummary(pairs, clusters, subjects int) string {
+	return fmt.Sprintf("%s across %s and %s",
+		english.Plural(pairs, "ambiguous pair", "ambiguous pairs"),
+		english.Plural(clusters, "cluster", "clusters"),
+		english.Plural(subjects, "subject", "subjects"))
+}
+
+// recomputeMissingRadius measures the extent of clusters stored without one, over the markers they
+// hold. A singleton has no extent to measure and is left alone; anything else is measured rather
+// than set to a constant, since a width nothing observed is what this exists to remove.
+func (w *Faces) recomputeMissingRadius(fix bool, subjUID string) (repaired int, err error) {
+	// The rows the matcher reads, and no others: nothing narrows a radius again, so a cluster the
+	// operator hid would come back with its own extent gone. Below the floor rather than at it,
+	// since a row already sitting there was written by a current path.
+	stmt := entity.UnscopedDb().Model(&entity.Face{}).
+		Where("sample_radius < ?", face.Epsilon).
+		Where("samples > ?", 1).
+		Where("face_hidden = ?", false).
+		Where("face_kind <= 1")
+
+	if cond, args := entity.EmbeddingModelCond(face.EmbeddingModelName()); cond != "" {
+		stmt = stmt.Where(cond, args...)
+	}
+
+	if subjUID != "" {
+		stmt = stmt.Where("subj_uid = ?", subjUID)
+	}
+
+	var faces entity.Faces
+
+	if err = stmt.Find(&faces).Error; err != nil {
+		return 0, err
+	}
+
+	if !fix {
+		if len(faces) > 0 {
+			log.Infof("faces: %s without a sample radius", english.Plural(len(faces), "cluster", "clusters"))
+		} else {
+			log.Infof("faces: found no clusters without a sample radius")
+		}
+
+		return len(faces), nil
+	}
+
+	for i := range faces {
+		measured, statsErr := recomputeFaceStats(&faces[i])
+
+		if statsErr != nil {
+			return repaired, statsErr
+		} else if !measured {
+			continue
+		}
+
+		// A cluster is only compared against the markers again while it counts as unmatched.
+		if err = faces[i].Update("MatchedAt", nil); err != nil {
+			return repaired, err
+		}
+
+		repaired++
+	}
+
+	if repaired == 0 {
+		log.Infof("faces: found no clusters to measure")
+		return 0, nil
+	}
+
+	entity.UpdateFaces.Store(true)
+
+	log.Infof("faces: measured the sample radius of %s", english.Plural(repaired, "cluster", "clusters"))
+
+	return repaired, nil
+}
+
+// faceNormalizationTolerance defines the acceptable deviation from unit length before a
+// persisted embedding is treated as stale and needs to be normalized again.
+const faceNormalizationTolerance = 5e-7
+
+type faceNormalizationCandidate struct {
+	face       entity.Face
+	normalized face.Embedding
+	json       []byte
+	newID      string
+	rekey      bool
+}
+
+// normalizeStoredEmbeddings ensures persisted face embeddings are L2-normalized and IDs are aligned.
+// It optionally persists the normalized embeddings (when fix is true) and reports the number of
+// clusters that would be affected, how many IDs would change, and how many marker distances were
+// recalculated during the run.
+func (w *Faces) normalizeStoredEmbeddings(fix bool) (normalized, rekeyed, distances int, err error) {
+	var faces entity.Faces
+
+	if err = entity.Db().Order("id").Find(&faces).Error; err != nil {
+		return 0, 0, 0, err
+	}
+
+	candidates := make([]faceNormalizationCandidate, 0, len(faces))
+
+	for i := range faces {
+		f := faces[i]
+
+		if len(f.EmbeddingJSON) == 0 {
+			continue
+		}
+
+		embedding := f.Embedding()
+
+		if len(embedding) == 0 {
+			continue
+		}
+
+		var sum float64
+		invalidComponent := false
+
+		for _, v := range embedding {
+			if math.IsNaN(v) || math.IsInf(v, 0) {
+				invalidComponent = true
+				break
+			}
+
+			sum += v * v
+		}
+
+		if invalidComponent {
+			log.Warnf("faces: face %s has invalid embedding components; skipping normalization", clean.Log(f.ID))
+			continue
+		}
+
+		if sum == 0 {
+			continue
+		}
+
+		length := math.Sqrt(sum)
+
+		if length == 0 || math.IsNaN(length) {
+			continue
+		}
+
+		if math.Abs(length-1) <= faceNormalizationTolerance {
+			continue
+		}
+
+		normalizedEmb := make(face.Embedding, len(embedding))
+		inv := 1 / length
+
+		for j, v := range embedding {
+			nv := v * inv
+
+			if nv == -0 {
+				nv = 0
+			}
+
+			normalizedEmb[j] = nv
+		}
+
+		normalizedJSON := normalizedEmb.JSON()
+
+		if len(normalizedJSON) == 0 {
+			log.Warnf("faces: face %s produced empty normalized embedding; skipping", clean.Log(f.ID))
+			continue
+		}
+
+		//nolint:gosec // SHA1 is sufficient for non-security audit hashing.
+		sumBytes := sha1.Sum(normalizedJSON)
+		newID := base32.StdEncoding.EncodeToString(sumBytes[:])
+
+		candidates = append(candidates, faceNormalizationCandidate{
+			face:       f,
+			normalized: normalizedEmb,
+			json:       normalizedJSON,
+			newID:      newID,
+			rekey:      newID != f.ID,
+		})
+	}
+
+	if len(candidates) == 0 {
+		log.Infof("faces: stored embeddings are normalized")
+		return 0, 0, 0, nil
+	}
+
+	rekeyNeeded := 0
+
+	for _, c := range candidates {
+		if c.rekey {
+			rekeyNeeded++
+		}
+	}
+
+	if !fix {
+		log.Infof("faces: %s require embedding normalization (%s would change ids)", english.Plural(len(candidates), "face cluster", "face clusters"), english.Plural(rekeyNeeded, "cluster", "clusters"))
+		return len(candidates), rekeyNeeded, 0, nil
+	}
+
+	successes := 0
+	rekeyed = 0
+	updatedDistances := 0
+
+	for _, candidate := range candidates {
+		updatedMarkers, err := w.persistNormalizedFace(candidate)
+		if err != nil {
+			log.Errorf("faces: failed normalizing face %s (%s)", clean.Log(candidate.face.ID), err)
+			continue
+		}
+
+		successes++
+		updatedDistances += updatedMarkers
+
+		if candidate.rekey {
+			rekeyed++
+		}
+	}
+
+	if successes > 0 {
+		entity.UpdateFaces.Store(true)
+		log.Infof("faces: normalized %s (%d rekeyed, %d marker distances updated)", english.Plural(successes, "face cluster", "face clusters"), rekeyed, updatedDistances)
+	}
+
+	return successes, rekeyed, updatedDistances, nil
+}
+
+// persistNormalizedFace writes the normalized embedding for a single face cluster and returns the
+// number of marker rows whose cached distance was updated as part of the transaction.
+func (w *Faces) persistNormalizedFace(candidate faceNormalizationCandidate) (int, error) {
+	updated := 0
+
+	err := entity.UnscopedDb().Transaction(func(tx *gorm.DB) error {
+		now := entity.Now()
+		oldID := candidate.face.ID
+		targetID := candidate.newID
+
+		if candidate.rekey {
+			var existing int64
+
+			if err := tx.Model(&entity.Face{}).Where("id = ?", candidate.newID).Count(&existing).Error; err != nil {
+				return err
+			}
+
+			if existing > 0 {
+				return fmt.Errorf("target id %s already exists", candidate.newID)
+			}
+
+			if err := tx.Exec("UPDATE faces SET id = ?, embedding_json = ?, updated_at = ? WHERE id = ?", candidate.newID, candidate.json, now, oldID).Error; err != nil {
+				return err
+			}
+
+			if err := tx.Exec("UPDATE markers SET face_id = ? WHERE face_id = ?", candidate.newID, oldID).Error; err != nil {
+				return err
+			}
+		} else {
+			if err := tx.Exec("UPDATE faces SET embedding_json = ?, updated_at = ? WHERE id = ?", candidate.json, now, oldID).Error; err != nil {
+				return err
+			}
+		}
+
+		markerUpdates, err := w.updateMarkerDistances(tx, targetID, candidate.normalized)
+		if err != nil {
+			return err
+		}
+
+		updated = markerUpdates
+
+		return nil
+	})
+
+	return updated, err
+}
+
+// updateMarkerDistances recalculates the cached FaceDist values for markers belonging to the given
+// face, keeping the transaction-scoped DB handle so ID changes and distance updates are atomic.
+func (w *Faces) updateMarkerDistances(tx *gorm.DB, faceID string, normalized face.Embedding) (int, error) {
+	if len(normalized) == 0 {
+		return 0, nil
+	}
+
+	var markers []entity.Marker
+
+	if err := tx.Where("face_id = ?", faceID).Find(&markers).Error; err != nil {
+		return 0, err
+	}
+
+	updated := 0
+
+	for i := range markers {
+		marker := &markers[i]
+		emb := marker.Embeddings()
+
+		if emb.Empty() {
+			continue
+		}
+
+		dist := minEmbeddingDistance(normalized, emb)
+
+		if dist < 0 {
+			continue
+		}
+
+		if marker.FaceDist >= 0 && math.Abs(marker.FaceDist-dist) <= faceNormalizationTolerance {
+			continue
+		}
+
+		if err := tx.Model(&entity.Marker{}).
+			Where("marker_uid = ?", marker.MarkerUID).
+			Update("face_dist", dist).Error; err != nil {
+			return updated, err
+		}
+
+		updated++
+	}
+
+	return updated, nil
+}
+
+// minEmbeddingDistance returns the minimum Euclidean distance between an embedding and any
+// candidate in a cluster. A negative return value indicates no comparable embeddings were found.
+func minEmbeddingDistance(faceEmb face.Embedding, embeddings face.Embeddings) float64 {
+	return embeddings.Dist(faceEmb)
+}
+
+// auditProvenance reports what produced the vectors a library holds, per cluster and per
+// marker. The three reports read separate tables and are run independently, so one that
+// cannot be read reports its own error rather than suppressing the others.
+func (w *Faces) auditProvenance() {
+	w.auditEmbeddingModels()
+	w.auditMarkerEmbeddingModels(face.EmbeddingModelName())
+	w.auditMarkerDetectModels()
+	w.auditMarkerThumbSizes()
+	w.auditMarkerSampleShortfall()
+}
+
+// auditMarkerSampleShortfall reports the markers whose vector rests on too few pixels to be
+// clustered, and how many of them the originals could still supply.
+//
+// It is the one state that leaves no trace in the vectors themselves: a marker embedded from an
+// upscaled crop is indistinguishable from one that was not, so without this an operator whose
+// thumbnail cache is smaller than their faces need, or whose migration could not write a rendition,
+// has no number to read and nothing to act on.
+func (w *Faces) auditMarkerSampleShortfall() {
+	shortfall, err := query.FaceMarkerSampleShortfall(face.ClusterSizeThreshold)
+
+	if err != nil {
+		log.Errorf("faces: %s (audit marker sample sizes)", err)
+		return
+	}
+
+	if shortfall.BelowBar == 0 {
+		log.Debugf("faces: every measured marker was sampled at or above the %d px clustering size",
+			face.ClusterSizeThreshold)
+
+		return
+	}
+
+	log.Infof("faces: %s sampled below the %d px clustering size, of %d measured",
+		english.Plural(shortfall.BelowBar, "marker", "markers"), face.ClusterSizeThreshold, shortfall.Measured)
+
+	if shortfall.Recoverable > 0 {
+		log.Infof("faces: %s of those have originals that hold enough detail, so photoprism faces migrate would sample them above it",
+			english.Plural(shortfall.Recoverable, "marker", "markers"))
+	} else {
+		log.Infof("faces: none of them have an original holding enough detail, so no thumbnail size or migration changes it")
+	}
+}
+
+// auditMarkerThumbSizes counts embedded markers with no recorded sample extent, which the size bar
+// then judges by markers.size instead. The value is never synthesized, so this only reports.
+//
+// The subset a migration would still sample is named separately, because the total includes markers
+// a sampling already gave up on - reporting only that would promise a figure no run can clear.
+func (w *Faces) auditMarkerThumbSizes() {
+	n, err := query.CountMarkersWithoutThumbSize()
+
+	if err != nil {
+		log.Errorf("faces: %s (audit marker thumb sizes)", err)
+		return
+	}
+
+	if n == 0 {
+		return
+	}
+
+	unsettled, err := query.CountMarkersUnsettledThumbSize()
+
+	if err != nil {
+		log.Errorf("faces: %s (audit marker thumb sizes)", err)
+		return
+	}
+
+	log.Infof("faces: %s with an embedding but no recorded sample size, judged by their detection size",
+		english.Plural(n, "marker", "markers"))
+
+	if unsettled > 0 {
+		log.Infof("faces: %s of those would be sampled again by photoprism faces migrate", english.Plural(unsettled, "marker", "markers"))
+	} else {
+		log.Infof("faces: every one of them was sampled and could not be measured, so a migration would not change it")
+	}
+}
+
+// auditEmbeddingModels reports face clusters that were generated by a different
+// embedding model than the one configured now. Their vectors are not comparable, so
+// automatic matching skips them until the operator regenerates them.
+func (w *Faces) auditEmbeddingModels() {
+	counts, err := query.FaceEmbeddingModels()
+
+	if err != nil {
+		log.Errorf("faces: %s (audit embedding models)", err)
+		return
+	}
+
+	current := face.EmbeddingModelName()
+	stale := 0
+
+	// Without a configured model there is nothing a stored vector can be incompatible with,
+	// and a migration has no target to run against, so the counts are reported as they are.
+	configured := current != ""
+
+	for _, c := range counts {
+		switch {
+		case c.EmbedModel == "" && face.ModelsComparable("", current):
+			log.Infof("faces: %s without a recorded embedding model", english.Plural(c.Faces, "cluster", "clusters"))
+		case c.EmbedModel == "":
+			stale += c.Faces
+			log.Warnf("faces: %s without a recorded embedding model, which is not compatible with configured %s",
+				english.Plural(c.Faces, "cluster", "clusters"), clean.Log(current))
+		case c.EmbedModel == current || !configured:
+			log.Infof("faces: %s from embedding model %s", english.Plural(c.Faces, "cluster", "clusters"), clean.Log(c.EmbedModel))
+		default:
+			stale += c.Faces
+			log.Warnf("faces: %s from embedding model %s, which is not the configured %s",
+				english.Plural(c.Faces, "cluster", "clusters"), clean.Log(c.EmbedModel), clean.Log(current))
+		}
+	}
+
+	if stale > 0 {
+		log.Warnf("faces: run photoprism faces migrate to regenerate %s with the configured model",
+			english.Plural(stale, "cluster", "clusters"))
+	}
+}
+
+// auditMarkerEmbeddingModels reports the face markers per embedding model. Markers hold
+// the vectors a migration regenerates, so their counts show how much work a model switch
+// leaves behind after the cluster report above.
+func (w *Faces) auditMarkerEmbeddingModels(current string) {
+	counts, err := query.MarkerEmbeddingModels()
+
+	if err != nil {
+		log.Errorf("faces: %s (audit marker embedding models)", err)
+		return
+	}
+
+	for _, c := range counts {
+		switch {
+		case c.EmbedModel == "" && face.ModelsComparable("", current):
+			log.Infof("faces: %s without a recorded embedding model", english.Plural(c.Markers, "marker", "markers"))
+		case c.EmbedModel == "":
+			log.Warnf("faces: %s without a recorded embedding model, which is not compatible with configured %s",
+				english.Plural(c.Markers, "marker", "markers"), clean.Log(current))
+		case c.EmbedModel == current || current == "":
+			log.Infof("faces: %s from embedding model %s", english.Plural(c.Markers, "marker", "markers"), clean.Log(c.EmbedModel))
+		default:
+			log.Warnf("faces: %s from embedding model %s, which is not the configured %s",
+				english.Plural(c.Markers, "marker", "markers"), clean.Log(c.EmbedModel), clean.Log(current))
+		}
+	}
+}
+
+// auditMarkerDetectModels reports the face markers per detector. The detector decides the
+// landmarks and therefore the aligned crop, so a marker produced by a different one holds a
+// vector that is not strictly comparable even when the embedding model matches.
+func (w *Faces) auditMarkerDetectModels() {
+	counts, err := query.MarkerDetectModels()
+
+	if err != nil {
+		log.Errorf("faces: %s (audit marker detectors)", err)
+		return
+	}
+
+	// The detector, not the engine that runs it: every detector runs on ONNX, so comparing a
+	// stored detector name against the engine name would report every marker as foreign.
+	current := face.ActiveDetector()
+
+	for _, c := range counts {
+		switch {
+		case c.DetectModel == "":
+			log.Infof("faces: %s without a recorded detector", english.Plural(c.Markers, "marker", "markers"))
+		case c.DetectModel == current || current == face.DetectorNone:
+			log.Infof("faces: %s from detector %s", english.Plural(c.Markers, "marker", "markers"), clean.Log(c.DetectModel))
+		default:
+			log.Warnf("faces: %s from detector %s, which is not the active %s",
+				english.Plural(c.Markers, "marker", "markers"), clean.Log(c.DetectModel), clean.Log(current))
+		}
+	}
 }

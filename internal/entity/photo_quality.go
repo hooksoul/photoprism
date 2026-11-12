@@ -7,7 +7,8 @@ import (
 	"github.com/photoprism/photoprism/pkg/txt"
 )
 
-var QualityBlacklist = map[string]bool{
+// NonPhotographicKeywords names the keywords that mark a picture as not a photograph.
+var NonPhotographicKeywords = map[string]bool{
 	"screenshot":  true,
 	"screenshots": true,
 	"info":        true,
@@ -18,7 +19,7 @@ var (
 	year2012 = time.Date(2012, 1, 1, 0, 0, 0, 0, time.UTC)
 )
 
-// QualityScore returns a score based on photo properties like size and metadata.
+// QualityScore returns the heuristic review score derived from favorites, trusted metadata, age, and resolution.
 func (m *Photo) QualityScore() (score int) {
 	if m.PhotoFavorite {
 		score += 3
@@ -40,7 +41,37 @@ func (m *Photo) QualityScore() (score int) {
 		score++
 	}
 
-	blacklisted := false
+	if !m.IsNonPhotographic() {
+		score++
+	}
+
+	if score < 3 && (m.PhotoType != MediaImage || m.PhotoIso > 0 || m.PhotoExposure != "" || m.EditedAt != nil) {
+		score = 3
+	}
+
+	return score
+}
+
+// UpdateQuality recomputes the quality score and persists it unless the photo is already deleted/invalid.
+func (m *Photo) UpdateQuality() error {
+	if m.DeletedAt.Valid || m.PhotoQuality < 0 {
+		return nil
+	}
+
+	m.PhotoQuality = m.QualityScore()
+
+	if !m.HasID() {
+		return nil
+	}
+
+	return m.Update("PhotoQuality", m.PhotoQuality)
+}
+
+// IsNonPhotographic checks whether the image looks like a non-photographic asset based on type and keywords.
+func (m *Photo) IsNonPhotographic() (result bool) {
+	if m.PhotoType == MediaUnknown || m.PhotoType == MediaVector || m.PhotoType == MediaAnimated || m.PhotoType == MediaDocument {
+		return true
+	}
 
 	details := m.GetDetails()
 
@@ -50,31 +81,12 @@ func (m *Photo) QualityScore() (score int) {
 		for _, w := range keywords {
 			w = strings.ToLower(w)
 
-			if _, ok := QualityBlacklist[w]; ok {
-				blacklisted = true
+			if _, ok := NonPhotographicKeywords[w]; ok {
+				result = true
 				break
 			}
 		}
 	}
 
-	if !blacklisted {
-		score++
-	}
-
-	if score < 3 && (m.PhotoType != MediaImage || m.EditedAt != nil) {
-		score = 3
-	}
-
-	return score
-}
-
-// UpdateQuality updates the photo quality attribute.
-func (m *Photo) UpdateQuality() error {
-	if m.DeletedAt != nil || m.PhotoQuality < 0 {
-		return nil
-	}
-
-	m.PhotoQuality = m.QualityScore()
-
-	return m.Update("PhotoQuality", m.PhotoQuality)
+	return result
 }

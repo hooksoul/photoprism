@@ -1,0 +1,224 @@
+package api
+
+import (
+	"archive/zip"
+	"bytes"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"github.com/photoprism/photoprism/internal/config"
+	"github.com/photoprism/photoprism/internal/entity"
+	"github.com/photoprism/photoprism/internal/service/cluster"
+	reg "github.com/photoprism/photoprism/internal/service/cluster/registry"
+	"github.com/photoprism/photoprism/pkg/fs"
+	"github.com/photoprism/photoprism/pkg/http/header"
+	"github.com/photoprism/photoprism/pkg/rnd"
+)
+
+// TestClusterGetTheme checks theme responses and node theme metadata.
+func TestClusterGetTheme(t *testing.T) {
+	t.Run("FeatureDisabled", func(t *testing.T) {
+		app, router, conf := NewApiTest()
+		// Ensure portal feature flag is disabled.
+		conf.Options().NodeRole = cluster.RoleInstance
+		ClusterGetTheme(router)
+
+		r := PerformRequest(app, http.MethodGet, "/api/v1/cluster/theme")
+		assert.Equal(t, http.StatusForbidden, r.Code)
+	})
+	t.Run("NotFound", func(t *testing.T) {
+		app, router, conf := NewApiTest()
+		// Enable portal feature flag for this endpoint.
+		enablePortalAPIs(t, conf)
+		ClusterGetTheme(router)
+
+		missing := filepath.Join(os.TempDir(), "photoprism-test-missing-theme")
+		_ = os.RemoveAll(missing)
+		conf.SetThemePath(missing)
+		assert.False(t, fs.PathExists(conf.ThemePath()))
+
+		req := httptest.NewRequest(http.MethodGet, "/api/v1/cluster/theme", nil)
+		req.Header.Set("Accept", "application/json")
+		w := httptest.NewRecorder()
+		app.ServeHTTP(w, req)
+		assert.Equal(t, http.StatusNotFound, w.Code)
+	})
+	t.Run("Success", func(t *testing.T) {
+		app, router, conf := NewApiTest()
+		// Enable portal feature flag for this endpoint.
+		enablePortalAPIs(t, conf)
+		ClusterGetTheme(router)
+
+		tempTheme, err := os.MkdirTemp("", "pp-theme-*")
+		assert.NoError(t, err)
+		defer func() { _ = os.RemoveAll(tempTheme) }()
+		conf.SetThemePath(tempTheme)
+
+		assert.NoError(t, os.MkdirAll(filepath.Join(tempTheme, "sub"), fs.ModeDir))
+		// Visible files
+		assert.NoError(t, os.WriteFile(filepath.Join(tempTheme, "app.js"), []byte("console.log('ok')\n"), fs.ModeFile))
+		assert.NoError(t, os.WriteFile(filepath.Join(tempTheme, "style.css"), []byte("body{}\n"), fs.ModeFile))
+		assert.NoError(t, os.WriteFile(filepath.Join(tempTheme, "~font.css"), []byte("body{}\n"), fs.ModeFile))
+		assert.NoError(t, os.WriteFile(filepath.Join(tempTheme, "$logo.svg"), []byte("<svg/>\n"), fs.ModeFile))
+		assert.NoError(t, os.WriteFile(filepath.Join(tempTheme, fs.VersionTxtFile), []byte(" 1.0.0\n"), fs.ModeFile))
+		assert.NoError(t, os.WriteFile(filepath.Join(tempTheme, "sub", "visible.txt"), []byte("ok\n"), fs.ModeFile))
+		// Hidden file
+		assert.NoError(t, os.WriteFile(filepath.Join(tempTheme, ".hidden.txt"), []byte("secret\n"), fs.ModeFile))
+		// Hidden directory
+		assert.NoError(t, os.MkdirAll(filepath.Join(tempTheme, ".git"), fs.ModeDir))
+		assert.NoError(t, os.WriteFile(filepath.Join(tempTheme, ".git", "HEAD"), []byte("ref: refs/heads/main\n"), fs.ModeFile))
+		// Hidden directory pattern "_.folder"
+		assert.NoError(t, os.MkdirAll(filepath.Join(tempTheme, "_.folder"), fs.ModeDir))
+		assert.NoError(t, os.WriteFile(filepath.Join(tempTheme, "_.folder", "secret.txt"), []byte("hidden\n"), fs.ModeFile))
+		// Symlink (should be skipped); best-effort
+		_ = os.Symlink(filepath.Join(tempTheme, "style.css"), filepath.Join(tempTheme, "link.css"))
+
+		r := PerformRequest(app, http.MethodGet, "/api/v1/cluster/theme")
+		assert.Equal(t, http.StatusOK, r.Code)
+
+		// Verify headers
+		assert.Equal(t, header.ContentTypeZip, r.Header().Get(header.ContentType))
+		assert.Contains(t, r.Header().Get(header.ContentDisposition), "attachment; filename=theme.zip")
+
+		// Verify zip contents
+		body := r.Body.Bytes()
+		zr, err := zip.NewReader(bytes.NewReader(body), int64(len(body)))
+		assert.NoError(t, err)
+
+		names := make([]string, 0, len(zr.File))
+		for _, f := range zr.File {
+			names = append(names, f.Name)
+		}
+
+		// Included
+		assert.Contains(t, names, "style.css")
+		assert.Contains(t, names, "~font.css")
+		assert.Contains(t, names, "$logo.svg")
+		// Subdirectories are not included for security reasons
+		assert.NotContains(t, names, "sub/visible.txt")
+
+		// Excluded (hidden files/dirs and symlinks)
+		assert.NotContains(t, names, ".hidden.txt")
+		assert.NotContains(t, names, ".git/HEAD")
+		assert.NotContains(t, names, "_.folder/secret.txt")
+		assert.NotContains(t, names, "link.css")
+	})
+	t.Run("Empty", func(t *testing.T) {
+		app, router, conf := NewApiTest()
+		// Enable portal feature flag for this endpoint.
+		enablePortalAPIs(t, conf)
+		ClusterGetTheme(router)
+
+		// Create an empty temporary theme directory (no includable files).
+		tempTheme, err := os.MkdirTemp("", "pp-theme-empty-*")
+		assert.NoError(t, err)
+		defer func() { _ = os.RemoveAll(tempTheme) }()
+		conf.SetThemePath(tempTheme)
+
+		// Hidden-only content and no app.js should yield 404.
+		assert.NoError(t, os.MkdirAll(filepath.Join(tempTheme, ".hidden-dir"), fs.ModeDir))
+		assert.NoError(t, os.WriteFile(filepath.Join(tempTheme, ".hidden-dir", "file.txt"), []byte("secret\n"), fs.ModeFile))
+		assert.NoError(t, os.WriteFile(filepath.Join(tempTheme, ".hidden"), []byte("secret\n"), fs.ModeFile))
+
+		req := httptest.NewRequest(http.MethodGet, "/api/v1/cluster/theme", nil)
+		req.Header.Set("Accept", "application/json")
+		w := httptest.NewRecorder()
+		app.ServeHTTP(w, req)
+		assert.Equal(t, http.StatusNotFound, w.Code)
+	})
+	t.Run("CIDRAllowWithoutAuth", func(t *testing.T) {
+		app, router, conf := NewApiTest()
+		// Enable portal role and set CIDR to loopback/10.0.0.0/8 for test.
+		enablePortalAPIs(t, conf)
+		conf.Options().ClusterCIDR = "10.0.0.0/8"
+		ClusterGetTheme(router)
+
+		tempTheme, err := os.MkdirTemp("", "pp-theme-cidr-*")
+		assert.NoError(t, err)
+		defer func() { _ = os.RemoveAll(tempTheme) }()
+		conf.SetThemePath(tempTheme)
+		assert.NoError(t, os.WriteFile(filepath.Join(tempTheme, "app.js"), []byte("console.log('ok')\n"), fs.ModeFile))
+		assert.NoError(t, os.WriteFile(filepath.Join(tempTheme, "style.css"), []byte("body{}\n"), fs.ModeFile))
+
+		req := httptest.NewRequest(http.MethodGet, "/api/v1/cluster/theme", nil)
+		// Simulate request from 10.1.2.3
+		req.RemoteAddr = "10.1.2.3:12345"
+		w := httptest.NewRecorder()
+		app.ServeHTTP(w, req)
+		assert.Equal(t, http.StatusOK, w.Code)
+		assert.Equal(t, header.ContentTypeZip, w.Header().Get(header.ContentType))
+	})
+	t.Run("CIDRList", func(t *testing.T) {
+		app, router, conf := NewApiTest()
+		enablePortalAPIs(t, conf)
+		prevClusterCIDR := conf.Options().ClusterCIDR
+		conf.SetAuthMode(config.AuthModePasswd)
+		t.Cleanup(func() {
+			conf.Options().ClusterCIDR = prevClusterCIDR
+			conf.SetAuthMode(config.AuthModePublic)
+		})
+		ClusterGetTheme(router)
+
+		tempTheme := t.TempDir()
+		conf.SetThemePath(tempTheme)
+		assert.NoError(t, os.WriteFile(filepath.Join(tempTheme, "app.js"), []byte("console.log('ok')\n"), fs.ModeFile))
+
+		// request returns the status of an unauthenticated theme download from the specified address.
+		request := func(remoteAddr string) int {
+			req := httptest.NewRequest(http.MethodGet, "/api/v1/cluster/theme", nil)
+			req.RemoteAddr = remoteAddr
+			w := httptest.NewRecorder()
+			app.ServeHTTP(w, req)
+			return w.Code
+		}
+
+		conf.Options().ClusterCIDR = "fd00:10::/64, 10.0.0.0/8"
+		assert.Equal(t, http.StatusOK, request("10.1.2.3:12345"))
+		assert.Equal(t, http.StatusOK, request("[fd00:10::5]:12345"))
+		assert.Equal(t, http.StatusUnauthorized, request("192.0.2.1:12345"))
+
+		// An invalid list grants nothing.
+		conf.Options().ClusterCIDR = "10.0.0.0/8,garbage"
+		assert.Equal(t, http.StatusUnauthorized, request("10.1.2.3:12345"))
+	})
+	t.Run("UpdateThemeVersion", func(t *testing.T) {
+		app, _, conf := NewApiTest()
+		_ = app // unused
+		enablePortalAPIs(t, conf)
+
+		regy, err := reg.NewClientRegistryWithConfig(conf)
+		assert.NoError(t, err)
+
+		name := "pp-node-theme-" + rnd.Base36(10)
+		var existing int64
+		require.NoError(t, entity.Db().Model(&entity.Client{}).Where("client_name = ?", name).Count(&existing).Error)
+		require.Zero(t, existing)
+		node := &reg.Node{Node: cluster.Node{Name: name, Role: cluster.RoleInstance, UUID: rnd.UUIDv7()}}
+		require.NoError(t, regy.Put(node))
+		require.NotEmpty(t, node.ClientID)
+		t.Cleanup(func() {
+			require.NoError(t, entity.UnscopedDb().Unscoped().Delete(&entity.Client{}, "client_uid = ?", node.ClientID).Error)
+			var remaining int64
+			require.NoError(t, entity.UnscopedDb().Unscoped().Model(&entity.Client{}).
+				Where("client_uid = ?", node.ClientID).Count(&remaining).Error)
+			require.Zero(t, remaining)
+		})
+
+		client := entity.FindClientByUID(node.ClientID)
+		sess := entity.NewSession(-1, -1)
+		sess.SetClient(client)
+		sess.RefID = "sess-test"
+
+		updateNodeThemeVersion(conf, sess, " theme-v1 \n", "127.0.0.1", sess.RefID)
+
+		stored, err := regy.Get(node.UUID)
+		assert.NoError(t, err)
+		assert.Equal(t, "theme-v1", stored.Theme)
+	})
+}

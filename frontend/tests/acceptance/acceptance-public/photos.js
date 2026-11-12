@@ -8,11 +8,24 @@ import Photo from "../page-model/photo";
 import PhotoViewer from "../page-model/photoviewer";
 import Page from "../page-model/page";
 import PhotoEdit from "../page-model/photo-edit";
+import Notify from "../page-model/notifications";
+
+import { helperBeforeFixture, helperBeforeEach, helperAfterEach, logTime, logTimeEnd, logMessage } from "../page-model/helpers";
 
 const scroll = ClientFunction((x, y) => window.scrollTo(x, y));
-const getcurrentPosition = ClientFunction(() => window.pageYOffset);
+const getcurrentPosition = ClientFunction(() => window.scrollY);
 
-fixture`Test photos`.page`${testcafeconfig.url}`;
+fixture`Test photos`
+.page`${testcafeconfig.url}`
+.beforeEach(async t => {
+  await helperBeforeEach(t);
+})
+.afterEach(async t => {
+  await helperAfterEach(t);
+})
+.before(async ctx => {
+  await helperBeforeFixture(ctx);
+});
 
 const menu = new Menu();
 const toolbar = new Toolbar();
@@ -21,25 +34,25 @@ const photo = new Photo();
 const photoviewer = new PhotoViewer();
 const page = new Page();
 const photoedit = new PhotoEdit();
+const notify = new Notify();
 
 test.meta("testID", "photos-001").meta({ mode: "public" })("Common: Scroll to top", async (t) => {
-  await toolbar.setFilter("view", "Cards");
+  await t.click(toolbar.cardsViewAction);
 
   await t
     .expect(Selector("button.is-photo-scroll-top").exists)
     .notOk()
     .expect(getcurrentPosition())
     .eql(0)
-    .expect(Selector("div.image.clickable").nth(0).visible)
+    .expect(Selector("div.type-image.result").nth(0).visible)
     .ok();
 
-  await scroll(0, 1400);
-  await scroll(0, 900);
+  await t.scroll("bottom");
+  await t.pressKey("pageUp");
 
-  await t.click(Selector("button.p-scroll-top")).expect(getcurrentPosition()).eql(0);
+  await t.click(Selector("button.p-scroll")).expect(getcurrentPosition()).eql(0);
 });
 
-//TODO Covered by admin role test
 test.meta("testID", "photos-002").meta({ mode: "public" })(
   "Common: Download single photo/video using clipboard and fullscreen mode",
   async (t) => {
@@ -50,7 +63,8 @@ test.meta("testID", "photos-002").meta({ mode: "public" })(
 
     await photoviewer.checkPhotoViewerActionAvailability("download", true);
 
-    await photoviewer.triggerPhotoViewerAction("close");
+    await photoviewer.triggerPhotoViewerAction("close-button");
+    await t.expect(Selector("div.p-lightbox__pswp").visible).notOk();
     await photo.triggerHoverAction("uid", FirstPhotoUid, "select");
     await photo.triggerHoverAction("uid", FirstVideoUid, "select");
     await contextmenu.checkContextMenuCount("2");
@@ -78,7 +92,7 @@ test.meta("testID", "photos-003").meta({ type: "short", mode: "public" })(
     if (t.browser.platform === "mobile") {
       await t.eval(() => location.reload());
     } else {
-      await toolbar.triggerToolbarAction("reload");
+      await toolbar.triggerToolbarAction("refresh");
     }
 
     await photo.checkPhotoVisibility(FirstPhotoUid, true);
@@ -88,26 +102,19 @@ test.meta("testID", "photos-003").meta({ type: "short", mode: "public" })(
     if (t.browser.platform === "mobile") {
       await t.click(photoedit.detailsApply).click(photoedit.detailsClose);
     } else {
-      await t.click(photoedit.detailsDone);
+      await t.click(photoedit.detailsClose);
     }
     await photo.triggerHoverAction("uid", SecondPhotoUid, "select");
     await contextmenu.triggerContextMenuAction("edit", "");
-    await t
-      .typeText(photoedit.latitude, "9.999", { replace: true })
-      .typeText(photoedit.longitude, "9.999", { replace: true });
-    if (t.browser.platform === "mobile") {
-      await t.click(photoedit.detailsApply).click(photoedit.detailsClose);
-    } else {
-      await t.click(photoedit.detailsDone);
-    }
-    await toolbar.setFilter("view", "Cards");
-    const ApproveButtonThirdPhoto =
-      'div.is-photo[data-uid="' + ThirdPhotoUid + '"] button.action-approve';
+    await t.typeText(photoedit.coordinates, "9.999,9.999", { replace: true });
+    await t.click(photoedit.detailsApply).click(photoedit.detailsClose);
+    await t.click(toolbar.cardsViewAction);
+    const ApproveButtonThirdPhoto = 'div.is-photo[data-uid="' + ThirdPhotoUid + '"] button.action-approve';
     await t.click(Selector(ApproveButtonThirdPhoto));
     if (t.browser.platform === "mobile") {
       await t.eval(() => location.reload());
     } else {
-      await toolbar.triggerToolbarAction("reload");
+      await toolbar.triggerToolbarAction("refresh");
     }
 
     await photo.checkPhotoVisibility(FirstPhotoUid, false);
@@ -117,6 +124,29 @@ test.meta("testID", "photos-003").meta({ type: "short", mode: "public" })(
     await photo.checkPhotoVisibility(FirstPhotoUid, true);
     await photo.checkPhotoVisibility(SecondPhotoUid, true);
     await photo.checkPhotoVisibility(ThirdPhotoUid, true);
+    // These three photos are missing a lot of data, can't be reverted, so need to be set as old, so they are not 1st on the list (which can break other tests).
+    // Please note that reversion of review photos is explicity prevented, so these changes will stick.
+    // Private isn't suitable as it may break other tests.
+    // As at 2026-06-05 there are no tests that choose the last photos.
+
+    const expectedInputValues = [
+      ["description", "Was a review photo"],
+    ];
+    const expectedSelectValues = [
+      ["day", "28"],
+      ["month", "02"],
+      ["year", "2009"],
+    ];
+
+    await page.clickCardImageLabelOfUID(FirstPhotoUid);
+    await t.expect(photoedit.coordinates.visible).ok();
+    await photoedit.editFormValues(expectedInputValues, expectedSelectValues);
+    await page.clickCardImageLabelOfUID(SecondPhotoUid);
+    await t.expect(photoedit.coordinates.visible).ok();
+    await photoedit.editFormValues(expectedInputValues, expectedSelectValues);
+    await page.clickCardImageLabelOfUID(ThirdPhotoUid);
+    await t.expect(photoedit.coordinates.visible).ok();
+    await photoedit.editFormValues(expectedInputValues, expectedSelectValues);
   }
 );
 
@@ -158,12 +188,13 @@ test.meta("testID", "photos-004").meta({ type: "short", mode: "public" })(
     await t.click(photoedit.dialogClose);
     await contextmenu.clearSelection();
     await photoviewer.openPhotoViewer("uid", FirstPhotoUid);
-    await photoviewer.triggerPhotoViewerAction("like");
-    await photoviewer.triggerPhotoViewerAction("close");
+    await photoviewer.triggerPhotoViewerAction("favorite-toggle");
+    await photoviewer.triggerPhotoViewerAction("close-button");
+    await t.expect(Selector("div.p-lightbox__pswp").visible).notOk();
     if (t.browser.platform === "mobile") {
       await t.eval(() => location.reload());
     } else {
-      await toolbar.triggerToolbarAction("reload");
+      await toolbar.triggerToolbarAction("refresh");
     }
 
     await photo.checkPhotoVisibility(FirstPhotoUid, false);
@@ -172,223 +203,266 @@ test.meta("testID", "photos-004").meta({ type: "short", mode: "public" })(
   }
 );
 
-test.meta("testID", "photos-005").meta({ type: "short", mode: "public" })(
-  "Common: Edit photo/video",
-  async (t) => {
-    await toolbar.setFilter("view", "Cards");
-    const FirstPhotoUid = await photo.getNthPhotoUid("image", 0);
-    await t.click(page.cardTitle.withAttribute("data-uid", FirstPhotoUid));
+test.meta("testID", "photos-005").meta({ type: "short", mode: "public" })("Common: Edit photo/video", async (t) => {
+  await menu.openPage("browse");
+  await t.click(toolbar.cardsViewAction);
+  await toolbar.search("geo:true");
+  const FirstPhotoUid = await photo.getNthPhotoUid("image", 0);
+  await page.clickCardTitleOfUID(FirstPhotoUid);
 
-    await t.expect(photoedit.latitude.visible).ok();
+  await t.expect(photoedit.coordinates.visible).ok();
+  const FirstPhotoTitle = await photoedit.title.value;
 
-    await t.click(photoedit.dialogNext);
+  await t.click(photoedit.dialogNext);
 
-    await t.expect(photoedit.dialogPrevious.getAttribute("disabled")).notEql("disabled");
+  await t.expect(photoedit.dialogPrevious.getAttribute("disabled")).notEql("disabled");
 
-    await t.click(photoedit.dialogPrevious).click(photoedit.dialogClose);
-    await photoviewer.openPhotoViewer("uid", FirstPhotoUid);
-    await photoviewer.triggerPhotoViewerAction("edit");
-    const FirstPhotoTitle = await photoedit.title.value;
-    const FirstPhotoLocalTime = await photoedit.localTime.value;
-    const FirstPhotoDay = await photoedit.day.value;
-    const FirstPhotoMonth = await photoedit.month.value;
-    const FirstPhotoYear = await photoedit.year.value;
-    const FirstPhotoTimezone = await photoedit.timezone.value;
-    const FirstPhotoLatitude = await photoedit.latitude.value;
-    const FirstPhotoLongitude = await photoedit.longitude.value;
-    const FirstPhotoAltitude = await photoedit.altitude.value;
-    const FirstPhotoCountry = await photoedit.country.value;
-    const FirstPhotoCamera = await photoedit.camera.innerText;
-    const FirstPhotoIso = await photoedit.iso.value;
-    const FirstPhotoExposure = await photoedit.exposure.value;
-    const FirstPhotoLens = await photoedit.lens.innerText;
-    const FirstPhotoFnumber = await photoedit.fnumber.value;
-    const FirstPhotoFocalLength = await photoedit.focallength.value;
-    const FirstPhotoSubject = await photoedit.subject.value;
-    const FirstPhotoArtist = await photoedit.artist.value;
-    const FirstPhotoCopyright = await photoedit.copyright.value;
-    const FirstPhotoLicense = await photoedit.license.value;
-    const FirstPhotoDescription = await photoedit.description.value;
-    const FirstPhotoKeywords = await photoedit.keywords.value;
-    const FirstPhotoNotes = await photoedit.notes.value;
+  await t.click(photoedit.dialogPrevious).click(photoedit.dialogClose);
 
-    await t
-      .typeText(photoedit.title, "Not saved photo title", { replace: true })
-      .click(photoedit.detailsClose)
-      .click(Selector("button.action-date-edit").withAttribute("data-uid", FirstPhotoUid));
-
-    await t.expect(photoedit.title.value).eql(FirstPhotoTitle);
-
-    await photoedit.editPhoto(
-      "New Photo Title",
-      "Europe/Moscow",
-      "15",
-      "07",
-      "2019",
-      "04:30:30",
-      "-1",
-      "41.15333",
-      "20.168331",
-      "32",
-      "1/32",
-      "29",
-      "33",
-      "Super nice edited photo",
-      "Happy",
-      "Happy2020",
-      "Super nice cat license",
-      "Description of a nice image :)",
-      ", cat, love",
-      "Some notes"
-    );
-    if (t.browser.platform === "mobile") {
-      await t.eval(() => location.reload());
-    } else {
-      await toolbar.triggerToolbarAction("reload");
-    }
-    await toolbar.search("uid:" + FirstPhotoUid);
-
-    await t
-      .expect(page.cardTitle.withAttribute("data-uid", FirstPhotoUid).innerText)
-      .eql("New Photo Title");
-
-    await photo.triggerHoverAction("uid", FirstPhotoUid, "select");
-    await contextmenu.triggerContextMenuAction("edit", "");
-
-    //const expectedValues = [{ FirstPhotoTitle: photoedit.title }, { "bluh bla": photoedit.day }];
-    /*const expectedValues = [
-    [FirstPhotoTitle, photoedit.title],
-    ["blah", photoedit.day],
+  const expectedInputValues = [
+    ["title", "New Photo Title"],
+    ["localTime", "04:30:30"],
+    ["altitude", "-1"],
+    ["iso", "32"],
+    ["exposure", "1/32"],
+    ["fnumber", "29"],
+    ["focallength", "33"],
+    ["subject", "Super nice edited photo"],
+    ["artist", "Happy"],
+    ["copyright", "Happy2020"],
+    ["license", "Super nice cat license"],
+    ["description", "Description of a nice image :)"],
+    ["notes", "Some notes"],
   ];
-  await photoedit.checkEditFormValuesNewNew(expectedValues);*/
+  const expectedSelectValues = [
+    ["day", "15"],
+    ["month", "07"],
+    ["year", "2019"],
+    ["timezone", "Europe/Moscow"],
+    ["country", "Albania"],
+    ["camera", "Canon EOS M10"],
+    ["lens", "EF-M15-45mm f/3.5-6.3 IS STM"],
+  ];
+  const expectedSelectValuesNoCountry = [
+    ["day", "15"],
+    ["month", "07"],
+    ["year", "2019"],
+    ["timezone", "Europe/Moscow"],
+    ["camera", "Canon EOS M10"],
+    ["lens", "EF-M15-45mm f/3.5-6.3 IS STM"],
+  ];
 
-    await photoedit.checkEditFormValues(
-      "New Photo Title",
-      "15",
-      "07",
-      "2019",
-      "04:30:30",
-      "Europe/Moscow",
-      "Albania",
-      "-1",
-      "",
-      "",
-      "",
-      "32",
-      "1/32",
-      "",
-      "29",
-      "33",
-      "Super nice edited photo",
-      "Happy",
-      "Happy2020",
-      "Super nice cat license",
-      "Description of a nice image :)",
-      "cat",
-      "Some notes"
-    );
+  await photoviewer.openPhotoViewer("uid", FirstPhotoUid);
+  await photoviewer.triggerPhotoViewerAction("edit-button");
 
-    await photoedit.undoPhotoEdit(
-      FirstPhotoTitle,
-      FirstPhotoTimezone,
-      FirstPhotoDay,
-      FirstPhotoMonth,
-      FirstPhotoYear,
-      FirstPhotoLocalTime,
-      FirstPhotoAltitude,
-      FirstPhotoLatitude,
-      FirstPhotoLongitude,
-      FirstPhotoCountry,
-      FirstPhotoIso,
-      FirstPhotoExposure,
-      FirstPhotoFnumber,
-      FirstPhotoFocalLength,
-      FirstPhotoSubject,
-      FirstPhotoArtist,
-      FirstPhotoCopyright,
-      FirstPhotoLicense,
-      FirstPhotoDescription,
-      FirstPhotoKeywords,
-      FirstPhotoNotes
-    );
-    await contextmenu.checkContextMenuCount("1");
-    await contextmenu.clearSelection();
+  await t.typeText(photoedit.title, "Not saved photo title", { replace: true }).click(photoedit.detailsClose);
+  await page.clickCardTitleOfUID(FirstPhotoUid);
+
+  await t.expect(photoedit.title.value).eql(FirstPhotoTitle);
+
+  await photoedit.editFormValues(expectedInputValues, expectedSelectValuesNoCountry);
+  await page.clickCardTitleOfUID(FirstPhotoUid);
+
+  await t.typeText(Selector("div.p-tab-photo-details .input-coordinates input"), "41.15333, 20.168331", {
+    replace: true,
+  });
+  await t.expect(await photoedit.coordinates.value).eql("41.15333, 20.168331");
+
+  await t.click(photoedit.detailsApply);
+  await t.expect(await photoedit.coordinates.value).eql("41.15333, 20.168331");
+
+  await t.click(photoedit.detailsClose);
+  if (t.browser.platform === "mobile") {
+    await t.eval(() => location.reload());
+  } else {
+    await toolbar.triggerToolbarAction("refresh");
   }
-);
+  await toolbar.search("uid:" + FirstPhotoUid);
 
-test.skip.meta("testID", "photos-006").meta({ mode: "public" })(
-  "Common: Navigate from card view to place",
+  await t
+    .expect(Selector('div[data-uid="' + FirstPhotoUid + '"] button.action-title-edit').innerText)
+    .eql("New Photo Title");
+  await photo.triggerHoverAction("uid", FirstPhotoUid, "select");
+  await contextmenu.triggerContextMenuAction("edit", "");
+  await photoedit.checkEditFormValues(expectedInputValues, expectedSelectValues);
+  await t.expect(await photoedit.coordinates.value).eql("41.15333, 20.168331");
+  await t.click(photoedit.detailsClose);
+
+  await contextmenu.checkContextMenuCount("1");
+  await contextmenu.clearSelection();
+});
+
+test.meta("testID", "photos-006").meta({ mode: "public" })(
+  "Multi-Window: Navigate from card view to place",
   async (t) => {
-    await toolbar.setFilter("view", "Cards");
+    await t.click(toolbar.cardsViewAction);
     await t.click(page.cardLocation.nth(0));
 
     await t
-      .expect(Selector("#map").exists, { timeout: 15000 })
+      .expect(Selector("div.map-loaded").exists, { timeout: 15000 })
       .ok()
-      .expect(Selector("div.p-map-control").visible)
+      .expect(Selector("div.map-control").visible)
       .ok()
       .expect(Selector(".input-search input").value)
       .notEql("");
   }
 );
 
-test.meta("testID", "photos-007").meta({ mode: "public" })(
-  "Common: Mark photos/videos as panorama/scan",
+test.meta("testID", "photos-007").meta({ mode: "public" })("Common: Mark photos/videos as panorama/scan", async (t) => {
+  const FirstPhotoUid = await photo.getNthPhotoUid("image", 0);
+  const FirstVideoUid = await photo.getNthPhotoUid("video", 1);
+  await menu.openPage("scans");
+
+  await photo.checkPhotoVisibility(FirstPhotoUid, false);
+  await photo.checkPhotoVisibility(FirstVideoUid, false);
+
+  await menu.openPage("panoramas");
+
+  await photo.checkPhotoVisibility(FirstPhotoUid, false);
+  await photo.checkPhotoVisibility(FirstVideoUid, false);
+
+  await menu.openPage("browse");
+
+  await page.clickCardTitleOfUID(FirstPhotoUid);
+
+  await photoedit.turnSwitchOn("scan");
+  await photoedit.turnSwitchOn("panorama");
+  await t.click(photoedit.dialogClose);
+  await page.clickCardTitleOfUID(FirstVideoUid);
+  await photoedit.turnSwitchOn("scan");
+  await photoedit.turnSwitchOn("panorama");
+  await t.click(photoedit.dialogClose);
+
+  await photo.checkPhotoVisibility(FirstPhotoUid, true);
+  await photo.checkPhotoVisibility(FirstVideoUid, true);
+
+  await menu.openPage("scans");
+
+  await photo.checkPhotoVisibility(FirstPhotoUid, true);
+  await photo.checkPhotoVisibility(FirstVideoUid, false);
+
+  await menu.openPage("panoramas");
+
+  await photo.checkPhotoVisibility(FirstPhotoUid, true);
+  await photo.checkPhotoVisibility(FirstVideoUid, true);
+
+  await page.clickCardTitleOfUID(FirstPhotoUid);
+
+  await photoedit.turnSwitchOff("scan");
+  await photoedit.turnSwitchOff("panorama");
+  await t.click(photoedit.dialogClose);
+  await page.clickCardTitleOfUID(FirstVideoUid);
+
+  await photoedit.turnSwitchOff("scan");
+  await photoedit.turnSwitchOff("panorama");
+  await t.click(photoedit.dialogClose);
+
+  if (t.browser.platform === "mobile") {
+    await t.eval(() => location.reload());
+  } else {
+    await toolbar.triggerToolbarAction("refresh");
+  }
+  await notify.waitForPhotosToLoad(5000, true);
+  await photo.checkPhotoVisibility(FirstPhotoUid, false);
+  await photo.checkPhotoVisibility(FirstVideoUid, false);
+});
+
+test.meta("testID", "photos-008").meta({ mode: "public" })(
+  "Multi-Window: Navigate from card view to photos taken at the same date",
   async (t) => {
-    const FirstPhotoUid = await photo.getNthPhotoUid("image", 0);
-    const FirstVideoUid = await photo.getNthPhotoUid("video", 1);
-    await menu.openPage("scans");
+    await t.click(toolbar.cardsViewAction);
+    await toolbar.search("flower");
+    await t.click(page.cardTaken.nth(0));
 
-    await photo.checkPhotoVisibility(FirstPhotoUid, false);
-    await photo.checkPhotoVisibility(FirstVideoUid, false);
+    const SearchTerm = await toolbar.search1.value;
 
-    await menu.openPage("panoramas");
+    const PhotoCount = await photo.getPhotoCount("all");
 
-    await photo.checkPhotoVisibility(FirstPhotoUid, false);
-    await photo.checkPhotoVisibility(FirstVideoUid, false);
-
-    await menu.openPage("browse");
-    await photo.triggerHoverAction("uid", FirstPhotoUid, "select");
-    await photo.triggerHoverAction("uid", FirstVideoUid, "select");
-    await contextmenu.triggerContextMenuAction("edit", "");
-    await photoedit.turnSwitchOn("scan");
-    await photoedit.turnSwitchOn("panorama");
-    await t.click(photoedit.dialogNext);
-    await photoedit.turnSwitchOn("scan");
-    await photoedit.turnSwitchOn("panorama");
-    await t.click(photoedit.dialogClose);
-    await contextmenu.clearSelection();
-
-    await photo.checkPhotoVisibility(FirstPhotoUid, true);
-    await photo.checkPhotoVisibility(FirstVideoUid, true);
-
-    await menu.openPage("scans");
-
-    await photo.checkPhotoVisibility(FirstPhotoUid, true);
-    await photo.checkPhotoVisibility(FirstVideoUid, false);
-
-    await menu.openPage("panoramas");
-
-    await photo.checkPhotoVisibility(FirstPhotoUid, true);
-    await photo.checkPhotoVisibility(FirstVideoUid, true);
-
-    await photo.triggerHoverAction("uid", FirstPhotoUid, "select");
-    await photo.triggerHoverAction("uid", FirstVideoUid, "select");
-    await contextmenu.triggerContextMenuAction("edit", "");
-    await photoedit.turnSwitchOff("scan");
-    await photoedit.turnSwitchOff("panorama");
-    await t.click(photoedit.dialogNext);
-    await photoedit.turnSwitchOff("scan");
-    await photoedit.turnSwitchOff("panorama");
-    await t.click(photoedit.dialogClose);
-    await contextmenu.clearSelection();
-    if (t.browser.platform === "mobile") {
-      await t.eval(() => location.reload());
-    } else {
-      await toolbar.triggerToolbarAction("reload");
-    }
-
-    await photo.checkPhotoVisibility(FirstPhotoUid, false);
-    await photo.checkPhotoVisibility(FirstVideoUid, false);
+    await t.expect(SearchTerm).eql("taken:2021-05-27").expect(PhotoCount).eql(3);
   }
 );
+
+test.meta("testID", "photos-009").meta({ mode: "public" })(
+  "Common: Verify that correct time is shown in all views",
+  async (t) => {
+    await t.click(toolbar.cardsViewAction);
+    await toolbar.search("filename:garden/20210530_125021_1993AB92.jpg");
+
+    await t.expect(page.cardTaken.innerText).eql("Sun, May 30, 2021, 2:50 PM GMT+2");
+    await photoviewer.openPhotoViewer("nth", 0);
+    await photoviewer.triggerPhotoViewerAction("info-button");
+    await t.expect(Selector("div").withText("May 30, 2021, 2:50 PM GMT+2").visible).ok();
+    await photoviewer.triggerPhotoViewerAction("edit-button");
+    await t.expect(photoedit.localTime.value).eql("14:50:21");
+    await t.expect(photoedit.timezoneValue.innerText).eql("Europe/Berlin");
+  }
+);
+
+test.meta("testID", "photos-010").meta({ mode: "public" })("Common: Set location on map", async (t) => {
+  await t.click(toolbar.cardsViewAction);
+  await toolbar.search("geo:false");
+
+  const FirstPhotoUid = await photo.getNthPhotoUid("image", 3);
+  await page.clickCardTitleOfUID(FirstPhotoUid);
+  const FirstPhotoTimezone = await photoedit.timezoneValue.innerText;
+  const FirstPhotoCoordinates = await photoedit.coordinates.value;
+  const FirstPhotoAltitude = await photoedit.altitude.value;
+  const FirstPhotoCountry = await photoedit.countryValue.innerText;
+
+  await t.expect(photoedit.altitude.value).eql(FirstPhotoAltitude);
+  await t.expect(photoedit.coordinates.value).eql(FirstPhotoCoordinates);
+  await t.expect(photoedit.timezoneValue.innerText).eql(FirstPhotoTimezone);
+  await t.expect(photoedit.countryValue.innerText).eql(FirstPhotoCountry);
+  await t.click(photoedit.locationAction);
+  const CoordinatesBefore = await photoedit.locationInput.value;
+  await t.expect(CoordinatesBefore).eql("");
+  await t.expect(photoedit.locationMarker.with({timeout: 200}).visible).notOk();  // The location marker won't be there, so why wait a long time?
+
+  //search
+  await t
+    .typeText(photoedit.locationSearch, "Brandenburger Tor Berlin")
+    .click(Selector('div.v-autocomplete__content').find('i.mdi-map-marker'));
+  const Coordinates = await photoedit.locationInput.value;
+  await t.expect(Coordinates).eql("52.5162546, 13.3777166");
+  await t.expect(photoedit.locationMarker.visible).ok();
+
+  await t.click(photoedit.locationClear);
+
+  const CoordinatesAfterClear = await photoedit.locationInput.value;
+  await t.expect(CoordinatesAfterClear).eql("");
+  await t.expect(photoedit.locationMarker.with({timeout: 200}).visible).notOk();   // The location marker won't be there, so why wait a long time?
+
+  await t.click(photoedit.locationUndo);
+
+  const CoordinatesAfterUndo = await photoedit.locationInput.value;
+  await t.expect(CoordinatesAfterUndo).eql("52.5162546, 13.3777166");
+  await t.expect(photoedit.locationMarker.visible).ok();
+  await t.click(photoedit.locationConfirm); // use ok on the following to avoid excessive wait time.
+
+  await t.expect(photoedit.altitude.withAttribute('value', "0").visible).ok(); // These will continue when the value appears
+  await t.expect(photoedit.coordinates.withAttribute('value', "52.5162546, 13.3777166").visible).ok();
+  await t.expect(photoedit.countryValue.withExactText("Germany").visible).ok();
+  await t.click(photoedit.detailsApply);
+  await t.click(photoedit.detailsClose);
+  await page.clickCardTitleOfUID(FirstPhotoUid);
+
+  await t.expect(photoedit.timezoneValue.innerText).eql("Europe/Berlin");
+  await t.expect(photoedit.altitude.value).eql("0");
+  await t.expect(photoedit.coordinates.value).eql("52.5162546, 13.3777166");
+  await t.expect(photoedit.countryValue.innerText).eql("Germany");
+
+  //click on map
+  await t.click(photoedit.locationAction);
+  const CoordinatesBeforeChange = await photoedit.locationInput.value;
+  await t.expect(CoordinatesBeforeChange).eql("52.5162546, 13.3777166");
+  await t.click(Selector("div.maplibregl-map"), { offsetX: 4, offsetY: 4 });
+  // The coordinate comes from a full-precision MapLibre unproject(), whose last bits
+  // vary by a few ULP (~nanometers) across browser/runtime versions. Assert proximity
+  // rather than bit-exact equality so float noise doesn't fail the test.
+  const CoordinatesAfterChange = await photoedit.locationInput.value;
+  const [latAfter, lngAfter] = CoordinatesAfterChange.split(",").map((v) => parseFloat(v));
+  await t.expect(Math.abs(latAfter - 52.534636098259455)).lte(1e-6);
+  await t.expect(Math.abs(lngAfter - 13.332140504419073)).lte(1e-6);
+  await t.click(photoedit.locationCancel); // use ok on the following to avoid excessive wait time.
+  await t.expect(photoedit.coordinates.withAttribute('value', "52.5162546, 13.3777166").visible).ok(); // This will exit when the value appears
+});

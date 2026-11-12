@@ -6,24 +6,47 @@ import (
 	"time"
 
 	"github.com/photoprism/photoprism/internal/event"
-	"github.com/photoprism/photoprism/internal/maps"
-	"github.com/photoprism/photoprism/pkg/s2"
+	"github.com/photoprism/photoprism/internal/service/maps"
+	"github.com/photoprism/photoprism/pkg/geo/s2"
 	"github.com/photoprism/photoprism/pkg/txt"
 )
 
 var cellMutex = sync.Mutex{}
 
-// Cell represents an S2 cell with metadata and reference to a place.
+// Cell represents an S2 cell with reverse-geocoded metadata and a linked place.
 type Cell struct {
-	ID           string    `gorm:"type:VARBINARY(42);primary_key;auto_increment:false;" json:"ID" yaml:"ID"`
-	CellName     string    `gorm:"type:VARCHAR(200);" json:"Name" yaml:"Name,omitempty"`
-	CellStreet   string    `gorm:"type:VARCHAR(100);" json:"Street" yaml:"Street,omitempty"`
-	CellPostcode string    `gorm:"type:VARCHAR(50);" json:"Postcode" yaml:"Postcode,omitempty"`
-	CellCategory string    `gorm:"type:VARCHAR(50);" json:"Category" yaml:"Category,omitempty"`
-	PlaceID      string    `gorm:"type:VARBINARY(42);default:'zz'" json:"-" yaml:"PlaceID"`
-	Place        *Place    `gorm:"PRELOAD:true" json:"Place" yaml:"-"`
+	ID           string    `gorm:"type:bytes;size:42;primaryKey;autoIncrement:false;" json:"ID" yaml:"ID"`
+	CellName     string    `gorm:"size:200;" json:"Name" yaml:"Name,omitempty"`
+	CellStreet   string    `gorm:"size:100;" json:"Street" yaml:"Street,omitempty"`
+	CellPostcode string    `gorm:"size:50;" json:"Postcode" yaml:"Postcode,omitempty"`
+	CellCategory string    `gorm:"size:50;" json:"Category" yaml:"Category,omitempty"`
+	PlaceID      string    `gorm:"type:bytes;size:42;default:'zz'" json:"-" yaml:"PlaceID"`
+	Place        *Place    `gorm:"-:migration" json:"Place" yaml:"-"`
 	CreatedAt    time.Time `json:"CreatedAt" yaml:"-"`
 	UpdatedAt    time.Time `json:"UpdatedAt" yaml:"-"`
+}
+
+// ensurePlace loads or synthesizes the related place so callers can safely
+// access place-derived fields even when the association was not preloaded.
+func (m *Cell) ensurePlace() *Place {
+	if m.Place != nil {
+		return m.Place
+	}
+
+	if m.PlaceID == "" || m.PlaceID == UnknownPlace.ID {
+		m.Place = &UnknownPlace
+		return m.Place
+	}
+
+	if place := FindPlace(m.PlaceID); place != nil {
+		m.Place = place
+		return m.Place
+	}
+
+	log.Warnf("cell: place %s for %s is missing", m.PlaceID, m.ID)
+	m.Place = &UnknownPlace
+
+	return m.Place
 }
 
 // TableName returns the entity table name.
@@ -48,15 +71,15 @@ func CreateUnknownLocation() {
 }
 
 // NewCell creates a location using a token extracted from coordinate
-func NewCell(lat, lng float32) *Cell {
+func NewCell(lat, lng float64) *Cell {
 	result := &Cell{}
 
-	result.ID = s2.PrefixedToken(float64(lat), float64(lng))
+	result.ID = s2.PrefixedToken(lat, lng)
 
 	return result
 }
 
-// Refresh updates the index by retrieving the latest data from an external API.
+// Refresh updates the cell details by fetching the latest data.
 func (m *Cell) Refresh(api string) (err error) {
 	// Unknown?
 	if m.Unknown() {
@@ -139,6 +162,7 @@ func (m *Cell) Find(api string) error {
 	db := Db()
 
 	if err := db.Preload("Place").First(m, "id = ?", m.ID).Error; err == nil {
+		m.ensurePlace()
 		log.Tracef("cell: found %s", m.ID)
 		return nil
 	}
@@ -190,6 +214,17 @@ func (m *Cell) Find(api string) error {
 	m.CellStreet = l.Street()
 	m.CellPostcode = l.Postcode()
 	m.CellCategory = l.Category()
+
+	place := m.Place
+	m.Place = nil
+
+	if findErr := db.Preload("Place").First(m, "id = ?", m.ID).Error; findErr == nil {
+		m.ensurePlace()
+		log.Tracef("cell: found %s [%s]", m.ID, time.Since(start))
+		return nil
+	}
+
+	m.Place = place
 
 	if createErr := db.Create(m).Error; createErr == nil {
 		log.Debugf("cell: added %s [%s]", m.ID, time.Since(start))
@@ -249,10 +284,7 @@ func FirstOrCreateCell(m *Cell) *Cell {
 
 // Keywords returns search keywords for a location.
 func (m *Cell) Keywords() (result []string) {
-	if m.Place == nil {
-		log.Errorf("cell: place for %s is missing - possible bug", m.ID)
-		return result
-	}
+	place := m.ensurePlace()
 
 	result = append(result, txt.Keywords(txt.ReplaceSpaces(m.District(), "-"))...)
 	result = append(result, txt.Keywords(txt.ReplaceSpaces(m.City(), "-"))...)
@@ -261,7 +293,7 @@ func (m *Cell) Keywords() (result []string) {
 	result = append(result, txt.Keywords(m.Name())...)
 	result = append(result, txt.Keywords(m.Street())...)
 	result = append(result, txt.Keywords(m.Category())...)
-	result = append(result, txt.Words(m.Place.PlaceKeywords)...)
+	result = append(result, txt.Words(place.PlaceKeywords)...)
 
 	result = txt.UniqueWords(result)
 
@@ -315,17 +347,17 @@ func (m *Cell) NoCategory() bool {
 
 // Label returns the location place label
 func (m *Cell) Label() string {
-	return m.Place.Label()
+	return m.ensurePlace().Label()
 }
 
 // District returns the district name if any.
 func (m *Cell) District() string {
-	return m.Place.District()
+	return m.ensurePlace().District()
 }
 
 // City returns the location city name if any.
 func (m *Cell) City() string {
-	return m.Place.City()
+	return m.ensurePlace().City()
 }
 
 // LongCity checks if the city name is more than 16 char
@@ -345,20 +377,20 @@ func (m *Cell) CityContains(text string) bool {
 
 // State returns the location place state
 func (m *Cell) State() string {
-	return m.Place.State()
+	return m.ensurePlace().State()
 }
 
 // NoState checks if the location place has no state
 func (m *Cell) NoState() bool {
-	return m.Place.State() == ""
+	return m.State() == ""
 }
 
 // CountryCode returns the location place country code
 func (m *Cell) CountryCode() string {
-	return m.Place.CountryCode()
+	return m.ensurePlace().CountryCode()
 }
 
 // CountryName returns the location place country name
 func (m *Cell) CountryName() string {
-	return m.Place.CountryName()
+	return m.ensurePlace().CountryName()
 }

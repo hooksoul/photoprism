@@ -35,17 +35,32 @@ func (data *Data) JSON(jsonName, originalName string) (err error) {
 		return fmt.Errorf("metadata: %s not found", quotedName)
 	}
 
-	jsonData, err := os.ReadFile(jsonName)
+	f, err := os.Open(jsonName) //nolint:gosec // JSON sidecars are read from resolved discovery paths.
 
 	if err != nil {
 		return fmt.Errorf("cannot read json file %s", quotedName)
 	}
 
-	if bytes.Contains(jsonData, []byte("ExifToolVersion")) {
+	defer f.Close()
+
+	info, err := f.Stat()
+
+	if err != nil {
+		return fmt.Errorf("cannot read json file %s: %w", quotedName, err)
+	}
+
+	jsonData, err := readJSONSidecar(f, info.Size())
+
+	if err != nil {
+		return fmt.Errorf("cannot read json file %s: %w", quotedName, err)
+	}
+
+	switch {
+	case bytes.Contains(jsonData, []byte("ExifToolVersion")):
 		return data.Exiftool(jsonData, originalName)
-	} else if bytes.Contains(jsonData, []byte("albumData")) {
+	case bytes.Contains(jsonData, []byte("albumData")):
 		return data.GMeta(jsonData)
-	} else if bytes.Contains(jsonData, []byte("photoTakenTime")) {
+	case bytes.Contains(jsonData, []byte("photoTakenTime")):
 		return data.GPhoto(jsonData)
 	}
 

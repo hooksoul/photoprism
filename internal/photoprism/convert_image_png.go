@@ -6,55 +6,100 @@ import (
 	"strconv"
 
 	"github.com/photoprism/photoprism/internal/ffmpeg"
+	"github.com/photoprism/photoprism/internal/ffmpeg/encode"
 )
 
-// PngConvertCommands returns commands for converting a media file to PNG, if possible.
-func (c *Convert) PngConvertCommands(f *MediaFile, pngName string) (result []*exec.Cmd, useMutex bool, err error) {
-	result = make([]*exec.Cmd, 0, 2)
+// PngConvertCmds returns commands for converting a media file to PNG, if possible.
+func (w *Convert) PngConvertCmds(f *MediaFile, pngName string) (result ConvertCmds, useMutex bool, err error) {
+	result = NewConvertCmds()
 
 	if f == nil {
-		return result, useMutex, fmt.Errorf("file is nil - possible bug")
+		return result, useMutex, fmt.Errorf("no media file provided for processing - you may have found a bug")
 	}
 
-	// Find conversion command depending on the file type and runtime environment.
+	// Add suitable conversion commands depending on the file type, codec, runtime environment, and configuration.
 	fileExt := f.Extension()
-	maxSize := strconv.Itoa(c.conf.PngSize())
+	maxSize := strconv.Itoa(w.conf.PngSize())
 
-	// Apple Scriptable image processing system: https://ss64.com/osx/sips.html
-	if (f.IsRaw() || f.IsHEIF()) && c.conf.SipsEnabled() && c.sipsBlacklist.Allow(fileExt) {
-		result = append(result, exec.Command(c.conf.SipsBin(), "-Z", maxSize, "-s", "format", "png", "--out", pngName, f.FileName()))
+	// Unlike JpegConvertCmds, this builder does not have a Darktable/RawTherapee renderer or an embedded preview
+	// fallback for converting RAW images to PNG — see internal/raw/README.md for more information.
+	if f.IsRaw() && w.conf.RawEnabled() {
+		log.Debugf("convert: PNG is not a supported target format for %s files", f.FileType().ToUpper())
 	}
 
-	// Extract a video still image that can be used as preview.
-	if f.IsAnimated() && !f.IsWebP() && c.conf.FFmpegEnabled() {
+	// On a Mac, use the Apple Scriptable image processing system to convert images to PNG,
+	// see https://ss64.com/osx/sips.html.
+	if f.IsHeif() && w.conf.SipsEnabled() && w.sipsExclude.Allow(fileExt) {
+		result = append(result, NewConvertCmd(
+			// #nosec G204 -- arguments are built from validated config and file paths.
+			exec.Command(w.conf.SipsBin(), "-Z", maxSize, "-s", "format", "png", "--out", pngName, f.FileName())),
+		)
+	}
+
+	// Use FFmpeg to extract video stills from videos, e.g. to use them as cover images.
+	if f.IsAnimated() && !f.IsWebp() && w.conf.FFmpegEnabled() && w.FFmpegAllowed(f) {
 		// Use "ffmpeg" to extract a PNG still image from the video.
-		result = append(result, exec.Command(c.conf.FFmpegBin(), "-y", "-i", f.FileName(), "-ss", ffmpeg.PreviewTimeOffset(f.Duration()), "-vframes", "1", pngName))
+		result = append(result, NewConvertCmd(
+			ffmpeg.ExtractPngImageCmd(f.FileName(), pngName, encode.NewPreviewImageOptions(w.conf.FFmpegBin(), f.Duration()))),
+		)
 	}
 
-	// Use heif-convert for HEIC/HEIF and AVIF image files.
-	if (f.IsHEIC() || f.IsAVIF()) && c.conf.HeifConvertEnabled() {
-		result = append(result, exec.Command(c.conf.HeifConvertBin(), f.FileName(), pngName))
+	// Use "heif-dec" or "heif-convert" to convert HEIC/HEIF and AVIF image files to PNG.
+	if (f.IsHeic() || f.IsAvif()) && w.conf.HeifConvertEnabled() {
+		result = append(result, NewConvertCmd(
+			// #nosec G204 -- arguments are built from validated config and file paths.
+			exec.Command(w.conf.HeifConvertBin(), f.FileName(), pngName)).
+			WithOrientation(w.conf.HeifConvertOrientation()),
+		)
 	}
 
-	// Decode JPEG XL image if support is enabled.
-	if f.IsJpegXL() && c.conf.JpegXLEnabled() {
-		result = append(result, exec.Command(c.conf.JpegXLDecoderBin(), f.FileName(), pngName))
+	// Use "djxl" to convert JPEG XL images as a fallback when libvips lacks native support.
+	if f.IsJpegXL() && w.conf.JpegXLEnabled() && w.conf.JpegXLDecoderBin() != "" {
+		result = append(result, NewConvertCmd(
+			// #nosec G204 -- arguments are built from validated config and file paths.
+			exec.Command(w.conf.JpegXLDecoderBin(), f.FileName(), pngName)),
+		)
 	}
 
-	// Try ImageMagick for other image file formats if allowed.
-	if c.conf.ImageMagickEnabled() && c.imagemagickBlacklist.Allow(fileExt) &&
-		(f.IsImage() && !f.IsJpegXL() && !f.IsRaw() && !f.IsHEIF() || f.IsVector() && c.conf.VectorEnabled()) {
-		resize := fmt.Sprintf("%dx%d>", c.conf.PngSize(), c.conf.PngSize())
-		args := []string{f.FileName(), "-flatten", "-resize", resize, pngName}
-		result = append(result, exec.Command(c.conf.ImageMagickBin(), args...))
-	} else if f.IsVector() && c.conf.RsvgConvertEnabled() {
-		// Vector graphics may be also be converted with librsvg if installed.
+	// Use librsvg to convert SVG vector graphics to PNG if installed and enabled.
+	if w.conf.RsvgConvertEnabled() && f.IsSVG() {
 		args := []string{"-a", "-f", "png", "-o", pngName, f.FileName()}
-		result = append(result, exec.Command(c.conf.RsvgConvertBin(), args...))
+		result = append(result, NewConvertCmd(
+			// #nosec G204 -- arguments are built from validated config and file paths.
+			exec.Command(w.conf.RsvgConvertBin(), args...)),
+		)
+	}
+
+	// Use ImageMagick for other media file formats if the type, extension, and file names are allowed.
+	if w.conf.ImageMagickEnabled() && w.imageMagickExclude.Allow(fileExt) && magickNames(f.FileName(), pngName) {
+		resize := fmt.Sprintf("%dx%d>", w.conf.PngSize(), w.conf.PngSize())
+		switch {
+		case f.IsImage() && !f.IsJpegXL() && !f.IsRaw() && !f.IsHeif():
+			args := []string{f.FileName(), "-flatten", "-resize", resize, pngName}
+			result = append(result, NewConvertCmd(
+				// #nosec G204 -- arguments are built from validated config and file paths.
+				exec.Command(w.conf.ImageMagickBin(), args...)),
+			)
+		case f.IsVector() && w.conf.VectorEnabled():
+			args := []string{f.FileName() + "[0]", "-resize", resize, pngName}
+			result = append(result, NewConvertCmd(
+				// #nosec G204 -- arguments are built from validated config and file paths.
+				exec.Command(w.conf.ImageMagickBin(), args...)),
+			)
+		case f.IsDocument():
+			args := []string{"-colorspace", "sRGB", "-density", "300", f.FileName() + "[0]", "-background", "white", "-alpha", "remove", "-alpha", "off", "-resize", resize, pngName}
+			result = append(result, NewConvertCmd(
+				// #nosec G204 -- arguments are built from validated config and file paths.
+				exec.Command(w.conf.ImageMagickBin(), args...)),
+			)
+		}
 	}
 
 	// No suitable converter found?
 	if len(result) == 0 {
+		if f.IsAnimated() && w.conf.FFmpegEnabled() && !w.FFmpegAllowed(f) {
+			return result, useMutex, fmt.Errorf("format %s is on the FFmpeg exclude list", w.ffmpegExclude.Match(f.MetaData().Codec, f.VideoInfo().VideoCodec, f.FileType().String()))
+		}
 		return result, useMutex, fmt.Errorf("file type %s not supported", f.FileType())
 	}
 

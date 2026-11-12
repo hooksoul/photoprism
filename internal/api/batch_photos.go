@@ -1,0 +1,497 @@
+package api
+
+import (
+	"net/http"
+	"path"
+	"time"
+
+	"github.com/dustin/go-humanize/english"
+
+	"github.com/gin-gonic/gin"
+	"gorm.io/gorm"
+
+	"github.com/photoprism/photoprism/internal/auth/acl"
+	"github.com/photoprism/photoprism/internal/config"
+	"github.com/photoprism/photoprism/internal/entity"
+	"github.com/photoprism/photoprism/internal/entity/query"
+	"github.com/photoprism/photoprism/internal/event"
+	"github.com/photoprism/photoprism/internal/form"
+	"github.com/photoprism/photoprism/internal/photoprism"
+	"github.com/photoprism/photoprism/internal/photoprism/get"
+	"github.com/photoprism/photoprism/pkg/clean"
+	"github.com/photoprism/photoprism/pkg/i18n"
+)
+
+// restrictPhotoSelection narrows frm.Photos to the pictures the session may access, so a batch
+// action stays within the session's shared scope, mirroring the single-photo and album update
+// gates. SelectedPhotoUIDsForSession is client and user role aware and returns the input without a
+// query for full-access sessions, so admins incur no overhead. It returns false and reports the
+// selection as not found when the scoped selection is empty or the lookup fails.
+func restrictPhotoSelection(c *gin.Context, s *entity.Session, frm *form.Selection) bool {
+	scoped, err := query.SelectedPhotoUIDsForSession(frm.Photos, s)
+
+	if err != nil || len(scoped) == 0 {
+		AbortEntityNotFound(c)
+		return false
+	}
+
+	frm.Photos = scoped
+
+	return true
+}
+
+// BatchPhotosArchive moves multiple photos to the archive.
+//
+//	@Summary	moves multiple photos to the archive
+//	@Id			BatchPhotosArchive
+//	@Tags		Photos
+//	@Accept		json
+//	@Produce	json
+//	@Success	200							{object}	i18n.Response
+//	@Failure	400,401,403,404,413,429,500	{object}	i18n.Response
+//	@Param		photos						body		form.Selection	true	"Photo Selection"
+//	@Router		/api/v1/batch/photos/archive [post]
+func BatchPhotosArchive(router *gin.RouterGroup) {
+	router.POST("/batch/photos/archive", func(c *gin.Context) {
+		s := Auth(c, acl.ResourcePhotos, acl.ActionDelete)
+
+		if s.Abort(c) {
+			return
+		}
+
+		var frm form.Selection
+
+		// Assign and validate request form values.
+		LimitRequestBodyBytes(c, MaxSelectionRequestBytes)
+
+		if err := c.BindJSON(&frm); err != nil {
+			if IsRequestBodyTooLarge(err) {
+				AbortRequestTooLarge(c, i18n.ErrBadRequest)
+				return
+			}
+
+			AbortBadRequest(c, err)
+			return
+		}
+
+		if len(frm.Photos) == 0 {
+			Abort(c, http.StatusBadRequest, i18n.ErrNoItemsSelected)
+			return
+		}
+
+		// Restrict the selection to the session's shared scope.
+		if !restrictPhotoSelection(c, s, &frm) {
+			return
+		}
+
+		log.Infof("photos: archiving %s", clean.Log(frm.String()))
+
+		if get.Config().SidecarYaml() {
+			// Fetch selection from index.
+			photos, err := query.SelectedPhotosForSession(frm, s)
+
+			if err != nil {
+				AbortEntityNotFound(c)
+				return
+			}
+
+			for _, p := range photos {
+				if archiveErr := p.Archive(); archiveErr != nil {
+					log.Errorf("archive: %s", archiveErr)
+				} else {
+					SaveSidecarYaml(p)
+				}
+			}
+		} else if err := entity.Db().Where("photo_uid IN (?)", frm.Photos).Delete(&entity.Photo{}).Error; err != nil {
+			log.Errorf("archive: failed to archive %d pictures (%s)", len(frm.Photos), err)
+			AbortSaveFailed(c)
+			return
+		} else if err = entity.Db().Model(&entity.PhotoAlbum{}).Where("photo_uid IN (?)", frm.Photos).UpdateColumn("hidden", true).Error; err != nil {
+			log.Errorf("archive: failed to flag %d pictures as hidden (%s)", len(frm.Photos), err)
+		}
+
+		// Update precalculated photo and file counts.
+		entity.UpdateCountsAsync()
+
+		// Update album, subject, and label cover thumbs.
+		query.UpdateCoversAsync()
+
+		UpdateClientConfig()
+
+		event.EntitiesArchived("photos", frm.Photos)
+
+		c.JSON(http.StatusOK, i18n.NewResponse(http.StatusOK, i18n.MsgSelectionArchived))
+	})
+}
+
+// BatchPhotosRestore restores multiple photos from the archive.
+//
+//	@Summary	restores multiple photos from the archive
+//	@Id			BatchPhotosRestore
+//	@Tags		Photos
+//	@Accept		json
+//	@Produce	json
+//	@Success	200							{object}	i18n.Response
+//	@Failure	400,401,403,404,413,429,500	{object}	i18n.Response
+//	@Param		photos						body		form.Selection	true	"Photo Selection"
+//	@Router		/api/v1/batch/photos/restore [post]
+func BatchPhotosRestore(router *gin.RouterGroup) {
+	router.POST("/batch/photos/restore", func(c *gin.Context) {
+		s := Auth(c, acl.ResourcePhotos, acl.ActionDelete)
+
+		if s.Abort(c) {
+			return
+		}
+
+		var frm form.Selection
+
+		LimitRequestBodyBytes(c, MaxSelectionRequestBytes)
+
+		if err := c.BindJSON(&frm); err != nil {
+			if IsRequestBodyTooLarge(err) {
+				AbortRequestTooLarge(c, i18n.ErrBadRequest)
+				return
+			}
+
+			AbortBadRequest(c, err)
+			return
+		}
+
+		if len(frm.Photos) == 0 {
+			Abort(c, http.StatusBadRequest, i18n.ErrNoItemsSelected)
+			return
+		}
+
+		// Restrict the selection to the session's shared scope.
+		if !restrictPhotoSelection(c, s, &frm) {
+			return
+		}
+
+		log.Infof("photos: restoring %s", clean.Log(frm.String()))
+
+		if get.Config().SidecarYaml() {
+			// Fetch selection from index.
+			photos, err := query.SelectedPhotosForSession(frm, s)
+
+			if err != nil {
+				AbortEntityNotFound(c)
+				return
+			}
+
+			for _, p := range photos {
+				if err = p.Restore(); err != nil {
+					log.Errorf("restore: %s", err)
+				} else {
+					SaveSidecarYaml(p)
+				}
+			}
+		} else if err := entity.Db().Unscoped().Model(&entity.Photo{}).Where("photo_uid IN (?)", frm.Photos).
+			UpdateColumn("deleted_at", gorm.Expr("NULL")).Error; err != nil {
+			log.Errorf("restore: %s", err)
+			AbortSaveFailed(c)
+			return
+		}
+
+		// Update precalculated photo and file counts.
+		entity.UpdateCountsAsync()
+
+		// Update album, subject, and label cover thumbs.
+		query.UpdateCoversAsync()
+
+		UpdateClientConfig()
+
+		event.EntitiesRestored("photos", frm.Photos)
+
+		c.JSON(http.StatusOK, i18n.NewResponse(http.StatusOK, i18n.MsgSelectionRestored))
+	})
+}
+
+// BatchPhotosApprove approves multiple photos that are currently under review.
+//
+//	@Summary	approves multiple photos that are currently under review
+//	@Id			BatchPhotosApprove
+//	@Tags		Photos
+//	@Accept		json
+//	@Produce	json
+//	@Success	200						{object}	i18n.Response
+//	@Failure	400,401,403,404,413,429	{object}	i18n.Response
+//	@Param		photos					body		form.Selection	true	"Photo Selection"
+//	@Router		/api/v1/batch/photos/approve [post]
+func BatchPhotosApprove(router *gin.RouterGroup) {
+	router.POST("/batch/photos/approve", func(c *gin.Context) {
+		s := Auth(c, acl.ResourcePhotos, acl.ActionUpdate)
+
+		if s.Abort(c) {
+			return
+		}
+
+		var frm form.Selection
+
+		LimitRequestBodyBytes(c, MaxSelectionRequestBytes)
+
+		if err := c.BindJSON(&frm); err != nil {
+			if IsRequestBodyTooLarge(err) {
+				AbortRequestTooLarge(c, i18n.ErrBadRequest)
+				return
+			}
+
+			AbortBadRequest(c, err)
+			return
+		}
+
+		if len(frm.Photos) == 0 {
+			Abort(c, http.StatusBadRequest, i18n.ErrNoItemsSelected)
+			return
+		}
+
+		// Restrict the selection to the session's shared scope.
+		if !restrictPhotoSelection(c, s, &frm) {
+			return
+		}
+
+		log.Infof("photos: approving %s", clean.Log(frm.String()))
+
+		// Fetch selection from index.
+		photos, err := query.SelectedPhotosForSession(frm, s)
+
+		if err != nil {
+			AbortEntityNotFound(c)
+			return
+		}
+
+		var approved entity.Photos
+
+		for _, p := range photos {
+			if err = p.Approve(); err != nil {
+				log.Errorf("approve: %s", err)
+			} else {
+				approved = append(approved, p)
+				SaveSidecarYaml(p)
+			}
+		}
+
+		UpdateClientConfig()
+
+		event.EntitiesUpdated("photos", approved.UIDs())
+
+		c.JSON(http.StatusOK, i18n.NewResponse(http.StatusOK, i18n.MsgSelectionApproved))
+	})
+}
+
+// BatchPhotosPrivate toggles private state of multiple photos.
+//
+//	@Summary	toggles private state of multiple photos
+//	@Id			BatchPhotosPrivate
+//	@Tags		Photos
+//	@Accept		json
+//	@Produce	json
+//	@Success	200							{object}	i18n.Response
+//	@Failure	400,401,403,404,413,429,500	{object}	i18n.Response
+//	@Param		photos						body		form.Selection	true	"Photo Selection"
+//	@Router		/api/v1/batch/photos/private [post]
+func BatchPhotosPrivate(router *gin.RouterGroup) {
+	router.POST("/batch/photos/private", func(c *gin.Context) {
+		s := AuthAccess(c, acl.ResourcePhotos, acl.ActionUpdate, acl.Permissions{acl.AccessPrivate})
+
+		if s.Abort(c) {
+			return
+		}
+
+		var frm form.Selection
+
+		LimitRequestBodyBytes(c, MaxSelectionRequestBytes)
+
+		if err := c.BindJSON(&frm); err != nil {
+			if IsRequestBodyTooLarge(err) {
+				AbortRequestTooLarge(c, i18n.ErrBadRequest)
+				return
+			}
+
+			AbortBadRequest(c, err)
+			return
+		}
+
+		if len(frm.Photos) == 0 {
+			Abort(c, http.StatusBadRequest, i18n.ErrNoItemsSelected)
+			return
+		}
+
+		// Restrict the selection to the session's shared scope.
+		if !restrictPhotoSelection(c, s, &frm) {
+			return
+		}
+
+		log.Infof("photos: updating private flag for %s", clean.Log(frm.String()))
+
+		if err := entity.Db().Model(&entity.Photo{}).Where("photo_uid IN (?)", frm.Photos).UpdateColumn("photo_private",
+			gorm.Expr("CASE WHEN photo_private THEN FALSE ELSE TRUE END")).Error; err != nil {
+			log.Errorf("private: %s", err)
+			AbortSaveFailed(c)
+			return
+		}
+
+		// Update precalculated photo and file counts.
+		entity.UpdateCountsAsync()
+
+		// Fetch selection from index.
+		if photos, err := query.SelectedPhotosForSession(frm, s); err == nil {
+			for _, p := range photos {
+				SaveSidecarYaml(p)
+			}
+
+			event.EntitiesUpdated("photos", photos.UIDs())
+		}
+
+		UpdateClientConfig()
+
+		FlushCoverCache()
+
+		c.JSON(http.StatusOK, i18n.NewResponse(http.StatusOK, i18n.MsgSelectionProtected))
+	})
+}
+
+// BatchPhotosDelete permanently removes multiple photos from the archive.
+//
+//	@Summary	permanently removes multiple or all photos from the archive
+//	@Id			BatchPhotosDelete
+//	@Tags		Photos
+//	@Accept		json
+//	@Produce	json
+//	@Success	200						{object}	i18n.Response
+//	@Failure	400,401,403,404,413,429	{object}	i18n.Response
+//	@Param		photos					body		form.Selection	true	"All or Photo Selection"
+//	@Router		/api/v1/batch/photos/delete [post]
+func BatchPhotosDelete(router *gin.RouterGroup) {
+	router.POST("/batch/photos/delete", func(c *gin.Context) {
+		s := Auth(c, acl.ResourcePhotos, acl.ActionDelete)
+
+		if s.Abort(c) {
+			return
+		}
+
+		conf := get.Config()
+
+		if conf.ReadOnly() || !conf.Settings().Features.Delete {
+			AbortFeatureDisabled(c)
+			return
+		}
+
+		var frm form.Selection
+
+		LimitRequestBodyBytes(c, MaxSelectionRequestBytes)
+
+		if err := c.BindJSON(&frm); err != nil {
+			if IsRequestBodyTooLarge(err) {
+				AbortRequestTooLarge(c, i18n.ErrBadRequest)
+				return
+			}
+
+			AbortBadRequest(c, err)
+			return
+		}
+
+		deleteStart := time.Now()
+
+		var photos entity.Photos
+		var err error
+
+		// Abort if user wants to delete all but does not have sufficient privileges.
+		if frm.All && !acl.Rules.AllowAll(acl.ResourcePhotos, s.GetUserRole(), acl.Permissions{acl.AccessAll, acl.ActionManage}) {
+			AbortForbidden(c)
+			return
+		}
+
+		// Restrict an explicit selection to the session's shared scope.
+		if !frm.All && len(frm.Photos) > 0 && !restrictPhotoSelection(c, s, &frm) {
+			return
+		}
+
+		// Get selection or all archived photos if f.All is true.
+		switch {
+		case len(frm.Photos) == 0 && !frm.All:
+			Abort(c, http.StatusBadRequest, i18n.ErrNoItemsSelected)
+			return
+		case frm.All:
+			photos, err = query.ArchivedPhotos(1000000, 0)
+		default:
+			photos, err = query.SelectedPhotosForSession(frm, s)
+		}
+
+		if err != nil {
+			log.Errorf("archive: %s", err)
+			Abort(c, http.StatusBadRequest, i18n.ErrNoItemsSelected)
+			return
+		}
+
+		// Permanently delete only the selected photos that are archived and not removed.
+		if archived := photos.Archived(); len(archived) < len(photos) {
+			log.Infof("archive: skipped %s not in archive", english.Plural(len(photos)-len(archived), "selected photo", "selected photos"))
+			photos = archived
+		}
+
+		// Abort if no photos were found.
+		if len(photos) == 0 {
+			Abort(c, http.StatusBadRequest, i18n.ErrNoItemsSelected)
+			return
+		}
+
+		log.Infof("archive: deleting %s", english.Plural(len(photos), "photo", "photos"))
+
+		deleted, numFiles := deleteArchivedPhotos(c, s, photos)
+
+		if numFiles > 0 || len(deleted) > 0 {
+			log.Infof("archive: deleted %s and %s [%s]", english.Plural(numFiles, "file", "files"), english.Plural(len(deleted), "photo", "photos"), time.Since(deleteStart))
+		}
+
+		// Any photos deleted?
+		if len(deleted) > 0 {
+			config.FlushUsageCache()
+
+			// Update precalculated photo and file counts.
+			entity.UpdateCountsAsync()
+
+			UpdateClientConfig()
+
+			event.EntitiesDeleted("photos", deleted.UIDs())
+		}
+
+		c.JSON(http.StatusOK, i18n.NewResponse(http.StatusOK, i18n.MsgPermanentlyDeleted))
+	})
+}
+
+// archivedPhoto returns the current row of a photo if it is archived; tests may replace it.
+var archivedPhoto = query.ArchivedPhoto
+
+// deleteArchivedPhotos permanently deletes the photos that are archived when they are reached, using their
+// current rows, and returns the deleted photos with the number of files removed. It stops at the first
+// photo whose state cannot be read.
+func deleteArchivedPhotos(c *gin.Context, s *entity.Session, photos entity.Photos) (deleted entity.Photos, numFiles int) {
+	for _, selected := range photos {
+		// Delete only photos that are still archived.
+		p, err := archivedPhoto(selected.ID)
+
+		if err != nil {
+			log.Errorf("archive: %s (%s)", clean.Log(selected.PhotoUID), clean.Error(err))
+			break
+		} else if p == nil {
+			log.Infof("archive: skipped %s, no longer in archive", clean.Log(selected.PhotoUID))
+			continue
+		}
+
+		// Report file deletion.
+		event.AuditWarn([]string{ClientIP(c), clean.LogQuote(s.UserName), "delete", clean.Log(path.Join(p.PhotoPath, p.PhotoName+"*"))})
+
+		// Remove all related files from storage.
+		n, err := photoprism.DeletePhoto(p, true, true)
+
+		numFiles += n
+
+		if err != nil {
+			log.Errorf("delete: %s", err)
+		} else {
+			deleted = append(deleted, p)
+		}
+	}
+
+	return deleted, numFiles
+}

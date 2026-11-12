@@ -1,58 +1,114 @@
 package entity
 
 import (
+	"errors"
+	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
+	"time"
 
+	"github.com/gin-gonic/gin"
+	"github.com/sirupsen/logrus"
+	logtest "github.com/sirupsen/logrus/hooks/test"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"gorm.io/gorm"
 
+	"github.com/photoprism/photoprism/internal/auth/acl"
+	"github.com/photoprism/photoprism/internal/event"
+	"github.com/photoprism/photoprism/internal/form"
+	"github.com/photoprism/photoprism/pkg/authn"
+	"github.com/photoprism/photoprism/pkg/http/header"
+	"github.com/photoprism/photoprism/pkg/list"
 	"github.com/photoprism/photoprism/pkg/rnd"
+	"github.com/photoprism/photoprism/pkg/time/unix"
+	"github.com/photoprism/photoprism/pkg/txt/report"
 )
 
 func TestNewSession(t *testing.T) {
 	t.Run("NoSessionData", func(t *testing.T) {
-		m := NewSession(UnixDay, UnixHour*6)
+		m := NewSession(unix.Day, unix.Hour*6)
 
+		assert.True(t, rnd.IsAuthToken(m.AuthToken()))
 		assert.True(t, rnd.IsSessionID(m.ID))
 		assert.False(t, m.CreatedAt.IsZero())
 		assert.False(t, m.UpdatedAt.IsZero())
 		assert.False(t, m.ExpiresAt().IsZero())
 		assert.NotEmpty(t, m.ID)
-		assert.NotNil(t, m.Data())
-		assert.Equal(t, 0, len(m.Data().Tokens))
+		assert.NotNil(t, m.GetData())
+		assert.Equal(t, 0, len(m.GetData().Tokens))
 	})
 	t.Run("EmptySessionData", func(t *testing.T) {
-		m := NewSession(UnixDay, UnixHour*6)
+		m := NewSession(unix.Day, unix.Hour*6)
 		m.SetData(NewSessionData())
 
+		assert.True(t, rnd.IsAuthToken(m.AuthToken()))
 		assert.True(t, rnd.IsSessionID(m.ID))
 		assert.False(t, m.CreatedAt.IsZero())
 		assert.False(t, m.UpdatedAt.IsZero())
 		assert.False(t, m.ExpiresAt().IsZero())
 		assert.NotEmpty(t, m.ID)
-		assert.NotNil(t, m.Data())
-		assert.Equal(t, 0, len(m.Data().Tokens))
+		assert.NotNil(t, m.GetData())
+		assert.Equal(t, 0, len(m.GetData().Tokens))
 	})
 	t.Run("WithSessionData", func(t *testing.T) {
 		data := NewSessionData()
 		data.Tokens = []string{"foo", "bar"}
-		m := NewSession(UnixDay, UnixHour*6)
+		m := NewSession(unix.Day, unix.Hour*6)
 		m.SetData(data)
 
+		assert.True(t, rnd.IsAuthToken(m.AuthToken()))
 		assert.True(t, rnd.IsSessionID(m.ID))
 		assert.False(t, m.CreatedAt.IsZero())
 		assert.False(t, m.UpdatedAt.IsZero())
 		assert.False(t, m.ExpiresAt().IsZero())
 		assert.NotEmpty(t, m.ID)
-		assert.NotNil(t, m.Data())
-		assert.Len(t, m.Data().Tokens, 2)
-		assert.Equal(t, "foo", m.Data().Tokens[0])
-		assert.Equal(t, "bar", m.Data().Tokens[1])
+		assert.NotNil(t, m.GetData())
+		assert.Len(t, m.GetData().Tokens, 2)
+		assert.Equal(t, "foo", m.GetData().Tokens[0])
+		assert.Equal(t, "bar", m.GetData().Tokens[1])
+	})
+}
+
+func TestNewSessionFromToken(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	t.Run("EmptyToken", func(t *testing.T) {
+		w := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(w)
+
+		assert.Nil(t, NewSessionFromToken(c, "", acl.ResourceVision.String(), "vision-api"))
+	})
+	t.Run("PopulatedSession", func(t *testing.T) {
+		w := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(w)
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/vision/labels", nil)
+		req.RemoteAddr = "198.51.100.42:8080"
+		req.Header.Set(header.UserAgent, "VisionClient/1.0")
+		c.Request = req
+
+		token := "vision-service-key-abc123"
+		sess := NewSessionFromToken(c, token, acl.ResourceVision.String(), "vision-api")
+		if assert.NotNil(t, sess) {
+			assert.Equal(t, http.StatusOK, sess.HttpStatus())
+			assert.Equal(t, token, sess.AuthToken())
+			assert.Equal(t, rnd.SessionID(token), sess.ID)
+			assert.Equal(t, acl.ResourceVision.String(), sess.Scope())
+			assert.Equal(t, authn.GrantToken, sess.GetGrantType())
+			assert.Equal(t, authn.MethodDefault, sess.GetMethod())
+			assert.Equal(t, authn.ProviderAccessToken, sess.GetProvider())
+			assert.Equal(t, header.ClientIP(c), sess.ClientIP)
+			assert.Equal(t, req.UserAgent(), sess.UserAgent)
+			assert.EqualValues(t, 60, sess.SessTimeout)
+			assert.True(t, rnd.IsRefID(sess.RefID))
+		}
 	})
 }
 
 func TestSession_SetData(t *testing.T) {
 	t.Run("Nil", func(t *testing.T) {
-		m := NewSession(UnixDay, UnixHour*6)
+		m := NewSession(unix.Day, unix.Hour*6)
 
 		assert.NotNil(t, m)
 
@@ -62,54 +118,1123 @@ func TestSession_SetData(t *testing.T) {
 		assert.NotEmpty(t, sess.ID)
 		assert.Equal(t, sess.ID, m.ID)
 	})
+	t.Run("GetDataCached", func(t *testing.T) {
+		m := NewSession(unix.Day, unix.Hour*6)
+		data := NewSessionData()
+		data.Tokens = []string{"alpha"}
+
+		m.SetData(data)
+
+		first := m.GetData()
+		second := m.GetData()
+
+		assert.Same(t, first, second)
+		assert.Equal(t, "alpha", second.Tokens[0])
+	})
+}
+
+func TestSession_Expires(t *testing.T) {
+	t.Run("SetExpiryDate", func(t *testing.T) {
+		m := NewSession(unix.Day, unix.Hour)
+		initialExpiryDate := m.SessExpires
+		m.Expires(time.Date(2035, 01, 15, 12, 30, 0, 0, time.UTC))
+		finalExpiryDate := m.SessExpires
+		assert.Greater(t, finalExpiryDate, initialExpiryDate)
+
+	})
+	t.Run("TryToSetZeroDate", func(t *testing.T) {
+		m := NewSession(unix.Day, unix.Hour)
+		initialExpiryDate := m.SessExpires
+		m.Expires(time.Date(1, 1, 1, 0, 0, 0, 0, time.UTC))
+		finalExpiryDate := m.SessExpires
+		assert.Equal(t, finalExpiryDate, initialExpiryDate)
+	})
+}
+
+func TestSessionStatusUnauthorized(t *testing.T) {
+	m := SessionStatusUnauthorized()
+	assert.Equal(t, http.StatusUnauthorized, m.Status)
+	assert.IsType(t, &Session{}, m)
+}
+
+func TestSessionStatusForbidden(t *testing.T) {
+	m := SessionStatusForbidden()
+	assert.Equal(t, http.StatusForbidden, m.Status)
+	assert.IsType(t, &Session{}, m)
+}
+
+func TestSessionStatusTooManyRequests(t *testing.T) {
+	m := SessionStatusTooManyRequests()
+	assert.Equal(t, http.StatusTooManyRequests, m.Status)
+	assert.IsType(t, &Session{}, m)
+}
+
+func TestLookupSessionByRefID(t *testing.T) {
+	t.Run("Found", func(t *testing.T) {
+		m, err := LookupSessionByRefID("sessxkkcabcd")
+		require.NoError(t, err)
+		require.NotNil(t, m)
+		assert.Equal(t, "sessxkkcabcd", m.RefID)
+	})
+	t.Run("NotFound", func(t *testing.T) {
+		m, err := LookupSessionByRefID(rnd.RefID("sess"))
+		assert.NoError(t, err)
+		assert.Nil(t, m)
+		m, err = LookupSessionByRefID("")
+		assert.NoError(t, err)
+		assert.Nil(t, m)
+	})
+	t.Run("ReadError", func(t *testing.T) {
+		name := "test:fail_ref_id_reads_" + rnd.Base36(8)
+		require.NoError(t, Db().Callback().Query().Before("gorm:query").Register(name, func(db *gorm.DB) {
+			if db.Statement.Table == (Session{}).TableName() {
+				_ = db.AddError(errors.New("session lookup failed"))
+			}
+		}))
+		t.Cleanup(func() { _ = Db().Callback().Query().Remove(name) })
+		m, err := LookupSessionByRefID("sessxkkcabcd")
+		assert.Error(t, err)
+		assert.Nil(t, m)
+		assert.Nil(t, FindSessionByRefID("sessxkkcabcd"))
+	})
+}
+
+func TestFindSessionByRefID(t *testing.T) {
+	t.Run("Nil", func(t *testing.T) {
+		assert.Nil(t, FindSessionByRefID(""))
+	})
+	t.Run("Alice", func(t *testing.T) {
+		m := FindSessionByRefID("sessxkkcabcd")
+		assert.Equal(t, "alice", m.UserName)
+		assert.IsType(t, &Session{}, m)
+	})
+}
+
+func TestSession_Regenerate(t *testing.T) {
+	t.Run("NewSession", func(t *testing.T) {
+		m := NewSession(unix.Day, unix.Hour)
+		assert.Equal(t, int64(0), m.LastActive)
+		initialID := m.ID
+		m.UpdateLastActive(false)
+		assert.GreaterOrEqual(t, unix.Now(), m.LastActive)
+		m.Regenerate()
+		assert.Equal(t, int64(0), m.LastActive)
+		finalID := m.ID
+		assert.NotEqual(t, initialID, finalID)
+	})
+	t.Run("Empty", func(t *testing.T) {
+		m := Session{ID: ""}
+		initialID := m.ID
+		m.Regenerate()
+		finalID := m.ID
+		assert.NotEqual(t, initialID, finalID)
+	})
+	t.Run("Existing", func(t *testing.T) {
+		m := Session{ID: "1234567"}
+		initialID := m.ID
+		m.Regenerate()
+		finalID := m.ID
+		assert.NotEqual(t, initialID, finalID)
+	})
+}
+
+func TestSession_AuthToken(t *testing.T) {
+	t.Run("New", func(t *testing.T) {
+		alice := SessionFixtures.Get("alice")
+		sess := &Session{}
+		assert.Equal(t, "", sess.ID)
+		assert.Equal(t, "", sess.AuthToken())
+		assert.False(t, rnd.IsSessionID(sess.ID))
+		assert.False(t, rnd.IsAuthToken(sess.AuthToken()))
+		assert.Equal(t, header.AuthBearer, sess.AuthTokenType())
+		sess.Regenerate()
+		assert.True(t, rnd.IsSessionID(sess.ID))
+		assert.True(t, rnd.IsAuthToken(sess.AuthToken()))
+		assert.Equal(t, header.AuthBearer, sess.AuthTokenType())
+		sess.SetAuthToken(alice.AuthToken())
+		assert.Equal(t, "a3859489780243a78b331bd44f58255b552dee104041a45c0e79b610f63af2e5", sess.ID)
+		assert.Equal(t, "69be27ac5ca305b394046a83f6fda18167ca3d3f2dbe7ac0", sess.AuthToken())
+		assert.Equal(t, header.AuthBearer, sess.AuthTokenType())
+	})
+	t.Run("Alice", func(t *testing.T) {
+		sess := SessionFixtures.Get("alice")
+		assert.Equal(t, "a3859489780243a78b331bd44f58255b552dee104041a45c0e79b610f63af2e5", sess.ID)
+		assert.Equal(t, "69be27ac5ca305b394046a83f6fda18167ca3d3f2dbe7ac0", sess.AuthToken())
+		assert.Equal(t, header.AuthBearer, sess.AuthTokenType())
+	})
+	t.Run("Find", func(t *testing.T) {
+		alice := SessionFixtures.Get("alice")
+		sess := FindSessionByRefID("sessxkkcabcd")
+		assert.Equal(t, "a3859489780243a78b331bd44f58255b552dee104041a45c0e79b610f63af2e5", sess.ID)
+		assert.Equal(t, "", sess.AuthToken())
+		assert.Equal(t, header.AuthBearer, sess.AuthTokenType())
+		sess.SetAuthToken(alice.AuthToken())
+		assert.Equal(t, "a3859489780243a78b331bd44f58255b552dee104041a45c0e79b610f63af2e5", sess.ID)
+		assert.Equal(t, "69be27ac5ca305b394046a83f6fda18167ca3d3f2dbe7ac0", sess.AuthToken())
+		assert.Equal(t, header.AuthBearer, sess.AuthTokenType())
+	})
+}
+
+func TestSession_Create(t *testing.T) {
+	t.Run("Success", func(t *testing.T) {
+		m := FindSessionByRefID("sessxkkcxxxx")
+		assert.Empty(t, m)
+		s := &Session{
+			UserName:    "charles",
+			SessExpires: unix.Day * 3,
+			SessTimeout: unix.Now() + unix.Week,
+			RefID:       "sessxkkcxxxx",
+		}
+
+		s.SetAuthToken("69be27ac5ca305b394046a83f6fda18167ca3d3f2dbe7xxx")
+
+		err := s.Create()
+		require.Nil(t, err)
+
+		t.Cleanup(func() {
+			assert.NoError(t, s.Delete())
+		})
+
+		m2 := FindSessionByRefID("sessxkkcxxxx")
+		assert.Equal(t, "charles", m2.UserName)
+	})
+	t.Run("InvalidRefId", func(t *testing.T) {
+		//nolint:gosec // G101: Static auth token fixture is intentional for session tests.
+		authToken := "69be27ac5ca305b394046a83f6fda18167ca3d3f2dbe7111"
+		id := rnd.SessionID("69be27ac5ca305b394046a83f6fda18167ca3d3f2dbe7111")
+
+		m, _ := FindSession(id)
+
+		assert.Empty(t, m)
+
+		s := &Session{
+			UserName:    "charles",
+			SessExpires: unix.Day * 3,
+			SessTimeout: unix.Now() + unix.Week,
+			RefID:       "123",
+		}
+
+		s.SetAuthToken(authToken)
+
+		err := s.Create()
+		require.Nil(t, err)
+
+		t.Cleanup(func() {
+			assert.NoError(t, s.Delete())
+		})
+
+		m2, _ := FindSession(id)
+
+		assert.NotEqual(t, "123", m2.RefID)
+	})
+	t.Run("IdAlreadyExists", func(t *testing.T) {
+		m := FindSessionByRefID("sessxkkcxxxx")
+		assert.Empty(t, m)
+		s := &Session{
+			UserName:    "charles",
+			SessExpires: unix.Day * 3,
+			SessTimeout: unix.Now() + unix.Week,
+			RefID:       "sessxkkcxxxx",
+		}
+
+		s.SetAuthToken("69be27ac5ca305b394046a83f6fda18167ca3d3f2dbe7xxx")
+
+		err := s.Create()
+		require.Nil(t, err)
+
+		t.Cleanup(func() {
+			assert.NoError(t, s.Delete())
+		})
+
+		//nolint:gosec // G101: Static auth token fixture is intentional for session tests.
+		authToken := "69be27ac5ca305b394046a83f6fda18167ca3d3f2dbe7ac0"
+
+		s2 := &Session{
+			UserName:    "charles",
+			SessExpires: unix.Day * 3,
+			SessTimeout: unix.Now() + unix.Week,
+			RefID:       "sessxkkcxxxx",
+		}
+
+		s2.SetAuthToken(authToken)
+
+		err = s2.Create()
+		assert.Error(t, err)
+	})
+	t.Run("BadRefIDandID", func(t *testing.T) {
+		authToken := "69be27ac5ca305b394046a83f6fda18167ca3d3f2dbe7cad" //nolint:gosec // fixture token, not a credential
+
+		s := &Session{
+			UserName:    "freddy",
+			SessExpires: unix.Day * 3,
+			SessTimeout: unix.Now() + unix.Week,
+			RefID:       "1234567890",
+		}
+
+		s.SetAuthToken(authToken)
+
+		s.ID = "toshort"
+
+		err := s.Create()
+		assert.Empty(t, err)
+	})
+	t.Run("LongNumericAuthID", func(t *testing.T) {
+		refID := rnd.RefID("ts")
+		m := FindSessionByRefID(refID)
+		assert.Empty(t, m)
+		s := &Session{
+			UserName:    "charles",
+			SessExpires: unix.Day * 3,
+			SessTimeout: unix.Now() + unix.Week,
+			RefID:       refID,
+			AuthID:      "012345678901234567890",
+		}
+
+		s.SetAuthToken("69be27ac5ca305b394046a83f6fda18167ca3d3f2dbe7xxs")
+
+		err := s.Create()
+		require.Nil(t, err)
+
+		t.Cleanup(func() {
+			assert.NoError(t, s.Delete())
+		})
+
+		m2 := FindSessionByRefID(refID)
+		assert.Equal(t, "charles", m2.UserName)
+		assert.Equal(t, "012345678901234567890", m2.AuthID)
+	})
+}
+
+func TestSession_Save(t *testing.T) {
+	t.Run("Success", func(t *testing.T) {
+		m := FindSessionByRefID("sessxkkcxxxy")
+		assert.Empty(t, m)
+		s := &Session{
+			UserName:    "chris",
+			SessExpires: unix.Day * 3,
+			SessTimeout: unix.Now() + unix.Week,
+			RefID:       "sessxkkcxxxy",
+		}
+
+		s.SetAuthToken("69be27ac5ca305b394046a83f6fda18167ca3d3f2dbe7xxy")
+
+		err := s.Save()
+		require.Nil(t, err)
+
+		m2 := FindSessionByRefID("sessxkkcxxxy")
+		assert.Equal(t, "chris", m2.UserName)
+	})
+	t.Run("LongNumericAuthID", func(t *testing.T) {
+		refID := rnd.RefID("ts")
+		m := FindSessionByRefID(refID)
+		assert.Empty(t, m)
+		s := &Session{
+			UserName:    "chris",
+			SessExpires: unix.Day * 3,
+			SessTimeout: unix.Now() + unix.Week,
+			RefID:       refID,
+			AuthID:      "012345678901234567890",
+		}
+
+		s.SetAuthToken("69be27ac5ca305b394046a83f6fda18167ca3d3f2dbe7xxy")
+
+		err := s.Save()
+		require.Nil(t, err)
+
+		t.Cleanup(func() {
+			assert.NoError(t, s.Delete())
+		})
+
+		m2 := FindSessionByRefID(refID)
+		assert.Equal(t, "chris", m2.UserName)
+		assert.Equal(t, "012345678901234567890", m2.AuthID)
+	})
+}
+
+func TestSession_Updates(t *testing.T) {
+	m := FindSessionByRefID("sessxkkcabcd")
+	assert.Equal(t, "alice", m.UserName)
+
+	if err := m.Updates(Session{UserName: "anton"}); err != nil {
+		t.Fatal(err)
+	}
+
+	assert.Equal(t, "anton", m.UserName)
+}
+
+func TestSession_Client(t *testing.T) {
+	t.Run("Alice", func(t *testing.T) {
+		m := FindSessionByRefID("sessxkkcabcd")
+		assert.Equal(t, "uqxetse3cy5eo9z2", m.UserUID)
+		assert.Equal(t, "uqxetse3cy5eo9z2", m.GetUser().UserUID)
+		assert.Equal(t, "", m.GetClient().ClientUID)
+		assert.Equal(t, "uqxetse3cy5eo9z2", m.GetClient().UserUID)
+		assert.Equal(t, acl.RoleNone, m.GetClient().AclRole())
+		assert.Equal(t, acl.RoleNone, m.GetClientRole())
+	})
+	t.Run("AliceTokenPersonal", func(t *testing.T) {
+		m := SessionFixtures.Get("alice_token_personal")
+		assert.Equal(t, "uqxetse3cy5eo9z2", m.UserUID)
+		assert.Equal(t, "uqxetse3cy5eo9z2", m.GetUser().UserUID)
+		assert.Equal(t, "", m.GetClient().ClientUID)
+		assert.Equal(t, "uqxetse3cy5eo9z2", m.GetClient().UserUID)
+		assert.Equal(t, acl.RoleClient, m.GetClient().AclRole())
+		assert.Equal(t, acl.RoleClient, m.GetClientRole())
+	})
+	t.Run("ClientMetrics", func(t *testing.T) {
+		m := SessionFixtures.Get("client_metrics")
+		assert.Equal(t, "", m.UserUID)
+		assert.Equal(t, "", m.GetUser().UserUID)
+		assert.Equal(t, "cs5cpu17n6gj2qo5", m.GetClient().ClientUID)
+		assert.Equal(t, "", m.GetClient().UserUID)
+		assert.Equal(t, acl.RoleClient, m.GetClient().AclRole())
+		assert.Equal(t, acl.RoleClient, m.GetClientRole())
+	})
+	t.Run("Default", func(t *testing.T) {
+		m := &Session{}
+		assert.Equal(t, "", m.UserUID)
+		assert.Equal(t, "", m.GetUser().UserUID)
+		assert.Equal(t, "", m.GetClient().ClientUID)
+		assert.Equal(t, "", m.GetClient().UserUID)
+		assert.Equal(t, acl.RoleNone, m.GetClient().AclRole())
+		assert.Equal(t, acl.RoleNone, m.GetClientRole())
+	})
+}
+
+func TestSession_ClientRole(t *testing.T) {
+	t.Run("Alice", func(t *testing.T) {
+		m := SessionFixtures.Get("alice")
+		assert.Equal(t, acl.RoleNone, m.GetClientRole())
+	})
+	t.Run("AliceTokenPersonal", func(t *testing.T) {
+		m := SessionFixtures.Get("alice_token_personal")
+		assert.Equal(t, acl.RoleClient, m.GetClientRole())
+	})
+	t.Run("TokenMetrics", func(t *testing.T) {
+		m := SessionFixtures.Get("token_metrics")
+		assert.Equal(t, acl.RoleClient, m.GetClientRole())
+	})
+	t.Run("TokenSettings", func(t *testing.T) {
+		m := SessionFixtures.Get("token_settings")
+		assert.Equal(t, acl.RoleClient, m.GetClientRole())
+	})
+	t.Run("Default", func(t *testing.T) {
+		m := &Session{}
+		assert.Equal(t, acl.RoleNone, m.GetClientRole())
+	})
+	t.Run("MissingClientEntityPortal", func(t *testing.T) {
+		m := &Session{
+			ClientUID:    "cs5cpu17n6gj2zzz",
+			AuthProvider: authn.ProviderClient.String(),
+			AuthMethod:   authn.MethodJWT.String(),
+			AuthIssuer:   "portal:cbaa0276-07d3-43ac-b420-25e2601b0ad4",
+		}
+
+		role := m.GetClientRole()
+		assert.Equal(t, acl.RolePortal, role)
+		client := m.GetClient()
+		assert.Equal(t, "cs5cpu17n6gj2zzz", client.ClientUID)
+		assert.Equal(t, acl.RolePortal, client.AclRole())
+	})
+	t.Run("MissingClientEntityDefault", func(t *testing.T) {
+		m := &Session{
+			ClientUID:    "cs5cpu17n6gj2xxx",
+			AuthProvider: authn.ProviderClient.String(),
+			AuthMethod:   authn.MethodJWT.String(),
+			AuthIssuer:   "https://example.com/oauth",
+		}
+
+		role := m.GetClientRole()
+		assert.Equal(t, acl.RoleClient, role)
+	})
+}
+
+func TestSession_ClientInfo(t *testing.T) {
+	t.Run("Alice", func(t *testing.T) {
+		m := SessionFixtures.Get("alice")
+		assert.Equal(t, "n/a", m.GetClientInfo())
+	})
+	t.Run("Metrics", func(t *testing.T) {
+		m := SessionFixtures.Get("client_metrics")
+		assert.Equal(t, "cs5cpu17n6gj2qo5", m.GetClientInfo())
+	})
+}
+
+func TestSession_NoClient(t *testing.T) {
+	t.Run("Alice", func(t *testing.T) {
+		m := SessionFixtures.Get("alice")
+		assert.True(t, m.NoClient())
+	})
+	t.Run("Metrics", func(t *testing.T) {
+		m := SessionFixtures.Get("client_metrics")
+		assert.False(t, m.NoClient())
+	})
+}
+
+func TestSession_SetClient(t *testing.T) {
+	t.Run("Alice", func(t *testing.T) {
+		m := SessionFixtures.Get("alice")
+		assert.Equal(t, acl.RoleNone, m.GetClientRole())
+		assert.Equal(t, "", m.GetClient().ClientUID)
+		m.SetClient(ClientFixtures.Pointer("alice"))
+		assert.Equal(t, acl.RoleClient, m.GetClientRole())
+		assert.Equal(t, "cs5gfen1bgxz7s9i", m.GetClient().ClientUID)
+	})
+}
+
+func TestSession_SetClientName(t *testing.T) {
+	t.Run("Empty", func(t *testing.T) {
+		m := SessionFixtures.Get("alice_token_personal")
+		assert.Equal(t, "", m.ClientUID)
+		assert.Equal(t, "alice_token_personal", m.GetClientName())
+		assert.Equal(t, "alice_token_personal", m.GetClientInfo())
+		m.SetClientName("Foo Bar!")
+		assert.Equal(t, "", m.ClientUID)
+		assert.Equal(t, "Foo Bar!", m.GetClientName())
+		assert.Equal(t, "Foo Bar!", m.GetClientInfo())
+		m.SetClientName("")
+		assert.Equal(t, "Foo Bar!", m.GetClientName())
+		assert.Equal(t, "Foo Bar!", m.GetClientInfo())
+	})
+	t.Run("SetNewId", func(t *testing.T) {
+		m := NewSession(0, 0)
+		assert.Equal(t, "", m.ClientUID)
+		assert.Equal(t, "", m.GetClientName())
+		assert.Equal(t, report.NotAssigned, m.GetClientInfo())
+		m.SetClientName("Foo Bar!")
+		assert.Equal(t, "", m.ClientUID)
+		assert.Equal(t, "Foo Bar!", m.GetClientName())
+		assert.Equal(t, "Foo Bar!", m.GetClientInfo())
+	})
+}
+
+func TestSession_User(t *testing.T) {
+	t.Run("Alice", func(t *testing.T) {
+		m := FindSessionByRefID("sessxkkcabcd")
+		assert.Equal(t, "uqxetse3cy5eo9z2", m.GetUser().UserUID)
+	})
+	t.Run("Default", func(t *testing.T) {
+		m := &Session{}
+		assert.Equal(t, "", m.GetUser().UserUID)
+	})
+}
+
+func TestSession_UserInfo(t *testing.T) {
+	t.Run("Alice", func(t *testing.T) {
+		m := SessionFixtures.Get("alice")
+		assert.Equal(t, "alice", m.UserInfo())
+	})
+	t.Run("Metrics", func(t *testing.T) {
+		m := SessionFixtures.Get("client_metrics")
+		assert.Equal(t, "", m.UserInfo())
+	})
+}
+
+func TestSession_UserRole(t *testing.T) {
+	t.Run("Alice", func(t *testing.T) {
+		m := FindSessionByRefID("sessxkkcabcd")
+		assert.Equal(t, acl.RoleAdmin, m.GetUserRole())
+	})
+	t.Run("Bob", func(t *testing.T) {
+		m := FindSessionByRefID("sessxkkcabce")
+		assert.Equal(t, acl.RoleAdmin, m.GetUserRole())
+	})
+	t.Run("Default", func(t *testing.T) {
+		m := &Session{}
+		assert.Equal(t, acl.RoleNone, m.GetUserRole())
+	})
+}
+
+func TestSession_RefreshUser(t *testing.T) {
+	t.Run("Bob", func(t *testing.T) {
+		m := FindSessionByRefID("sessxkkcabce")
+
+		assert.Equal(t, "bob", m.GetUserName())
+
+		m.UserName = "bobby"
+
+		assert.Equal(t, "bobby", m.GetUserName())
+
+		assert.Equal(t, "bob", m.RefreshUser().UserName)
+
+		assert.Equal(t, "bob", m.GetUserName())
+	})
+	t.Run("Empty", func(t *testing.T) {
+		m := &Session{}
+		assert.Equal(t, "", m.RefreshUser().UserUID)
+	})
+}
+
+func TestSession_AuthInfo(t *testing.T) {
+	t.Run("Bob", func(t *testing.T) {
+		m := FindSessionByRefID("sessxkkcabce")
+
+		i := m.GetAuthInfo()
+
+		assert.Equal(t, "Default", i)
+	})
+	t.Run("AliceTokenWebDav", func(t *testing.T) {
+		m := FindSessionByRefID("sesshjtgx8qt")
+
+		i := m.GetAuthInfo()
+
+		assert.Equal(t, "Access Token", i)
+	})
+}
+
+func TestSession_SetAuthID(t *testing.T) {
+	t.Run("Empty", func(t *testing.T) {
+		s := &Session{
+			UserName: "test",
+			RefID:    "sessxkkcxxxz",
+			AuthID:   "test-session-auth-id",
+		}
+
+		m := s.SetAuthID("", "https://accounts.google.com")
+
+		assert.Equal(t, "test-session-auth-id", m.AuthID)
+		assert.Equal(t, "", m.AuthIssuer)
+	})
+	t.Run("New", func(t *testing.T) {
+		s := &Session{
+			UserName: "test",
+			RefID:    "sessxkkcxxxz",
+			AuthID:   "new-id",
+		}
+
+		m := s.SetAuthID("new-id", "https://accounts.google.com")
+
+		assert.Equal(t, "new-id", m.AuthID)
+		assert.Equal(t, "https://accounts.google.com", m.AuthIssuer)
+	})
+}
+
+func TestSession_SetMethod(t *testing.T) {
+	t.Run("Empty", func(t *testing.T) {
+		s := &Session{
+			UserName:     "test",
+			RefID:        "sessxkkcxxxz",
+			AuthProvider: authn.ProviderAccessToken.String(),
+			AuthMethod:   authn.MethodDefault.String(),
+		}
+
+		m := s.SetMethod("")
+
+		assert.Equal(t, authn.ProviderAccessToken, m.GetProvider())
+		assert.Equal(t, authn.MethodDefault, m.GetMethod())
+	})
+	t.Run("Test", func(t *testing.T) {
+		s := &Session{
+			UserName:     "test",
+			RefID:        "sessxkkcxxxz",
+			AuthProvider: authn.ProviderAccessToken.String(),
+			AuthMethod:   authn.MethodDefault.String(),
+		}
+
+		m := s.SetMethod("Test")
+
+		assert.Equal(t, authn.ProviderAccessToken, m.GetProvider())
+		assert.Equal(t, authn.Method("Test"), m.GetMethod())
+	})
+	t.Run("Test", func(t *testing.T) {
+		s := &Session{
+			UserName:     "test",
+			RefID:        "sessxkkcxxxz",
+			AuthProvider: authn.ProviderAccessToken.String(),
+			AuthMethod:   authn.MethodDefault.String(),
+		}
+
+		m := s.SetMethod(authn.MethodSession)
+
+		assert.Equal(t, authn.ProviderAccessToken, m.GetProvider())
+		assert.Equal(t, authn.MethodSession, m.GetMethod())
+	})
+	t.Run("TwoFa", func(t *testing.T) {
+		s := &Session{
+			UserName:     "test",
+			RefID:        "sessxkkcxxxz",
+			AuthProvider: authn.ProviderAccessToken.String(),
+			AuthMethod:   authn.MethodDefault.String(),
+		}
+		s.Regenerate()
+		assert.False(t, s.Is2FA())
+		m := s.SetMethod(authn.Method2FA)
+		assert.True(t, s.Is2FA())
+		assert.True(t, m.Is2FA())
+		assert.Equal(t, m.ID, s.ID)
+	})
+}
+
+func TestSession_SetProvider(t *testing.T) {
+	m := FindSessionByRefID("sessxkkcabce")
+	assert.Equal(t, authn.ProviderDefault, m.GetProvider())
+	m.SetProvider("")
+	assert.Equal(t, authn.ProviderDefault, m.GetProvider())
+	m.SetProvider(authn.ProviderLink)
+	assert.Equal(t, authn.ProviderLink, m.GetProvider())
+	m.SetProvider(authn.ProviderDefault)
+	assert.Equal(t, authn.ProviderDefault, m.GetProvider())
+}
+
+func TestSession_ChangePassword(t *testing.T) {
+	m := FindSessionByRefID("sessxkkcabce")
+	before := m.PreviewToken
+
+	err := m.ChangePassword("photoprism123")
+
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Changing the password regenerates the user's tokens and mirrors them onto the session.
+	assert.NotEmpty(t, m.PreviewToken)
+	assert.NotEqual(t, before, m.PreviewToken)
+	assert.Equal(t, m.GetUser().PreviewToken, m.PreviewToken)
+
+	err2 := m.ChangePassword("Bobbob123!")
+
+	if err2 != nil {
+		t.Fatal(err2)
+	}
+
+	err3 := m.ChangePassword("123")
+	assert.Error(t, err3)
+}
+
+func TestSession_ValidateScope(t *testing.T) {
+	t.Run("AnyScope", func(t *testing.T) {
+		s := &Session{
+			UserName:  "test",
+			RefID:     "sessxkkcxxxz",
+			AuthScope: "*",
+		}
+
+		assert.True(t, s.ValidateScope("", nil))
+	})
+	t.Run("ReadScope", func(t *testing.T) {
+		s := &Session{
+			UserName:  "test",
+			RefID:     "sessxkkcxxxz",
+			AuthScope: "read",
+		}
+
+		assert.True(t, s.ValidateScope("metrics", nil))
+		assert.True(t, s.ValidateScope("sessions", nil))
+		assert.True(t, s.ValidateScope("metrics", acl.Permissions{acl.ActionView, acl.AccessAll}))
+		assert.False(t, s.ValidateScope("metrics", acl.Permissions{acl.ActionUpdate}))
+		assert.False(t, s.ValidateScope("metrics", acl.Permissions{acl.ActionUpdate}))
+		assert.False(t, s.ValidateScope("settings", acl.Permissions{acl.ActionUpdate}))
+		assert.False(t, s.ValidateScope("settings", acl.Permissions{acl.ActionCreate}))
+		assert.False(t, s.ValidateScope("sessions", acl.Permissions{acl.ActionDelete}))
+	})
+	t.Run("ReadAny", func(t *testing.T) {
+		s := &Session{
+			UserName:  "test",
+			RefID:     "sessxkkcxxxz",
+			AuthScope: "read *",
+		}
+
+		assert.True(t, s.ValidateScope("metrics", nil))
+		assert.True(t, s.ValidateScope("sessions", nil))
+		assert.True(t, s.ValidateScope("metrics", acl.Permissions{acl.ActionView, acl.AccessAll}))
+		assert.False(t, s.ValidateScope("metrics", acl.Permissions{acl.ActionUpdate}))
+		assert.False(t, s.ValidateScope("metrics", acl.Permissions{acl.ActionUpdate}))
+		assert.False(t, s.ValidateScope("settings", acl.Permissions{acl.ActionUpdate}))
+		assert.False(t, s.ValidateScope("settings", acl.Permissions{acl.ActionCreate}))
+		assert.False(t, s.ValidateScope("sessions", acl.Permissions{acl.ActionDelete}))
+	})
+	t.Run("ReadSettings", func(t *testing.T) {
+		s := &Session{
+			UserName:  "test",
+			RefID:     "sessxkkcxxxz",
+			AuthScope: "read settings",
+		}
+
+		assert.True(t, s.ValidateScope("settings", acl.Permissions{acl.ActionView}))
+		assert.False(t, s.ValidateScope("metrics", nil))
+		assert.False(t, s.ValidateScope("sessions", nil))
+		assert.False(t, s.ValidateScope("metrics", acl.Permissions{acl.ActionView, acl.AccessAll}))
+		assert.False(t, s.ValidateScope("metrics", acl.Permissions{acl.ActionUpdate}))
+		assert.False(t, s.ValidateScope("metrics", acl.Permissions{acl.ActionUpdate}))
+		assert.False(t, s.ValidateScope("settings", acl.Permissions{acl.ActionUpdate}))
+		assert.False(t, s.ValidateScope("sessions", acl.Permissions{acl.ActionDelete}))
+		assert.False(t, s.ValidateScope("sessions", acl.Permissions{acl.ActionDelete}))
+	})
+}
+
+func TestSession_InsufficientScope(t *testing.T) {
+	t.Run("Empty", func(t *testing.T) {
+		s := &Session{
+			UserName:  "test",
+			RefID:     "sessxkkcxxxz",
+			AuthScope: "*",
+		}
+
+		assert.False(t, s.InsufficientScope("", nil))
+	})
+	t.Run("ReadSettings", func(t *testing.T) {
+		s := &Session{
+			UserName:  "test",
+			RefID:     "sessxkkcxxxz",
+			AuthScope: "read settings",
+		}
+
+		assert.False(t, s.InsufficientScope("settings", acl.Permissions{acl.ActionView}))
+		assert.True(t, s.InsufficientScope("metrics", nil))
+		assert.True(t, s.InsufficientScope("sessions", nil))
+		assert.True(t, s.InsufficientScope("metrics", acl.Permissions{acl.ActionView, acl.AccessAll}))
+		assert.True(t, s.InsufficientScope("metrics", acl.Permissions{acl.ActionUpdate}))
+		assert.True(t, s.InsufficientScope("metrics", acl.Permissions{acl.ActionUpdate}))
+		assert.True(t, s.InsufficientScope("settings", acl.Permissions{acl.ActionUpdate}))
+		assert.True(t, s.InsufficientScope("sessions", acl.Permissions{acl.ActionDelete}))
+		assert.True(t, s.InsufficientScope("sessions", acl.Permissions{acl.ActionDelete}))
+	})
+}
+
+func TestSession_SetScope(t *testing.T) {
+	t.Run("EmptyScope", func(t *testing.T) {
+		s := &Session{
+			UserName:  "test",
+			RefID:     "sessxkkcxxxz",
+			AuthScope: "*",
+		}
+
+		m := s.SetScope("")
+
+		assert.Equal(t, "*", m.AuthScope)
+	})
+	t.Run("NewScope", func(t *testing.T) {
+		s := &Session{
+			UserName:  "test",
+			RefID:     "sessxkkcxxxz",
+			AuthScope: "*",
+		}
+
+		m := s.SetScope("Metrics")
+
+		assert.Equal(t, "metrics", m.AuthScope)
+	})
+}
+
+func TestSession_SetGrantType(t *testing.T) {
+	t.Run("Password", func(t *testing.T) {
+		m := &Session{
+			UserName:  "test",
+			RefID:     "sessxkkcxxxz",
+			AuthScope: "*",
+		}
+
+		expected := "password"
+
+		m.SetGrantType(authn.GrantPassword)
+		assert.Equal(t, expected, m.GrantType)
+		m.SetGrantType(authn.GrantClientCredentials)
+		assert.Equal(t, expected, m.GrantType)
+		m.SetGrantType(authn.GrantUndefined)
+		assert.Equal(t, expected, m.GrantType)
+		assert.Equal(t, authn.GrantPassword, m.GetGrantType())
+	})
+	t.Run("ClientCredentials", func(t *testing.T) {
+		client := ClientFixtures.Pointer("alice")
+		m := client.NewSession(&gin.Context{}, authn.GrantClientCredentials)
+
+		expected := "client_credentials"
+
+		assert.Equal(t, expected, m.GrantType)
+		m.SetGrantType(authn.GrantPassword)
+		assert.Equal(t, expected, m.GrantType)
+		m.SetGrantType(authn.GrantUndefined)
+		assert.Equal(t, expected, m.GrantType)
+		assert.Equal(t, authn.GrantClientCredentials, m.GetGrantType())
+	})
+}
+
+func TestSession_SetPreviewToken(t *testing.T) {
+	t.Run("Success", func(t *testing.T) {
+		m := &Session{ID: "12345678"}
+		m.SetPreviewToken("12345")
+		assert.Equal(t, "12345", m.PreviewToken)
+	})
+	t.Run("IdEmpty", func(t *testing.T) {
+		m := &Session{ID: ""}
+		m.SetPreviewToken("12345")
+		assert.Equal(t, "", m.PreviewToken)
+	})
+	t.Run("ReplacesPreviousValue", func(t *testing.T) {
+		m := &Session{}
+		m.SetAuthToken(rnd.AuthToken())
+		other := &Session{}
+		other.SetAuthToken(rnd.AuthToken())
+		t.Cleanup(func() {
+			PreviewToken.Unset(m.ID)
+			PreviewToken.Unset(other.ID)
+		})
+
+		m.SetPreviewToken("replace-preview-a")
+		other.SetPreviewToken("replace-preview-a")
+		m.SetPreviewToken("replace-preview-b")
+
+		assert.Equal(t, "replace-preview-b", PreviewToken.Get(m.ID))
+		assert.Equal(t, []string{m.ID}, PreviewToken.Keys("replace-preview-b"))
+		assert.Equal(t, []string{other.ID}, PreviewToken.Keys("replace-preview-a"))
+	})
+	t.Run("EmptyKeepsExistingValue", func(t *testing.T) {
+		m := &Session{}
+		m.SetAuthToken(rnd.AuthToken())
+		m.PreviewToken = "existing-preview"
+		t.Cleanup(func() { PreviewToken.Unset(m.ID) })
+
+		m.SetPreviewToken("")
+
+		assert.Equal(t, "existing-preview", m.PreviewToken)
+		assert.False(t, PreviewToken.Has(m.ID))
+	})
+}
+
+func TestSession_SetAuthToken(t *testing.T) {
+	t.Run("ReleasesPreviousId", func(t *testing.T) {
+		m := &Session{}
+		m.SetAuthToken(rnd.AuthToken())
+		oldID := m.ID
+		m.SetPreviewToken("release-preview")
+		assert.Equal(t, []string{oldID}, PreviewToken.Keys("release-preview"))
+
+		m.SetAuthToken(rnd.AppPassword())
+		assert.NotEqual(t, oldID, m.ID)
+		assert.Equal(t, "release-preview", m.PreviewToken)
+		assert.False(t, PreviewToken.Has(oldID))
+		assert.False(t, PreviewToken.Has(m.ID))
+		assert.True(t, PreviewToken.MissingValue("release-preview"))
+	})
+	t.Run("NoTokensNoOp", func(t *testing.T) {
+		m := &Session{}
+		m.SetAuthToken(rnd.AuthToken())
+		firstID := m.ID
+		m.SetAuthToken(rnd.AuthToken())
+		assert.NotEqual(t, firstID, m.ID)
+		assert.True(t, rnd.IsSessionID(m.ID))
+	})
+}
+
+func TestSession_IsSuperAdmin(t *testing.T) {
+	alice := FindSessionByRefID("sessxkkcabcd")
+	alice.RefreshUser()
+	assert.True(t, alice.IsSuperAdmin())
+
+	bob := FindSessionByRefID("sessxkkcabce")
+	bob.RefreshUser()
+	assert.False(t, bob.IsSuperAdmin())
+
+	m := &Session{}
+	assert.False(t, m.IsSuperAdmin())
+
+}
+
+func TestSession_IsApplication(t *testing.T) {
+	user := FindUserByName("alice")
+	assert.NotNil(t, user)
+
+	// Every user-bound client session is an app password, regardless of the grant
+	// type used to mint it (password for local users, session for OIDC-only users,
+	// cli for the "auth add" command). A client session without a user is a plain
+	// access token, not an app password.
+	cases := []struct {
+		name  string
+		grant authn.GrantType
+		user  *User
+		want  bool
+	}{
+		{"PasswordGrant", authn.GrantPassword, user, true},
+		{"SessionGrant", authn.GrantSession, user, true},
+		{"CliGrant", authn.GrantCLI, user, true},
+		{"ClientCredentialsNoUser", authn.GrantClientCredentials, nil, false},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s := NewClientSession("test-app-"+tc.name, 3600, "*", tc.grant, tc.user)
+			assert.Equal(t, tc.want, s.IsApplication())
+		})
+	}
+}
+
+func TestSession_NotRegistered(t *testing.T) {
+	alice := FindSessionByRefID("sessxkkcabcd")
+	alice.RefreshUser()
+	assert.False(t, alice.NotRegistered())
+
+	m := &Session{}
+	assert.True(t, m.NotRegistered())
+
+}
+
+func TestSession_NoShares(t *testing.T) {
+	alice := FindSessionByRefID("sessxkkcabcd")
+	alice.RefreshUser()
+	alice.GetUser().RefreshShares()
+	assert.False(t, alice.NoShares())
+
+	bob := FindSessionByRefID("sessxkkcabce")
+	bob.RefreshUser()
+	assert.True(t, bob.NoShares())
+
+	m := &Session{}
+	assert.True(t, m.NoShares())
+}
+
+func TestSession_NoUser(t *testing.T) {
+	alice := FindSessionByRefID("sessxkkcabcd")
+	assert.False(t, alice.NoUser())
+
+	visitor := FindSessionByRefID("sessxkkcabcg")
+	assert.False(t, visitor.NoUser())
+
+	metrics := FindSessionByRefID("sessgh6gjuo1")
+	assert.True(t, metrics.NoUser())
+}
+
+func TestSession_HasRegisteredUser(t *testing.T) {
+	alice := FindSessionByRefID("sessxkkcabcd")
+	assert.True(t, alice.HasRegisteredUser())
+
+	visitor := FindSessionByRefID("sessxkkcabcg")
+	assert.False(t, visitor.HasRegisteredUser())
+
+	metrics := FindSessionByRefID("sessgh6gjuo1")
+	assert.False(t, metrics.HasRegisteredUser())
+}
+
+func TestSession_HasShare(t *testing.T) {
+	alice := FindSessionByRefID("sessxkkcabcd")
+	alice.RefreshUser()
+	alice.GetUser().RefreshShares()
+	assert.True(t, alice.HasShare("as6sg6bxpogaaba9"))
+	assert.False(t, alice.HasShare("as6sg6bxpogaaba7"))
+
+	bob := FindSessionByRefID("sessxkkcabce")
+	bob.RefreshUser()
+	bob.GetUser().RefreshShares()
+	assert.False(t, bob.HasShare("as6sg6bxpogaaba9"))
+
+	m := &Session{}
+	assert.False(t, m.HasShare("as6sg6bxpogaaba9"))
+}
+
+func TestSession_SharedUIDs(t *testing.T) {
+	alice := FindSessionByRefID("sessxkkcabcd")
+	alice.RefreshUser()
+	alice.GetUser().RefreshShares()
+	assert.Equal(t, "as6sg6bxpogaaba9", alice.SharedUIDs()[0])
+
+	bob := FindSessionByRefID("sessxkkcabce")
+	bob.RefreshUser()
+	bob.GetUser().RefreshShares()
+	assert.Empty(t, bob.SharedUIDs())
+
+	m := &Session{}
+	assert.Empty(t, m.SharedUIDs())
+}
+
+func TestSession_RedeemToken(t *testing.T) {
+	t.Run("Bob", func(t *testing.T) {
+		bob := FindSessionByRefID("sessxkkcabce")
+		bob.RefreshUser()
+		bob.GetUser().RefreshShares()
+		assert.Equal(t, 0, bob.RedeemToken("1234"))
+		assert.Empty(t, bob.GetUser().UserShares)
+		assert.Equal(t, 1, bob.RedeemToken("1jxf3jfn2k"))
+		bob.GetUser().RefreshShares()
+		assert.Equal(t, "as6sg6bxpogaaba8", bob.GetUser().UserShares[0].ShareUID)
+	})
+	t.Run("EmptySession", func(t *testing.T) {
+		m := &Session{}
+		assert.Equal(t, 0, m.RedeemToken("1234"))
+	})
 }
 
 func TestSession_TimedOut(t *testing.T) {
 	t.Run("NewSession", func(t *testing.T) {
-		m := NewSession(UnixDay, UnixHour)
+		m := NewSession(unix.Day, unix.Hour)
 		assert.False(t, m.TimeoutAt().IsZero())
 		assert.Equal(t, m.ExpiresAt(), m.TimeoutAt())
 		assert.False(t, m.TimedOut())
+		assert.Greater(t, m.ExpiresIn(), int64(0))
 	})
 	t.Run("NoExpiration", func(t *testing.T) {
-		m := NewSession(0, UnixHour)
+		m := NewSession(0, unix.Hour)
 		t.Logf("Timeout: %s, Expiration: %s", m.TimeoutAt().String(), m.ExpiresAt())
 		assert.True(t, m.TimeoutAt().IsZero())
 		assert.Equal(t, m.ExpiresAt(), m.TimeoutAt())
 		assert.False(t, m.TimedOut())
 		assert.True(t, m.ExpiresAt().IsZero())
+		assert.Equal(t, m.ExpiresIn(), int64(0))
 	})
 	t.Run("NoTimeout", func(t *testing.T) {
-		m := NewSession(UnixDay, 0)
+		m := NewSession(unix.Day, 0)
 		t.Logf("Timeout: %s, Expiration: %s", m.TimeoutAt().String(), m.ExpiresAt())
 		assert.False(t, m.TimeoutAt().IsZero())
 		assert.Equal(t, m.ExpiresAt(), m.TimeoutAt())
 		assert.False(t, m.TimedOut())
 		assert.False(t, m.ExpiresAt().IsZero())
+		assert.Greater(t, m.ExpiresIn(), int64(0))
 	})
 	t.Run("TimedOut", func(t *testing.T) {
-		m := NewSession(UnixDay, UnixHour)
-		utc := UnixTime()
+		m := NewSession(unix.Day, unix.Hour)
+		utc := unix.Now()
 
-		m.LastActive = utc - (UnixHour + 1)
+		m.LastActive = utc - (unix.Hour + 1)
 
 		assert.False(t, m.TimeoutAt().IsZero())
 		assert.True(t, m.TimedOut())
 	})
 	t.Run("NotTimedOut", func(t *testing.T) {
-		m := NewSession(UnixDay, UnixHour)
-		utc := UnixTime()
+		m := NewSession(unix.Day, unix.Hour)
+		utc := unix.Now()
 
-		m.LastActive = utc - (UnixHour - 10)
+		m.LastActive = utc - (unix.Hour - 10)
 
 		assert.False(t, m.TimeoutAt().IsZero())
 		assert.False(t, m.TimedOut())
 	})
 }
 
+func TestSession_UpdateLastActive(t *testing.T) {
+	t.Run("NewSession", func(t *testing.T) {
+		m := NewSession(unix.Day, unix.Hour)
+		t.Logf("Timeout: %s, Expiration: %s", m.TimeoutAt().String(), m.ExpiresAt())
+
+		assert.Equal(t, int64(0), m.LastActive)
+
+		m.UpdateLastActive(false)
+
+		assert.GreaterOrEqual(t, unix.Now(), m.LastActive)
+	})
+	t.Run("SaveMethodSession", func(t *testing.T) {
+		expected := unix.Now() - 10
+		m := NewSession(unix.Day, unix.Hour)
+		t.Logf("Timeout: %s, Expiration: %s", m.TimeoutAt().String(), m.ExpiresAt())
+
+		assert.Equal(t, int64(0), m.LastActive)
+		m.LastActive = expected
+		m.SetMethod(authn.MethodSession)
+		m.SetAuthToken("69be27ac5ca305b394046a83f6fda18167ca3d3f2dbe70ca")
+		m.SetAuthID("MyIDString", "Testing")
+		m.AuthProvider = string(authn.ProviderClient)
+
+		if err := m.Create(); err != nil {
+			assert.Empty(t, err)
+			return
+		}
+
+		m = m.UpdateLastActive(true)
+
+		assert.Greater(t, m.LastActive, expected)
+	})
+}
+
 func TestSession_Expired(t *testing.T) {
 	t.Run("NewSession", func(t *testing.T) {
-		m := NewSession(UnixDay, UnixHour)
+		m := NewSession(unix.Day, unix.Hour)
 		t.Logf("Timeout: %s, Expiration: %s", m.TimeoutAt().String(), m.ExpiresAt())
 		assert.False(t, m.ExpiresAt().IsZero())
 		assert.False(t, m.Expired())
@@ -133,9 +1258,9 @@ func TestSession_Expired(t *testing.T) {
 		assert.False(t, m.TimedOut())
 	})
 	t.Run("Expired", func(t *testing.T) {
-		m := NewSession(UnixDay, UnixHour)
+		m := NewSession(unix.Day, unix.Hour)
 		t.Logf("Timeout: %s, Expiration: %s", m.TimeoutAt().String(), m.ExpiresAt())
-		utc := UnixTime()
+		utc := unix.Now()
 
 		m.SessExpires = utc - 10
 
@@ -146,8 +1271,8 @@ func TestSession_Expired(t *testing.T) {
 		assert.Equal(t, m.ExpiresAt(), m.TimeoutAt())
 	})
 	t.Run("NotExpired", func(t *testing.T) {
-		m := NewSession(UnixDay, UnixHour)
-		utc := UnixTime()
+		m := NewSession(unix.Day, unix.Hour)
+		utc := unix.Now()
 
 		m.SessExpires = utc + 10
 
@@ -156,5 +1281,326 @@ func TestSession_Expired(t *testing.T) {
 		assert.False(t, m.TimeoutAt().IsZero())
 		assert.False(t, m.TimedOut())
 		assert.Equal(t, m.ExpiresAt(), m.TimeoutAt())
+	})
+}
+
+func TestSession_SetUserAgent(t *testing.T) {
+	t.Run("UserAgentEmpty", func(t *testing.T) {
+		m := &Session{}
+		assert.Equal(t, "", m.UserAgent)
+		m.SetUserAgent("")
+		assert.Equal(t, "", m.UserAgent)
+		m.SetUserAgent("       ")
+		assert.Equal(t, "", m.UserAgent)
+	})
+	t.Run("ChangeUserAgent", func(t *testing.T) {
+		m := &Session{}
+		assert.Equal(t, "", m.UserAgent)
+		m.SetUserAgent("chrome")
+		assert.Equal(t, "chrome", m.UserAgent)
+		m.SetUserAgent("mozilla")
+		assert.Equal(t, "mozilla", m.UserAgent)
+	})
+}
+
+func TestSession_SetClientIP(t *testing.T) {
+	t.Run("IpEmpty", func(t *testing.T) {
+		m := &Session{}
+		assert.Equal(t, "", m.ClientIP)
+		m.SetClientIP("")
+		assert.Equal(t, "", m.ClientIP)
+		m.SetClientIP("       ")
+		assert.Equal(t, "", m.ClientIP)
+	})
+	t.Run("ChangeIp", func(t *testing.T) {
+		m := &Session{}
+		assert.Equal(t, "", m.ClientIP)
+		m.SetClientIP("1234")
+		assert.Equal(t, "", m.ClientIP)
+		m.SetClientIP("111.123.1.11")
+		assert.Equal(t, "111.123.1.11", m.ClientIP)
+		m.SetClientIP("2001:db8::68")
+		assert.Equal(t, "2001:db8::68", m.ClientIP)
+	})
+	t.Run("ChangeLog", func(t *testing.T) {
+		orig := event.AuditLog
+		logger, hook := logtest.NewNullLogger()
+		logger.SetLevel(logrus.TraceLevel)
+		event.AuditLog = logger
+		t.Cleanup(func() { event.AuditLog = orig })
+
+		m := &Session{RefID: "sessxkkcabce"}
+		m.SetClientIP("2001:db8:1:2::10")
+		assert.Empty(t, hook.AllEntries())
+
+		// A change within the same /64 keeps the full address without a log line.
+		m.SetClientIP("2001:db8:1:2:a:b:c:d")
+		assert.Equal(t, "2001:db8:1:2:a:b:c:d", m.ClientIP)
+		assert.Empty(t, hook.AllEntries())
+
+		// A change to another network is logged.
+		m.SetClientIP("2001:db8:1:3::10")
+		assert.Equal(t, "2001:db8:1:3::10", m.ClientIP)
+		require.Len(t, hook.AllEntries(), 1)
+		assert.Contains(t, hook.LastEntry().Message, "client address has changed from '2001:db8:1:2:a:b:c:d' to '2001:db8:1:3::10'")
+
+		hook.Reset()
+		m.SetClientIP("198.51.100.7")
+		m.SetClientIP("198.51.100.8")
+		assert.Len(t, hook.AllEntries(), 2)
+
+		// A NAT64 address counts as the IPv4 client it embeds, a 6to4 address does not.
+		hook.Reset()
+		m.SetClientIP("64:ff9b::198.51.100.8")
+		assert.Empty(t, hook.AllEntries())
+		m.SetClientIP("2002:c633:6408::1")
+		assert.Len(t, hook.AllEntries(), 1)
+
+		hook.Reset()
+		m.SetClientIP("fd00:1::2")
+		m.SetClientIP("fd00:1::3")
+		assert.Len(t, hook.AllEntries(), 2)
+		assert.Equal(t, "2001:db8:1:2::10", m.LoginIP)
+	})
+}
+
+func TestSession_HttpStatus(t *testing.T) {
+	m := &Session{}
+	assert.Equal(t, 401, m.HttpStatus())
+	m.Status = 403
+	assert.Equal(t, 403, m.HttpStatus())
+	alice := FindSessionByRefID("sessxkkcabcd")
+	assert.Equal(t, 200, alice.HttpStatus())
+}
+
+func TestSession_NoScopeAndHasScope(t *testing.T) {
+	var sess Session
+
+	assert.True(t, sess.NoScope())
+	assert.False(t, sess.HasScope())
+
+	sess.AuthScope = list.Any
+	assert.True(t, sess.NoScope())
+	assert.False(t, sess.HasScope())
+
+	sess.AuthScope = "photos:view"
+	assert.False(t, sess.NoScope())
+	assert.True(t, sess.HasScope())
+}
+
+func TestSession_ScopePermitsDownload(t *testing.T) {
+	t.Run("NoScope", func(t *testing.T) {
+		assert.True(t, (&Session{}).ScopePermitsDownload())
+		assert.True(t, (&Session{AuthScope: list.Any}).ScopePermitsDownload())
+	})
+	t.Run("Photos", func(t *testing.T) {
+		assert.True(t, (&Session{AuthScope: "photos albums"}).ScopePermitsDownload())
+	})
+	t.Run("Files", func(t *testing.T) {
+		assert.True(t, (&Session{AuthScope: "files"}).ScopePermitsDownload())
+	})
+	t.Run("Read", func(t *testing.T) {
+		assert.True(t, (&Session{AuthScope: "read"}).ScopePermitsDownload())
+	})
+	t.Run("Unrelated", func(t *testing.T) {
+		assert.False(t, (&Session{AuthScope: "albums shares"}).ScopePermitsDownload())
+		assert.False(t, (&Session{AuthScope: "config"}).ScopePermitsDownload())
+		assert.False(t, (&Session{AuthScope: "metrics"}).ScopePermitsDownload())
+	})
+	t.Run("WriteOnly", func(t *testing.T) {
+		assert.False(t, (&Session{AuthScope: "photos write"}).ScopePermitsDownload())
+		assert.False(t, (&Session{AuthScope: "files write"}).ScopePermitsDownload())
+	})
+	t.Run("ValueTerm", func(t *testing.T) {
+		// A scope term carrying a value does not match its own resource, so it permits nothing here.
+		assert.False(t, (&Session{AuthScope: "photos:read"}).ScopePermitsDownload())
+		assert.False(t, (&Session{AuthScope: "files:read"}).ScopePermitsDownload())
+	})
+}
+
+func TestSession_SetUserScopeDefault(t *testing.T) {
+	t.Run("DefaultsToUserScope", func(t *testing.T) {
+		sess := &Session{}
+		user := &User{UserUID: "u123", UserName: "scopeuser", UserScope: "photos:view"}
+
+		sess.SetUser(user)
+
+		assert.Equal(t, "photos:view", sess.AuthScope)
+		assert.Equal(t, user.UserUID, sess.UserUID)
+		assert.Equal(t, user.UserName, sess.UserName)
+	})
+	t.Run("KeepsExistingScope", func(t *testing.T) {
+		sess := &Session{AuthScope: "logs:*"}
+		user := &User{UserUID: "u456", UserName: "admin", UserScope: "photos:view"}
+
+		sess.SetUser(user)
+
+		assert.Equal(t, "logs:*", sess.AuthScope)
+	})
+}
+
+func TestUsableIdToken(t *testing.T) {
+	t.Run("Empty", func(t *testing.T) {
+		usable, dropped := UsableIdToken("")
+		assert.Equal(t, "", usable)
+		assert.False(t, dropped)
+	})
+	t.Run("WithinLimit", func(t *testing.T) {
+		token := strings.Repeat("a", IdTokenMaxSize)
+		usable, dropped := UsableIdToken(token)
+		assert.Equal(t, token, usable)
+		assert.False(t, dropped)
+	})
+	t.Run("ExceedsLimit", func(t *testing.T) {
+		// Nothing is stored, so the logout path takes its no-hint branch rather than sending a
+		// token the provider refuses.
+		token := strings.Repeat("a", IdTokenMaxSize+100)
+		usable, dropped := UsableIdToken(token)
+		assert.True(t, dropped)
+		assert.Empty(t, usable)
+	})
+}
+
+func TestSession_ClientDisabled(t *testing.T) {
+	t.Run("Enabled", func(t *testing.T) {
+		m := SessionFixtures.Get("token_metrics")
+		assert.False(t, m.ClientDisabled())
+	})
+	t.Run("NoClient", func(t *testing.T) {
+		m := SessionFixtures.Get("alice")
+		assert.False(t, m.ClientDisabled())
+	})
+	t.Run("Nil", func(t *testing.T) {
+		var m *Session
+		assert.False(t, m.ClientDisabled())
+	})
+	t.Run("Missing", func(t *testing.T) {
+		m := &Session{ClientUID: "cs5cpu17n6gj2zzz", AuthProvider: authn.ProviderClient.String()}
+		assert.True(t, m.ClientDisabled())
+	})
+	t.Run("Disabled", func(t *testing.T) {
+		client, err := AddClient(form.Client{ClientName: "Session Client Disabled", AuthScope: "metrics"})
+		require.NoError(t, err)
+		t.Cleanup(func() { _ = client.Purge() })
+
+		m := client.NewSession(nil, authn.GrantClientCredentials)
+		assert.False(t, m.ClientDisabled())
+
+		require.NoError(t, UnscopedDb().Model(&Client{}).Where("client_uid = ?", client.ClientUID).UpdateColumn("auth_enabled", false).Error)
+		assert.False(t, m.ClientDisabled())
+		FlushClientCache()
+		assert.Equal(t, acl.RoleClient, m.GetClientRole())
+		assert.True(t, m.ClientDisabled())
+	})
+}
+
+func TestSession_ScopePermitsPreview(t *testing.T) {
+	t.Run("NoScope", func(t *testing.T) {
+		assert.True(t, (&Session{}).ScopePermitsPreview())
+		assert.True(t, (&Session{AuthScope: list.Any}).ScopePermitsPreview())
+	})
+	t.Run("Photos", func(t *testing.T) {
+		assert.True(t, (&Session{AuthScope: "photos albums"}).ScopePermitsPreview())
+	})
+	t.Run("Files", func(t *testing.T) {
+		assert.True(t, (&Session{AuthScope: "files"}).ScopePermitsPreview())
+	})
+	t.Run("Read", func(t *testing.T) {
+		assert.True(t, (&Session{AuthScope: "read"}).ScopePermitsPreview())
+	})
+	t.Run("Unrelated", func(t *testing.T) {
+		assert.False(t, (&Session{AuthScope: "albums shares"}).ScopePermitsPreview())
+		assert.False(t, (&Session{AuthScope: "metrics"}).ScopePermitsPreview())
+	})
+}
+
+func TestSession_RolePermitsPreview(t *testing.T) {
+	for _, tc := range []struct {
+		role string
+		want bool
+	}{{"client", true}, {"instance", true}, {"admin", true}, {acl.RoleAliasNone, false}} {
+		t.Run(tc.role, func(t *testing.T) {
+			client, err := AddClient(form.Client{ClientName: "Role Preview " + tc.role, AuthScope: "*", ClientRole: tc.role})
+			require.NoError(t, err)
+			t.Cleanup(func() { _ = client.Purge() })
+
+			m := &Session{ClientUID: client.ClientUID, AuthProvider: authn.ProviderClient.String()}
+			assert.Equal(t, tc.want, m.RolePermitsPreview())
+		})
+	}
+}
+
+func TestSession_SignedPreview(t *testing.T) {
+	t.Run("ClientWithoutAccount", func(t *testing.T) {
+		assert.True(t, SessionFixtures.Pointer("client_metrics").SignedPreview())
+	})
+	t.Run("AccessTokenWithoutClient", func(t *testing.T) {
+		assert.False(t, SessionFixtures.Pointer("token_metrics").SignedPreview())
+	})
+	t.Run("Account", func(t *testing.T) {
+		assert.False(t, SessionFixtures.Pointer("alice").SignedPreview())
+		assert.False(t, SessionFixtures.Pointer("alice_app_password_full_access").SignedPreview())
+	})
+	t.Run("NoID", func(t *testing.T) {
+		m := *SessionFixtures.Pointer("client_metrics")
+		m.ID = ""
+		assert.False(t, m.SignedPreview())
+	})
+	t.Run("Nil", func(t *testing.T) {
+		var m *Session
+		assert.False(t, m.SignedPreview())
+	})
+}
+
+func TestSession_SetPreviewToken_SignedPreview(t *testing.T) {
+	client, err := AddClient(form.Client{ClientName: "Signed Preview Client", AuthScope: "*"})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = client.Purge() })
+
+	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/api/v1/oauth/token", nil)
+
+	t.Run("Issued", func(t *testing.T) {
+		m := client.NewSession(ctx, authn.GrantClientCredentials)
+		require.True(t, m.SignedPreview())
+		assert.Empty(t, m.PreviewToken)
+		assert.False(t, PreviewToken.Has(m.ID))
+
+		require.NoError(t, m.Save())
+		t.Cleanup(func() { _ = m.Delete() })
+
+		stored := &Session{}
+		require.NoError(t, Db().First(stored, "id = ?", m.ID).Error)
+		assert.Empty(t, stored.PreviewToken)
+	})
+	t.Run("Reloaded", func(t *testing.T) {
+		m := client.NewSession(ctx, authn.GrantClientCredentials)
+		require.NoError(t, m.Save())
+		t.Cleanup(func() { _ = m.Delete() })
+		FlushSessionCache()
+
+		found, err := FindSession(m.ID)
+		require.NoError(t, err)
+		assert.Equal(t, client.ClientUID, found.GetClient().ClientUID)
+		assert.Equal(t, acl.RoleClient, found.GetClientRole())
+		assert.Empty(t, found.PreviewToken)
+		assert.False(t, PreviewToken.Has(m.ID))
+	})
+	t.Run("ExplicitToken", func(t *testing.T) {
+		m := client.NewSession(ctx, authn.GrantClientCredentials)
+		m.SetPreviewToken("signedpv1")
+		t.Cleanup(func() { PreviewToken.Unset(m.ID) })
+		assert.Equal(t, "signedpv1", m.PreviewToken)
+	})
+	t.Run("ClientWithAccount", func(t *testing.T) {
+		alice := FindUserByName("alice")
+		require.NotNil(t, alice)
+		owned := NewClient().SetName("Signed Preview Owned").SetUser(alice)
+		require.NoError(t, owned.Create())
+		t.Cleanup(func() { _ = owned.Purge() })
+
+		m := owned.NewSession(ctx, authn.GrantClientCredentials)
+		assert.False(t, m.SignedPreview())
+		assert.Equal(t, alice.PreviewToken, m.PreviewToken)
 	})
 }

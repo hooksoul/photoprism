@@ -1,7 +1,8 @@
 package photoprism
 
-import "github.com/photoprism/photoprism/internal/face"
+import "github.com/photoprism/photoprism/internal/ai/face"
 
+// FacesOptions controls face clustering jobs.
 type FacesOptions struct {
 	Force     bool
 	Threshold int

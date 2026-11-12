@@ -1,39 +1,15 @@
-/*
-
-Copyright (c) 2018 - 2023 PhotoPrism UG. All rights reserved.
-
-    This program is free software: you can redistribute it and/or modify
-    it under Version 3 of the GNU Affero General Public License (the "AGPL"):
-    <https://docs.photoprism.app/license/agpl>
-
-    This program is distributed in the hope that it will be useful,
-    but WITHOUT ANY WARRANTY; without even the implied warranty of
-    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-    GNU Affero General Public License for more details.
-
-    The AGPL is supplemented by our Trademark and Brand Guidelines,
-    which describe how our Brand Assets may be used:
-    <https://www.photoprism.app/trademark>
-
-Feel free to send an email to hello@photoprism.app if you have questions,
-want to support our work, or just want to say hello.
-
-Additional information can be found in our Developer Guide:
-<https://docs.photoprism.app/developer-guide/>
-
-*/
-
 import RestModel from "model/rest";
-import Api from "common/api";
 import { DateTime } from "luxon";
 import File from "model/file";
-import Util from "common/util";
-import { config } from "app/session";
-import { $gettext } from "common/vm";
+import { $config } from "app/session";
+import $api from "common/api";
+import $util from "common/util";
+import { $gettext } from "common/gettext";
 
 export const RootImport = "import";
 export const RootOriginals = "originals";
 
+// Folder wraps server folder metadata and provides helpers for imports/originals trees.
 export class Folder extends RestModel {
   getDefaults() {
     return {
@@ -62,13 +38,21 @@ export class Folder extends RestModel {
   classes(selected) {
     let classes = ["is-folder", "uid-" + this.UID];
 
-    if (this.Favorite) classes.push("is-favorite");
-    if (this.Private) classes.push("is-private");
-    if (selected) classes.push("is-selected");
+    if (this.Favorite) {
+      classes.push("is-favorite");
+    }
+    if (this.Private) {
+      classes.push("is-private");
+    }
+    if (selected) {
+      classes.push("is-selected");
+    }
 
     return classes;
   }
 
+  // baseName returns the folder name without its path and without bidi and other control characters,
+  // shortened to the optional length.
   baseName(truncate) {
     let result = this.Path;
     const slash = result.lastIndexOf("/");
@@ -77,8 +61,10 @@ export class Folder extends RestModel {
       result = this.Path.substring(slash + 1);
     }
 
+    result = $util.stripBidiControls(result);
+
     if (truncate) {
-      result = Util.truncate(result, truncate, "…");
+      result = $util.truncate(result, truncate, "…");
     }
 
     return result;
@@ -93,7 +79,7 @@ export class Folder extends RestModel {
   }
 
   thumbnailUrl(size) {
-    return `${config.contentUri}/folders/t/${this.UID}/${config.previewToken}/${size}`;
+    return `${$config.contentUri}/folders/t/${this.UID}/${$config.previewToken}/${size}`;
   }
 
   getDateString() {
@@ -104,20 +90,20 @@ export class Folder extends RestModel {
     this.Favorite = !this.Favorite;
 
     if (this.Favorite) {
-      return Api.post(this.getEntityResource() + "/like");
+      return $api.post(this.getEntityResource() + "/like");
     } else {
-      return Api.delete(this.getEntityResource() + "/like");
+      return $api.delete(this.getEntityResource() + "/like");
     }
   }
 
   like() {
     this.Favorite = true;
-    return Api.post(this.getEntityResource() + "/like");
+    return $api.post(this.getEntityResource() + "/like");
   }
 
   unlike() {
     this.Favorite = false;
-    return Api.delete(this.getEntityResource() + "/like");
+    return $api.delete(this.getEntityResource() + "/like");
   }
 
   static findAll(path) {
@@ -132,6 +118,7 @@ export class Folder extends RestModel {
     if (!path || path[0] !== "/") {
       path = "/" + path;
     }
+
     return this.search(RootOriginals + path, params);
   }
 
@@ -143,8 +130,13 @@ export class Folder extends RestModel {
     if (!path || path[0] !== "/") {
       path = "/" + path;
     }
-    return Api.get(this.getCollectionResource() + path, options).then((response) => {
-      let folders = response.data.folders;
+
+    // "#" chars in path names must be explicitly escaped,
+    // see https://github.com/photoprism/photoprism/issues/3695
+    path = path.replaceAll(":", "%3A").replaceAll("#", "%23");
+
+    return $api.get(this.getCollectionResource() + path, options).then((response) => {
+      let folders = response.data.folders ? response.data.folders : [];
       let files = response.data.files ? response.data.files : [];
 
       let count = folders.length + files.length;

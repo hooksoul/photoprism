@@ -1,13 +1,22 @@
 package entity
 
 import (
+	"fmt"
+	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
-	"github.com/photoprism/photoprism/internal/classify"
+	"github.com/photoprism/photoprism/internal/ai/classify"
 	"github.com/photoprism/photoprism/internal/form"
+	"github.com/photoprism/photoprism/pkg/dsn"
+	"github.com/photoprism/photoprism/pkg/media"
+	"github.com/photoprism/photoprism/pkg/rnd"
+	"github.com/photoprism/photoprism/pkg/time/tz"
+	"github.com/photoprism/photoprism/pkg/txt"
 )
 
 func TestSavePhotoForm(t *testing.T) {
@@ -49,7 +58,7 @@ func TestSavePhotoForm(t *testing.T) {
 
 		m := PhotoFixtures.Get("Photo08")
 
-		if err := SavePhotoForm(m, f); err != nil {
+		if err := SavePhotoForm(&m, f); err != nil {
 			t.Fatal(err)
 		}
 
@@ -62,14 +71,432 @@ func TestSavePhotoForm(t *testing.T) {
 		assert.Equal(t, true, m.PhotoFavorite)
 		assert.Equal(t, true, m.PhotoPrivate)
 		assert.Equal(t, "image", m.PhotoType)
-		assert.Equal(t, float32(7.9999), m.PhotoLat)
+		assert.InEpsilon(t, 7.9999, m.PhotoLat, 0.0001)
+		assert.InEpsilon(t, 8.8888, m.PhotoLng, 0.0001)
 		assert.NotNil(t, m.EditedAt)
 
 		t.Log(m.GetDetails().Keywords)
 	})
+	t.Run("BatchDateChangeKeepsTimeZone", func(t *testing.T) {
+		photo := PhotoFixtures.Get("Photo09")
+		require.Equal(t, "America/Mexico_City", photo.TimeZone)
+
+		formSnapshot, err := form.NewPhoto(&photo)
+		require.NoError(t, err)
+
+		newDay := photo.PhotoDay + 1
+		formSnapshot.PhotoDay = newDay
+		formSnapshot.TakenSrc = SrcBatch
+		formSnapshot.TimeZone = photo.TimeZone
+		formSnapshot.TakenAtLocal = time.Date(
+			photo.PhotoYear,
+			time.Month(photo.PhotoMonth),
+			newDay,
+			photo.TakenAtLocal.Hour(),
+			photo.TakenAtLocal.Minute(),
+			photo.TakenAtLocal.Second(),
+			0,
+			time.UTC,
+		)
+
+		require.NoError(t, SavePhotoForm(&photo, formSnapshot))
+		require.NoError(t, Db().First(&photo, photo.ID).Error)
+
+		location := tz.Find(photo.TimeZone)
+		require.NotNil(t, location)
+		expectedUTC := time.Date(
+			photo.PhotoYear,
+			time.Month(photo.PhotoMonth),
+			newDay,
+			photo.TakenAtLocal.Hour(),
+			photo.TakenAtLocal.Minute(),
+			photo.TakenAtLocal.Second(),
+			0,
+			location,
+		).UTC()
+
+		assert.Equal(t, newDay, photo.PhotoDay)
+		assert.Equal(t, "America/Mexico_City", photo.TimeZone)
+		assert.Equal(t, SrcBatch, photo.TakenSrc)
+		assert.True(t, photo.TakenAt.Equal(expectedUTC))
+	})
 }
 
+// createTakenAtTestPhoto creates a photo with a manual capture time and removes it after the test.
+func createTakenAtTestPhoto(t *testing.T, zone string, takenAt, takenAtLocal time.Time) *Photo {
+	t.Helper()
+	photo := NewPhoto(false)
+	photo.TakenAt, photo.TakenAtLocal = takenAt, takenAtLocal
+	photo.TimeZone, photo.TakenSrc = zone, SrcManual
+	photo.PhotoYear, photo.PhotoMonth, photo.PhotoDay = takenAtLocal.Year(), int(takenAtLocal.Month()), takenAtLocal.Day()
+	require.NoError(t, photo.Create())
+	t.Cleanup(func() {
+		UnscopedDb().Delete(&PhotoKeyword{}, "photo_id = ?", photo.ID)
+		UnscopedDb().Delete(&Details{}, "photo_id = ?", photo.ID)
+		UnscopedDb().Delete(photo)
+	})
+	return &photo
+}
+
+// TestSavePhotoForm_TimeZoneCycles checks that converted UTC times stay stable through later unrelated saves.
+func TestSavePhotoForm_TimeZoneCycles(t *testing.T) {
+	taken := time.Date(2020, 1, 1, 0, 30, 0, 0, time.UTC)
+	for _, zone := range []string{"UTC-12", "Pacific/Kiritimati", "Europe/Berlin", "America/New_York", "Asia/Kathmandu"} {
+		t.Run(zone, func(t *testing.T) {
+			photo := createTakenAtTestPhoto(t, tz.UTC, taken, taken)
+			expected := taken.In(tz.Find(zone))
+			frm, err := form.NewPhoto(photo)
+			require.NoError(t, err)
+			frm.TimeZone = zone
+			frm.TakenAtLocal = time.Date(expected.Year(), expected.Month(), expected.Day(), expected.Hour(), expected.Minute(), expected.Second(), 0, time.UTC)
+			frm.PhotoYear, frm.PhotoMonth, frm.PhotoDay = expected.Year(), int(expected.Month()), expected.Day()
+			require.NoError(t, SavePhotoForm(photo, frm))
+			for range 3 {
+				frm, err = form.NewPhoto(photo)
+				require.NoError(t, err)
+				require.NoError(t, SavePhotoForm(photo, frm))
+				require.NoError(t, Db().First(photo, photo.ID).Error)
+				assert.True(t, photo.TakenAt.Equal(taken), "capture instant changed in %s", zone)
+				assert.Equal(t, expected.Format("2006-01-02T15:04:05"), photo.TakenAtLocal.Format("2006-01-02T15:04:05"))
+				assert.Equal(t, []int{expected.Year(), int(expected.Month()), expected.Day()}, []int{photo.PhotoYear, photo.PhotoMonth, photo.PhotoDay})
+			}
+		})
+	}
+}
+
+// TestSavePhotoForm_TakenAt checks how TakenAt is derived from the submitted wall time and zone.
+func TestSavePhotoForm_TakenAt(t *testing.T) {
+	berlin := time.Date(2025, 6, 30, 12, 0, 0, 0, time.UTC)
+	berlinLocal := time.Date(2025, 6, 30, 14, 0, 0, 0, time.UTC)
+	repeated := time.Date(2025, 10, 26, 0, 30, 0, 0, time.UTC)
+	repeatedLocal := time.Date(2025, 10, 26, 2, 30, 0, 0, time.UTC)
+	t.Run("ZoneOnlyKeepsWallTime", func(t *testing.T) {
+		photo := createTakenAtTestPhoto(t, "Europe/Berlin", berlin, berlinLocal)
+		frm, err := form.NewPhoto(photo)
+		require.NoError(t, err)
+		frm.TimeZone = "America/New_York"
+		require.NoError(t, SavePhotoForm(photo, frm))
+		assert.Equal(t, "2025-06-30T18:00:00Z", photo.TakenAt.Format(time.RFC3339))
+		assert.Equal(t, "2025-06-30T14:00:00Z", photo.TakenAtLocal.Format(time.RFC3339))
+	})
+	t.Run("ZoneOnlyFromUTCConverts", func(t *testing.T) {
+		taken := time.Date(2025, 6, 30, 23, 30, 0, 0, time.UTC)
+		photo := createTakenAtTestPhoto(t, tz.UTC, taken, taken)
+		frm, err := form.NewPhoto(photo)
+		require.NoError(t, err)
+		frm.TimeZone = "Europe/Berlin"
+		require.NoError(t, SavePhotoForm(photo, frm))
+		assert.Equal(t, "2025-06-30T23:30:00Z", photo.TakenAt.Format(time.RFC3339))
+		assert.Equal(t, "2025-07-01T01:30:00Z", photo.TakenAtLocal.Format(time.RFC3339))
+		assert.Equal(t, []int{2025, 7, 1}, []int{photo.PhotoYear, photo.PhotoMonth, photo.PhotoDay})
+	})
+	t.Run("ZoneOnlyFromUTCUnknownDay", func(t *testing.T) {
+		taken := time.Date(2020, 1, 1, 3, 0, 0, 0, time.UTC)
+		photo := createTakenAtTestPhoto(t, tz.UTC, taken, taken)
+		require.NoError(t, photo.Update("PhotoDay", -1))
+		photo.PhotoDay = -1
+		frm, err := form.NewPhoto(photo)
+		require.NoError(t, err)
+		frm.TimeZone = "America/New_York"
+		require.NoError(t, SavePhotoForm(photo, frm))
+		assert.Equal(t, "2019-12-31T22:00:00Z", photo.TakenAtLocal.Format(time.RFC3339))
+		assert.Equal(t, []int{2020, 1, -1}, []int{photo.PhotoYear, photo.PhotoMonth, photo.PhotoDay})
+	})
+	t.Run("ZoneOnlyToUTCKeepsWallTime", func(t *testing.T) {
+		photo := createTakenAtTestPhoto(t, "Europe/Berlin", berlin, berlinLocal)
+		frm, err := form.NewPhoto(photo)
+		require.NoError(t, err)
+		frm.TimeZone = tz.UTC
+		require.NoError(t, SavePhotoForm(photo, frm))
+		assert.Equal(t, "2025-06-30T14:00:00Z", photo.TakenAt.Format(time.RFC3339))
+		assert.Equal(t, "2025-06-30T14:00:00Z", photo.TakenAtLocal.Format(time.RFC3339))
+	})
+	t.Run("ZoneAndDateChangeKeepsWallTime", func(t *testing.T) {
+		taken := time.Date(2025, 6, 30, 23, 30, 0, 0, time.UTC)
+		photo := createTakenAtTestPhoto(t, tz.UTC, taken, taken)
+		frm, err := form.NewPhoto(photo)
+		require.NoError(t, err)
+		frm.TimeZone, frm.PhotoDay = "Europe/Berlin", 15
+		require.NoError(t, SavePhotoForm(photo, frm))
+		assert.Equal(t, "2025-06-30T23:30:00Z", photo.TakenAtLocal.Format(time.RFC3339))
+		assert.Equal(t, "2025-06-30T21:30:00Z", photo.TakenAt.Format(time.RFC3339))
+		assert.Equal(t, []int{2025, 6, 15}, []int{photo.PhotoYear, photo.PhotoMonth, photo.PhotoDay})
+	})
+	t.Run("FromUTCWithLocalTimeUsesIt", func(t *testing.T) {
+		taken := time.Date(2025, 6, 30, 23, 30, 0, 0, time.UTC)
+		photo := createTakenAtTestPhoto(t, tz.UTC, taken, taken)
+		frm, err := form.NewPhoto(photo)
+		require.NoError(t, err)
+		frm.TimeZone, frm.TakenAtLocal = "Europe/Berlin", time.Date(2025, 7, 2, 3, 45, 0, 0, time.UTC)
+		require.NoError(t, SavePhotoForm(photo, frm))
+		assert.Equal(t, "2025-07-02T01:45:00Z", photo.TakenAt.Format(time.RFC3339))
+		assert.Equal(t, "2025-07-02T03:45:00Z", photo.TakenAtLocal.Format(time.RFC3339))
+	})
+	t.Run("InconsistentTakenAtIsDerived", func(t *testing.T) {
+		photo := createTakenAtTestPhoto(t, "Europe/Berlin", berlin, berlinLocal)
+		frm, err := form.NewPhoto(photo)
+		require.NoError(t, err)
+		frm.TakenAt = berlin.Add(5 * time.Hour)
+		require.NoError(t, SavePhotoForm(photo, frm))
+		assert.Equal(t, "2025-06-30T12:00:00Z", photo.TakenAt.Format(time.RFC3339))
+	})
+	t.Run("RepeatedHourZoneChange", func(t *testing.T) {
+		photo := createTakenAtTestPhoto(t, tz.UTC, repeated, repeated)
+		frm, err := form.NewPhoto(photo)
+		require.NoError(t, err)
+		frm.TimeZone, frm.TakenAtLocal = "Europe/Berlin", repeatedLocal
+		require.NoError(t, SavePhotoForm(photo, frm))
+		assert.Equal(t, "2025-10-26T00:30:00Z", photo.TakenAt.Format(time.RFC3339))
+		assert.Equal(t, "2025-10-26T02:30:00Z", photo.TakenAtLocal.Format(time.RFC3339))
+	})
+	t.Run("RepeatedHourUnrelatedSave", func(t *testing.T) {
+		photo := createTakenAtTestPhoto(t, "Europe/Berlin", repeated, repeatedLocal)
+		frm, err := form.NewPhoto(photo)
+		require.NoError(t, err)
+		frm.PhotoTitle, frm.TitleSrc = "Repeated Hour", SrcManual
+		require.NoError(t, SavePhotoForm(photo, frm))
+		assert.Equal(t, "2025-10-26T00:30:00Z", photo.TakenAt.Format(time.RFC3339))
+		assert.Equal(t, "2025-10-26T02:30:00Z", photo.TakenAtLocal.Format(time.RFC3339))
+	})
+	t.Run("LocalUsesWallTime", func(t *testing.T) {
+		photo := createTakenAtTestPhoto(t, "Europe/Berlin", berlin, berlinLocal)
+		frm, err := form.NewPhoto(photo)
+		require.NoError(t, err)
+		frm.TimeZone = tz.Local
+		require.NoError(t, SavePhotoForm(photo, frm))
+		assert.Equal(t, "2025-06-30T14:00:00Z", photo.TakenAt.Format(time.RFC3339))
+		assert.Equal(t, "2025-06-30T14:00:00Z", photo.TakenAtLocal.Format(time.RFC3339))
+	})
+}
+
+func TestPhoto_LabelKeywords(t *testing.T) {
+	t.Run("CollectsSearchableKeywords", func(t *testing.T) {
+		photo := Photo{
+			Labels: []PhotoLabel{
+				{
+					LabelSrc:    SrcManual,
+					Uncertainty: 0,
+					Label: &Label{
+						LabelName: "Golden Gate",
+						LabelCategories: []*Label{
+							{LabelName: "Bridge Monuments"},
+							{LabelName: "San Francisco"},
+						},
+					},
+				},
+				{
+					// Skipped because source is ignored
+					LabelSrc: SrcTitle,
+					Label:    &Label{LabelName: "Title Based"},
+				},
+				{
+					// Skipped because uncertainty >= 100
+					LabelSrc:    SrcManual,
+					Uncertainty: 150,
+					Label:       &Label{LabelName: "Too Uncertain"},
+				},
+				{
+					// Safeguard: nil label should be ignored
+					LabelSrc: SrcManual,
+				},
+			},
+		}
+
+		expected := append([]string{}, txt.Keywords("Golden Gate")...)
+		expected = append(expected, txt.Keywords("Bridge Monuments")...)
+		expected = append(expected, txt.Keywords("San Francisco")...)
+
+		assert.ElementsMatch(t, expected, photo.LabelKeywords())
+	})
+	t.Run("NilPhoto", func(t *testing.T) {
+		var photo *Photo
+		assert.Nil(t, photo.LabelKeywords())
+	})
+}
+
+func TestPhoto_GetUID(t *testing.T) {
+	t.Run("ReturnsPhotoUID", func(t *testing.T) {
+		uid := rnd.GenerateUID(PhotoUID)
+		photo := &Photo{PhotoUID: uid}
+		assert.Equal(t, uid, photo.GetUID())
+	})
+	t.Run("NilPhoto", func(t *testing.T) {
+		var photo *Photo
+		assert.Equal(t, "<nil>", photo.GetUID())
+	})
+}
+
+func photoKeywordWords(t *testing.T, photoID uint) []string {
+	t.Helper()
+
+	type row struct {
+		Keyword string
+	}
+
+	var rows []row
+
+	if err := Db().Table(Keyword{}.TableName()).
+		Select("keywords.keyword").
+		Joins("JOIN photos_keywords pk ON pk.keyword_id = keywords.id AND pk.photo_id = ?", photoID).
+		Scan(&rows).Error; err != nil {
+		t.Fatalf("failed querying photo keywords: %v", err)
+	}
+
+	words := make([]string, 0, len(rows))
+
+	for _, r := range rows {
+		words = append(words, r.Keyword)
+	}
+
+	return words
+}
+
+func TestPhoto_LabelKeywordIndexing(t *testing.T) {
+	t.Run("SaveLabels", func(t *testing.T) {
+		fixture := PhotoFixtures.Get("Photo56")
+		photo := FindPhoto(fixture)
+		require.NotNil(t, photo)
+		require.Greater(t, len(photo.Labels), 0)
+
+		require.NoError(t, Db().Where("photo_id = ?", photo.ID).Delete(&PhotoKeyword{}).Error)
+
+		originalKeywords := photo.GetDetails().Keywords
+
+		require.NoError(t, photo.SaveLabels())
+
+		reloaded := FindPhoto(*photo)
+		require.NotNil(t, reloaded)
+		assert.Equal(t, originalKeywords, reloaded.GetDetails().Keywords)
+
+		words := photoKeywordWords(t, photo.ID)
+		assert.Contains(t, words, "flower")
+		assert.Contains(t, words, "cake")
+		assert.NotContains(t, words, "cow") // SrcKeyword entries are skipped
+	})
+	t.Run("Optimize", func(t *testing.T) {
+		fixture := PhotoFixtures.Get("Photo57")
+		photo := FindPhoto(fixture)
+		require.NotNil(t, photo)
+		require.Greater(t, len(photo.Labels), 0)
+
+		require.NoError(t, Db().Where("photo_id = ?", photo.ID).Delete(&PhotoKeyword{}).Error)
+
+		originalKeywords := photo.GetDetails().Keywords
+
+		_, _, err := photo.Optimize(false, false, false, false)
+		require.NoError(t, err)
+
+		reloaded := FindPhoto(*photo)
+		require.NotNil(t, reloaded)
+		assert.Equal(t, originalKeywords, reloaded.GetDetails().Keywords)
+
+		words := photoKeywordWords(t, photo.ID)
+		assert.Contains(t, words, "flower")
+	})
+}
+
+func TestPhoto_HasUID(t *testing.T) {
+	t.Run("True", func(t *testing.T) {
+		m := PhotoFixtures.Get("Photo01")
+		assert.True(t, m.HasID())
+		assert.True(t, m.HasUID())
+	})
+	t.Run("False", func(t *testing.T) {
+		m := Photo{}
+		assert.False(t, m.HasID())
+		assert.False(t, m.HasUID())
+	})
+}
+
+func TestPhoto_GetID(t *testing.T) {
+	t.Run("Success", func(t *testing.T) {
+		m := PhotoFixtures.Get("Photo01")
+		assert.Equal(t, uint(1000001), m.GetID())
+	})
+}
+
+func TestPhoto_MediaType(t *testing.T) {
+	t.Run("Image", func(t *testing.T) {
+		m := PhotoFixtures.Get("19800101_000002_D640C559")
+		assert.Equal(t, media.Image, m.MediaType())
+	})
+	t.Run("Raw", func(t *testing.T) {
+		m := Photo{PhotoType: "raw", TypeSrc: SrcManual}
+		assert.Equal(t, media.Raw, m.MediaType())
+		m.ResetMediaType(SrcFile)
+		assert.Equal(t, media.Raw, m.MediaType())
+		assert.Equal(t, SrcManual, m.TypeSrc)
+	})
+	t.Run("Live", func(t *testing.T) {
+		m := PhotoFixtures.Get("Photo27")
+		assert.Equal(t, media.Live, m.MediaType())
+		assert.Equal(t, SrcFile, m.TypeSrc)
+		assert.Equal(t, media.LiveMaxDuration, m.PhotoDuration)
+		m.ResetMediaType(SrcFile)
+		assert.Equal(t, media.Image, m.MediaType())
+		assert.Equal(t, SrcAuto, m.TypeSrc)
+		assert.Equal(t, media.LiveMaxDuration, m.PhotoDuration)
+		m.ResetDuration()
+		assert.Equal(t, time.Duration(0), m.PhotoDuration)
+	})
+}
+
+func TestPhoto_HasMediaType(t *testing.T) {
+	t.Run("Image", func(t *testing.T) {
+		m := PhotoFixtures.Get("19800101_000002_D640C559")
+		assert.True(t, m.HasMediaType(media.Image))
+		assert.True(t, m.HasMediaType(media.Image, media.Video, media.Live))
+		assert.False(t, m.HasMediaType(media.Video, media.Live))
+		assert.False(t, m.HasMediaType())
+	})
+	t.Run("Live", func(t *testing.T) {
+		m := PhotoFixtures.Get("Photo27")
+		assert.True(t, m.HasMediaType(media.Live))
+		assert.True(t, m.HasMediaType(media.Image, media.Video, media.Live))
+		assert.False(t, m.HasMediaType(media.Image, media.Animated))
+		assert.False(t, m.HasMediaType())
+	})
+}
+
+func TestPhoto_SetMediaType(t *testing.T) {
+	t.Run("Image", func(t *testing.T) {
+		m := PhotoFixtures.Get("19800101_000002_D640C559")
+		assert.Equal(t, media.Image, m.MediaType())
+		assert.Equal(t, SrcAuto, m.TypeSrc)
+		m.SetMediaType(media.Video, SrcAuto)
+		assert.Equal(t, media.Video, m.MediaType())
+		assert.Equal(t, SrcAuto, m.TypeSrc)
+		m.SetMediaType(media.Live, SrcAuto)
+		assert.Equal(t, media.Live, m.MediaType())
+		assert.Equal(t, SrcAuto, m.TypeSrc)
+		m.SetMediaType(media.Video, SrcAuto)
+		assert.Equal(t, media.Live, m.MediaType())
+		assert.Equal(t, SrcAuto, m.TypeSrc)
+		m.SetMediaType(media.Image, SrcAuto)
+		assert.Equal(t, media.Live, m.MediaType())
+		assert.Equal(t, SrcAuto, m.TypeSrc)
+		m.SetMediaType("", SrcAuto)
+		assert.Equal(t, media.Live, m.MediaType())
+		assert.Equal(t, SrcAuto, m.TypeSrc)
+		m.SetMediaType(media.Video, SrcManual)
+		assert.Equal(t, media.Video, m.MediaType())
+		assert.Equal(t, SrcManual, m.TypeSrc)
+	})
+	t.Run("Live", func(t *testing.T) {
+		m := PhotoFixtures.Get("Photo27")
+		assert.Equal(t, media.Live, m.MediaType())
+		m.SetMediaType(media.Image, SrcAuto)
+		assert.Equal(t, media.Live, m.MediaType())
+		assert.Equal(t, SrcFile, m.TypeSrc)
+		m.SetMediaType(media.Image, SrcManual)
+		assert.Equal(t, media.Image, m.MediaType())
+		assert.Equal(t, SrcManual, m.TypeSrc)
+	})
+}
+
+// TestPhoto_SaveLabels checks metadata persistence and drains its count-refresh jobs.
 func TestPhoto_SaveLabels(t *testing.T) {
+	t.Cleanup(WaitForAsyncJobs)
 	t.Run("NewPhoto", func(t *testing.T) {
 		photo := Photo{
 			ID:               11111,
@@ -112,7 +539,6 @@ func TestPhoto_SaveLabels(t *testing.T) {
 
 		assert.EqualError(t, err, "photo: cannot save to database, id is empty")
 	})
-
 	t.Run("ExistingPhoto", func(t *testing.T) {
 		m := PhotoFixtures.Get("19800101_000002_D640C559")
 		err := m.SaveLabels()
@@ -122,16 +548,102 @@ func TestPhoto_SaveLabels(t *testing.T) {
 	})
 }
 
+func TestPhoto_ShouldGenerateLabels(t *testing.T) {
+	t.Run("NoLabels", func(t *testing.T) {
+		p := Photo{}
+		assert.True(t, p.ShouldGenerateLabels(false))
+	})
+	t.Run("Force", func(t *testing.T) {
+		p := Photo{Labels: []PhotoLabel{{LabelSrc: string(SrcManual)}}}
+		assert.True(t, p.ShouldGenerateLabels(true))
+	})
+	t.Run("ExistingVisionLabel", func(t *testing.T) {
+		p := Photo{Labels: []PhotoLabel{{LabelSrc: string(SrcOllama)}}}
+		assert.False(t, p.ShouldGenerateLabels(false))
+	})
+	t.Run("VisionLabelHighUncertainty", func(t *testing.T) {
+		p := Photo{Labels: []PhotoLabel{{LabelSrc: string(SrcOllama), Uncertainty: 100}}}
+		assert.True(t, p.ShouldGenerateLabels(false))
+	})
+	t.Run("CaptionGeneratedLabels", func(t *testing.T) {
+		p := Photo{
+			Labels:     []PhotoLabel{{LabelSrc: string(SrcCaption)}},
+			CaptionSrc: SrcOllama,
+		}
+		assert.False(t, p.ShouldGenerateLabels(false))
+	})
+	t.Run("ManualLabels", func(t *testing.T) {
+		p := Photo{Labels: []PhotoLabel{{LabelSrc: string(SrcManual)}}}
+		assert.True(t, p.ShouldGenerateLabels(false))
+	})
+	t.Run("CaptionManualWithoutVision", func(t *testing.T) {
+		p := Photo{
+			Labels:     []PhotoLabel{{LabelSrc: string(SrcCaption)}},
+			CaptionSrc: SrcManual,
+		}
+		assert.True(t, p.ShouldGenerateLabels(false))
+	})
+}
+
+func TestPhoto_ShouldGenerateCaption(t *testing.T) {
+	ctx := []struct {
+		name   string
+		photo  Photo
+		source Src
+		force  bool
+		expect bool
+	}{
+		{
+			name:   "NoCaptionAutoSource",
+			photo:  Photo{CaptionSrc: SrcAuto},
+			source: SrcOllama,
+			expect: true,
+		},
+		{
+			name:   "LowerPriority",
+			photo:  Photo{CaptionSrc: SrcOllama},
+			source: SrcImage,
+			expect: false,
+		},
+		{
+			name:   "HigherPriority",
+			photo:  Photo{CaptionSrc: SrcImage},
+			source: SrcOllama,
+			expect: true,
+		},
+		{
+			name:   "ForceOverrides",
+			photo:  Photo{CaptionSrc: SrcImage, PhotoCaption: "existing"},
+			source: SrcImage,
+			force:  true,
+			expect: true,
+		},
+		{
+			name:   "SamePriorityNoForce",
+			photo:  Photo{CaptionSrc: SrcOllama, PhotoCaption: "existing"},
+			source: SrcOllama,
+			expect: false,
+		},
+	}
+
+	for _, tc := range ctx {
+		t.Run(tc.name, func(t *testing.T) {
+			result := tc.photo.ShouldGenerateCaption(tc.source, tc.force)
+			assert.Equal(t, tc.expect, result)
+		})
+	}
+}
+
 func TestPhoto_ClassifyLabels(t *testing.T) {
 	t.Run("NewPhoto", func(t *testing.T) {
 		m := PhotoFixtures.Get("Photo19")
-		Db().Set("gorm:auto_preload", true).Model(&m).Related(&m.Labels)
+		Db().Where("photo_id = ?", m.ID).Preload("Label").Preload("Label.LabelCategories").Find(&m.Labels)
 		labels := m.ClassifyLabels()
 		assert.Empty(t, labels)
 	})
 	t.Run("ExistingPhoto", func(t *testing.T) {
 		m := PhotoFixtures.Get("19800101_000002_D640C559")
-		Db().Set("gorm:auto_preload", true).Model(&m).Related(&m.Labels)
+		Db().Where("photo_id = ?", m.ID).Preload("Label").Preload("Label.LabelCategories").Find(&m.Labels)
 		labels := m.ClassifyLabels()
 		assert.LessOrEqual(t, 2, labels.Len())
 	})
@@ -225,14 +737,23 @@ func TestPhoto_GetDetails(t *testing.T) {
 		result := m.GetDetails()
 		assert.Equal(t, uint(0x0), result.PhotoID)
 	})
-	t.Run("new photo with ID", func(t *testing.T) {
-		m := Photo{ID: 79550, PhotoUID: "pthkffkgk"}
+	t.Run("NewPhotoWithID", func(t *testing.T) {
+		m := Photo{ID: 79550, PhotoUID: "prjwufg1z97rcxff"}
 		result := m.GetDetails()
 		assert.Equal(t, uint(0x136be), result.PhotoID)
 	})
 }
 
 func TestPhoto_AddLabels(t *testing.T) {
+	resetLabel := func(t *testing.T, photoName, labelName, src string, uncertainty int) {
+		t.Helper()
+		photo := PhotoFixtures.Get(photoName)
+		label := LabelFixtures.Get(labelName)
+		assert.NoError(t, UnscopedDb().Model(&PhotoLabel{}).
+			Where("photo_id = ? AND label_id = ?", photo.ID, label.ID).
+			UpdateColumns(Values{"uncertainty": uncertainty, "label_src": src}).Error)
+	}
+
 	t.Run("Add", func(t *testing.T) {
 		m := PhotoFixtures.Get("19800101_000002_D640C559")
 		classifyLabels := classify.Labels{{Name: "cactus", Uncertainty: 30, Source: SrcManual, Priority: 5, Categories: []string{"plant"}}}
@@ -251,26 +772,142 @@ func TestPhoto_AddLabels(t *testing.T) {
 		assert.Equal(t, 10, m.Labels[0].Uncertainty)
 		assert.Equal(t, SrcManual, m.Labels[0].LabelSrc)
 	})
-}
+	t.Run("OllamaReplacesLowerConfidence", func(t *testing.T) {
+		photoName := "Photo15"
+		labelName := "landscape"
+		resetLabel(t, photoName, labelName, SrcImage, 20)
 
-func TestPhoto_SetDescription(t *testing.T) {
-	t.Run("empty description", func(t *testing.T) {
-		m := PhotoFixtures.Get("Photo15")
-		assert.Equal(t, "photo description blacklist", m.PhotoDescription)
-		m.SetDescription("", SrcManual)
-		assert.Equal(t, "photo description blacklist", m.PhotoDescription)
+		photo := PhotoFixtures.Get(photoName)
+		classifyLabels := classify.Labels{{Name: labelName, Uncertainty: 5, Source: SrcOllama}}
+		photo.AddLabels(classifyLabels)
+
+		updated, err := FindPhotoLabel(photo.ID, LabelFixtures.Get(labelName).ID, true)
+		if err != nil {
+			t.Fatalf("FindPhotoLabel failed: %v", err)
+		}
+		assert.Equal(t, 5, updated.Uncertainty)
+		assert.Equal(t, SrcOllama, updated.LabelSrc)
 	})
-	t.Run("description not from the same source", func(t *testing.T) {
-		m := PhotoFixtures.Get("Photo15")
-		assert.Equal(t, "photo description blacklist", m.PhotoDescription)
-		m.SetDescription("new photo description", SrcName)
-		assert.Equal(t, "photo description blacklist", m.PhotoDescription)
+	t.Run("KeepExistingWhenLessConfident", func(t *testing.T) {
+		photoName := "19800101_000002_D640C559"
+		labelName := "flower"
+		resetLabel(t, photoName, labelName, SrcImage, 20)
+
+		photo := PhotoFixtures.Get(photoName)
+		classifyLabels := classify.Labels{{Name: labelName, Uncertainty: 40, Source: SrcOllama}}
+		photo.AddLabels(classifyLabels)
+
+		updated, err := FindPhotoLabel(photo.ID, LabelFixtures.Get(labelName).ID, true)
+		if err != nil {
+			t.Fatalf("FindPhotoLabel failed: %v", err)
+		}
+		assert.Equal(t, 20, updated.Uncertainty)
+		assert.Equal(t, SrcImage, updated.LabelSrc)
 	})
-	t.Run("Ok", func(t *testing.T) {
-		m := PhotoFixtures.Get("Photo15")
-		assert.Equal(t, "photo description blacklist", m.PhotoDescription)
-		m.SetDescription("new photo description", SrcMeta)
-		assert.Equal(t, "new photo description", m.PhotoDescription)
+	t.Run("StoresTopicality", func(t *testing.T) {
+		photo := PhotoFixtures.Get("Photo15")
+		label := LabelFixtures.Get("landscape")
+
+		classifyLabels := classify.Labels{{Name: label.LabelSlug, Uncertainty: 15, Source: SrcManual, Topicality: 55}}
+		photo.AddLabels(classifyLabels)
+
+		updated, err := FindPhotoLabel(photo.ID, label.ID, true)
+		if err != nil {
+			t.Fatalf("FindPhotoLabel failed: %v", err)
+		}
+		assert.Equal(t, 55, updated.Topicality)
+	})
+	t.Run("NormalizesProviderSourceCase", func(t *testing.T) {
+		photoName := "Photo01"
+		labelName := "cow"
+		resetLabel(t, photoName, labelName, SrcImage, 20)
+
+		photo := PhotoFixtures.Get(photoName)
+		classifyLabels := classify.Labels{{Name: labelName, Uncertainty: 15, Source: "OlLaMa"}}
+		photo.AddLabels(classifyLabels)
+
+		updated, err := FindPhotoLabel(photo.ID, LabelFixtures.Get(labelName).ID, true)
+		if err != nil {
+			t.Fatalf("FindPhotoLabel failed: %v", err)
+		}
+		assert.Equal(t, 15, updated.Uncertainty)
+		assert.Equal(t, SrcOllama, updated.LabelSrc)
+	})
+	t.Run("SkipBlankTitle", func(t *testing.T) {
+		photo := PhotoFixtures.Get("Photo15")
+		initialLen := len(photo.Labels)
+
+		var labelCountBefore int64
+		if err := Db().Model(&Label{}).Where("label_slug = ?", "unknown").Count(&labelCountBefore).Error; err != nil {
+			t.Fatalf("count before failed: %v", err)
+		}
+
+		classifyLabels := classify.Labels{{Name: "   ", Uncertainty: 30, Source: SrcManual}}
+		photo.AddLabels(classifyLabels)
+
+		assert.Equal(t, initialLen, len(photo.Labels))
+
+		var labelCountAfter int64
+		if err := Db().Model(&Label{}).Where("label_slug = ?", "unknown").Count(&labelCountAfter).Error; err != nil {
+			t.Fatalf("count after failed: %v", err)
+		}
+		assert.EqualValues(t, labelCountBefore, labelCountAfter)
+	})
+	t.Run("ReusesRenamedLabelFromClassifier", func(t *testing.T) {
+		// Reproduces the AI ingestion path from issue #5531: a classifier
+		// re-emitting the previous name of a renamed label must reuse the
+		// existing row instead of creating a duplicate.
+		original := FirstOrCreateLabel(NewLabel("RenameClassifyA", 0))
+		require.NotNil(t, original)
+
+		t.Cleanup(func() {
+			_ = Db().Unscoped().Delete(original).Error
+			FlushLabelCache()
+		})
+
+		require.True(t, original.SetName("RenameClassifyB"))
+		require.NoError(t, Db().Save(original).Error)
+		FlushLabelCache()
+
+		var before int64
+		require.NoError(t, UnscopedDb().Model(&Label{}).
+			Where("label_slug LIKE ? OR custom_slug LIKE ?", "renameclassify%", "renameclassify%").
+			Count(&before).Error)
+		assert.EqualValues(t, 1, before)
+
+		photo := PhotoFixtures.Get("19800101_000002_D640C559")
+		photo.AddLabels(classify.Labels{{Name: "RenameClassifyA", Uncertainty: 30, Source: SrcImage, Priority: 0}})
+
+		var after int64
+		require.NoError(t, UnscopedDb().Model(&Label{}).
+			Where("label_slug LIKE ? OR custom_slug LIKE ?", "renameclassify%", "renameclassify%").
+			Count(&after).Error)
+		assert.EqualValues(t, 1, after, "classifier with old name must not create a duplicate label")
+
+		joined, err := FindPhotoLabel(photo.ID, original.ID, false)
+		require.NoError(t, err)
+		assert.Equal(t, original.ID, joined.LabelID)
+	})
+	t.Run("SkipZeroProbability", func(t *testing.T) {
+		photo := PhotoFixtures.Get("Photo15")
+		initialLen := len(photo.Labels)
+
+		labelSlug := "zero-probability"
+		var labelCountBefore int64
+		if err := Db().Model(&Label{}).Where("label_slug = ?", labelSlug).Count(&labelCountBefore).Error; err != nil {
+			t.Fatalf("count before failed: %v", err)
+		}
+
+		classifyLabels := classify.Labels{{Name: "Zero Probability", Uncertainty: 100, Source: SrcManual}}
+		photo.AddLabels(classifyLabels)
+
+		assert.Equal(t, initialLen, len(photo.Labels))
+
+		var labelCountAfter int64
+		if err := Db().Model(&Label{}).Where("label_slug = ?", labelSlug).Count(&labelCountAfter).Error; err != nil {
+			t.Fatalf("count after failed: %v", err)
+		}
+		assert.EqualValues(t, labelCountBefore, labelCountAfter)
 	})
 }
 
@@ -291,31 +928,115 @@ func TestPhoto_Delete(t *testing.T) {
 		}
 		assert.Len(t, files, 1)
 	})
+	t.Run("Archived", func(t *testing.T) {
+		archivedAt := time.Date(2021, 1, 1, 0, 0, 0, 0, time.UTC)
+		m := &Photo{PhotoUID: rnd.GenerateUID(PhotoUID), PhotoName: "DeleteArchived", PhotoQuality: 3, DeletedAt: DeletedAtTime(archivedAt)}
+		require.NoError(t, UnscopedDb().Create(m).Error)
+
+		t.Cleanup(func() {
+			require.NoError(t, UnscopedDb().Delete(&Photo{}, "id = ?", m.ID).Error)
+		})
+
+		_, err := m.Delete(false)
+		require.NoError(t, err)
+
+		var result Photo
+		require.NoError(t, UnscopedDb().Where("id = ?", m.ID).First(&result).Error)
+		assert.Equal(t, -1, result.PhotoQuality)
+		require.True(t, result.DeletedAt.Valid)
+		assert.False(t, result.IsArchived())
+	})
+	t.Run("NoID", func(t *testing.T) {
+		m := Photo{}
+		_, err := m.Delete(true)
+
+		assert.Error(t, err)
+	})
 }
 
 func TestPhotos_UIDs(t *testing.T) {
 	t.Run("Ok", func(t *testing.T) {
-		photo1 := Photo{PhotoUID: "abc123"}
-		photo2 := Photo{PhotoUID: "abc456"}
+		uid1 := rnd.GenerateUID(PhotoUID)
+		uid2 := rnd.GenerateUID(PhotoUID)
+		photo1 := &Photo{PhotoUID: uid1}
+		photo2 := &Photo{PhotoUID: uid2}
 		photos := Photos{photo1, photo2}
-		assert.Equal(t, []string{"abc123", "abc456"}, photos.UIDs())
+		assert.Equal(t, []string{uid1, uid2}, photos.UIDs())
 	})
 }
 
 func TestPhoto_String(t *testing.T) {
-	t.Run("ReturnOriginal", func(t *testing.T) {
-		photo := Photo{PhotoUID: "", PhotoName: "", OriginalName: "holidayOriginal"}
-		assert.Equal(t, "holidayOriginal", photo.String())
-	})
-	t.Run("Unknown", func(t *testing.T) {
-		photo := Photo{PhotoUID: "", PhotoName: "", OriginalName: ""}
-		assert.Equal(t, "(unknown)", photo.String())
-	})
+	generatedUID := rnd.GenerateUID(PhotoUID)
+	testcases := []struct {
+		name     string
+		photo    *Photo
+		want     string
+		checkFmt bool
+	}{
+		{
+			name:     "Nil",
+			photo:    nil,
+			want:     "Photo<nil>",
+			checkFmt: true,
+		},
+		{
+			name:     "PhotoNameWithPath",
+			photo:    &Photo{PhotoPath: "albums/test", PhotoName: "my photo.jpg"},
+			want:     "'albums/test/my photo.jpg'",
+			checkFmt: true,
+		},
+		{
+			name:  "PhotoNameOnly",
+			photo: &Photo{PhotoName: "photo.jpg"},
+			want:  "photo.jpg",
+		},
+		{
+			name:  "OriginalName",
+			photo: &Photo{OriginalName: "orig name.dng"},
+			want:  "'orig name.dng'",
+		},
+		{
+			name:  "UID",
+			photo: &Photo{PhotoUID: generatedUID},
+			want:  fmt.Sprintf("uid %s", generatedUID),
+		},
+		{
+			name:  "ID",
+			photo: &Photo{ID: 42},
+			want:  "id 42",
+		},
+		{
+			name:     "Fallback",
+			photo:    &Photo{},
+			want:     "*Photo",
+			checkFmt: true,
+		},
+	}
+
+	for _, tc := range testcases {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.photo == nil {
+				var p *Photo
+				assert.Equal(t, tc.want, p.String())
+				if tc.checkFmt {
+					//nolint:staticcheck // the point is that fmt reaches String(), which calling it cannot show.
+					assert.Equal(t, tc.want, fmt.Sprintf("%s", p))
+				}
+				return
+			}
+
+			assert.Equal(t, tc.want, tc.photo.String())
+			if tc.checkFmt {
+				//nolint:staticcheck // the point is that fmt reaches String(), which calling it cannot show.
+				assert.Equal(t, tc.want, fmt.Sprintf("%s", tc.photo))
+			}
+		})
+	}
 }
 
 func TestPhoto_Create(t *testing.T) {
 	t.Run("Ok", func(t *testing.T) {
-		photo := Photo{PhotoUID: "567", PhotoName: "Holiday", OriginalName: "holidayOriginal2"}
+		photo := Photo{PhotoUID: rnd.GenerateUID(PhotoUID), PhotoName: "Holiday", OriginalName: "holidayOriginal2"}
 		err := photo.Create()
 		if err != nil {
 			t.Fatal(err)
@@ -325,15 +1046,71 @@ func TestPhoto_Create(t *testing.T) {
 
 func TestPhoto_Save(t *testing.T) {
 	t.Run("Ok", func(t *testing.T) {
-		photo := Photo{PhotoUID: "567", PhotoName: "Holiday", OriginalName: "holidayOriginal2"}
+		photo := Photo{PhotoUID: rnd.GenerateUID(PhotoUID), PhotoName: "Holiday", OriginalName: "holidayOriginal2"}
 		err := photo.Save()
 		if err != nil {
 			t.Fatal(err)
 		}
 	})
 	t.Run("Error", func(t *testing.T) {
-		photo := Photo{PhotoUID: "pt9jtdre2lvl0yh0"}
+		photo := Photo{PhotoUID: "ps6sg6be2lvl0yh0"}
 		assert.Error(t, photo.Save())
+	})
+}
+
+func TestPhoto_BeforeSave(t *testing.T) {
+	t.Run("Create", func(t *testing.T) {
+		photo := Photo{PhotoUID: rnd.GenerateUID(PhotoUID), PhotoName: "BeforeSave", OriginalName: "beforeSaveOriginal"}
+		require.NoError(t, photo.Create())
+		t.Cleanup(func() { _ = UnscopedDb().Delete(&photo).Error })
+
+		found := Photo{}
+		require.NoError(t, UnscopedDb().Where("id = ?", photo.ID).First(&found).Error)
+		assert.False(t, found.TakenAt.IsZero())
+		assert.False(t, found.TakenAtLocal.IsZero())
+	})
+	t.Run("Save", func(t *testing.T) {
+		photo := Photo{PhotoUID: rnd.GenerateUID(PhotoUID), PhotoName: "BeforeSave", OriginalName: "beforeSaveOriginal"}
+		require.NoError(t, photo.Create())
+		t.Cleanup(func() { _ = UnscopedDb().Delete(&photo).Error })
+
+		photo.TakenAt = time.Time{}
+		photo.TakenAtLocal = time.Time{}
+		require.NoError(t, photo.Save())
+
+		found := Photo{}
+		require.NoError(t, UnscopedDb().Where("id = ?", photo.ID).First(&found).Error)
+		assert.Greater(t, found.TakenAt.Year(), 2000)
+		assert.Greater(t, found.TakenAtLocal.Year(), 2000)
+	})
+	t.Run("ColumnUpdate", func(t *testing.T) {
+		fixture := PhotoFixtures.Get("Photo04")
+		title := fixture.PhotoTitle
+		t.Cleanup(func() {
+			_ = UnscopedDb().Model(&Photo{}).Where("id = ?", fixture.ID).UpdateColumn("photo_title", title).Error
+		})
+
+		require.NoError(t, UnscopedDb().Model(&Photo{}).Where("id = ?", fixture.ID).Update("photo_title", "BeforeSave").Error)
+
+		found := Photo{}
+		require.NoError(t, UnscopedDb().Where("id = ?", fixture.ID).First(&found).Error)
+		assert.Equal(t, "BeforeSave", found.PhotoTitle)
+		assert.True(t, fixture.TakenAt.Equal(found.TakenAt), "taken_at changed to %s", found.TakenAt)
+		assert.True(t, fixture.TakenAtLocal.Equal(found.TakenAtLocal), "taken_at_local changed to %s", found.TakenAtLocal)
+	})
+	t.Run("StructUpdate", func(t *testing.T) {
+		fixture := PhotoFixtures.Get("Photo04")
+		title := fixture.PhotoTitle
+		t.Cleanup(func() {
+			_ = UnscopedDb().Model(&Photo{}).Where("id = ?", fixture.ID).UpdateColumn("photo_title", title).Error
+		})
+
+		require.NoError(t, UnscopedDb().Model(&Photo{}).Where("id = ?", fixture.ID).Updates(Photo{PhotoTitle: "BeforeSave"}).Error)
+
+		found := Photo{}
+		require.NoError(t, UnscopedDb().Where("id = ?", fixture.ID).First(&found).Error)
+		assert.Equal(t, "BeforeSave", found.PhotoTitle)
+		assert.True(t, fixture.TakenAt.Equal(found.TakenAt), "taken_at changed to %s", found.TakenAt)
 	})
 }
 
@@ -348,9 +1125,29 @@ func TestFindPhoto(t *testing.T) {
 		assert.NotNil(t, FindPhoto(photo))
 	})
 	t.Run("Found", func(t *testing.T) {
-		photo := Photo{PhotoUID: "pt9jtdre2lvl0yh0"}
+		photo := Photo{PhotoUID: "ps6sg6be2lvl0yh0"}
 		assert.NotNil(t, photo.Find())
 		assert.NotNil(t, FindPhoto(photo))
+	})
+	t.Run("DeletedLabel", func(t *testing.T) {
+		photo := NewPhoto(false)
+		require.NoError(t, photo.Save())
+		label := NewLabel("Deleted Preload "+rnd.GenerateUID('l'), 0)
+		require.NoError(t, label.Create())
+		require.NoError(t, NewPhotoLabel(photo.ID, label.ID, 10, SrcManual).Create())
+		t.Cleanup(func() {
+			UnscopedDb().Delete(&PhotoLabel{}, "photo_id = ?", photo.ID)
+			UnscopedDb().Delete(&Details{}, "photo_id = ?", photo.ID)
+			UnscopedDb().Delete(&photo)
+			UnscopedDb().Delete(label)
+		})
+		require.NoError(t, UnscopedDb().Model(label).UpdateColumn("deleted_at", Now()).Error)
+
+		found := FindPhoto(photo)
+		require.NotNil(t, found)
+		require.Len(t, found.Labels, 1)
+		assert.Nil(t, found.Labels[0].Label, "soft-deleted labels are not loaded")
+		assert.NotContains(t, found.LabelKeywords(), "preload")
 	})
 	t.Run("EmptyStruct", func(t *testing.T) {
 		photo := Photo{}
@@ -363,9 +1160,13 @@ func TestFindPhoto(t *testing.T) {
 		assert.Nil(t, photo.Find())
 	})
 	t.Run("InvalidUID", func(t *testing.T) {
-		photo := Photo{PhotoUID: "pt9jtdre2lvl0iuj"}
+		photo := Photo{PhotoUID: "ps6sg6be2lvl0iuj"}
 		assert.Nil(t, FindPhoto(photo))
 		assert.Nil(t, photo.Find())
+	})
+	t.Run("FindByID", func(t *testing.T) {
+		photo := Photo{ID: 1000001}
+		assert.NotNil(t, FindPhoto(photo))
 	})
 }
 
@@ -388,38 +1189,196 @@ func TestPhoto_RemoveKeyword(t *testing.T) {
 	})
 }
 
-func TestPhoto_SyncKeywordLabels(t *testing.T) {
-	t.Run("Ok", func(t *testing.T) {
-		keyword := Keyword{Keyword: "snake"}
-		keyword2 := Keyword{Keyword: "otter"}
-		keywords := []Keyword{keyword, keyword2}
-		label := Label{LabelName: "otter", LabelSlug: "otter"}
-		var deleteTime = time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC)
-		label2 := Label{LabelName: "snake", LabelSlug: "snake", DeletedAt: &deleteTime}
-		photo := &Photo{ID: 34567, Keywords: keywords}
-		err := photo.Save()
+func TestPhoto_UpdateLabels(t *testing.T) {
+	t.Run("Success", func(t *testing.T) {
+		labelNative := Label{LabelName: "Native", LabelSlug: "native"}
+		var deletedTime = time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC)
+		labelWindow := Label{LabelName: "Window", LabelSlug: "window", DeletedAt: DeletedAtTime(deletedTime)}
+
+		err := labelWindow.Save()
 		if err != nil {
 			t.Fatal(err)
 		}
-		err = label.Save()
+
+		err = labelNative.Save()
 		if err != nil {
 			t.Fatal(err)
 		}
-		err = label2.Save()
+
+		details := &Details{
+			Subject:     "native",
+			SubjectSrc:  SrcMeta,
+			Keywords:    "cow, flower, snake, otter",
+			KeywordsSrc: SrcMeta,
+		}
+		photo := Photo{ID: 134567, PhotoTitle: "Cat in the House", Details: details}
+
+		err = photo.Save()
 		if err != nil {
 			t.Fatal(err)
 		}
-		err = photo.SyncKeywordLabels()
+
+		p := FindPhoto(photo)
+
+		assert.Equal(t, 0, len(p.Labels))
+
+		err = p.UpdateLabels()
 		if err != nil {
 			t.Fatal(err)
 		}
-		assert.Equal(t, 2, len(photo.Keywords))
+
+		p = FindPhoto(*p)
+
+		assert.Equal(t, 25, len(p.Details.Keywords))
+		assert.Equal(t, 3, len(p.Labels))
+	})
+}
+
+func TestPhoto_SubjectNames(t *testing.T) {
+	t.Run("Photo09", func(t *testing.T) {
+		m := PhotoFixtures.Get("Photo09")
+
+		if names := m.SubjectNames(); len(names) > 0 {
+			t.Errorf("no name expected: %#v", names)
+		}
+	})
+	t.Run("Photo10", func(t *testing.T) {
+		m := PhotoFixtures.Get("Photo10")
+
+		if names := m.SubjectNames(); len(names) == 1 {
+			assert.Equal(t, "Actor A", names[0])
+		} else {
+			t.Logf("unstable subject list: %#v", names)
+		}
+	})
+	t.Run("Photo04", func(t *testing.T) {
+		m := PhotoFixtures.Get("Photo04")
+
+		if names := m.SubjectNames(); len(names) != 2 {
+			t.Errorf("two names expected: %#v", names)
+		} else {
+			assert.Equal(t, []string{"Corn McCornface", "Jens Mander"}, names)
+		}
+	})
+}
+
+func TestPhoto_UpdateSubjectLabels(t *testing.T) {
+	labelEgg := Label{LabelName: "Egg", LabelSlug: "egg"}
+	var deletedTime = time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC)
+	labelBird := Label{LabelName: "Bird", LabelSlug: "bird", DeletedAt: DeletedAtTime(deletedTime)}
+
+	if err := labelBird.Save(); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := labelEgg.Save(); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Run(`Success`, func(t *testing.T) {
+		details := &Details{Subject: "cow, egg, bird", SubjectSrc: SrcMeta}
+		photo := Photo{ID: 334567, TitleSrc: SrcName, Details: details}
+
+		if err := photo.Save(); err != nil {
+			t.Fatal(err)
+		}
+
+		p := FindPhoto(photo)
+
+		assert.Equal(t, 0, len(p.Labels))
+
+		if err := p.UpdateSubjectLabels(); err != nil {
+			t.Fatal(err)
+		}
+
+		p = FindPhoto(*p)
+
+		assert.Equal(t, "cow, egg, bird", p.Details.Subject)
+		assert.Equal(t, 2, len(p.Labels))
+	})
+	t.Run("EmptySubject", func(t *testing.T) {
+		details := &Details{Subject: "", SubjectSrc: SrcMeta}
+		photo := Photo{ID: 334568, TitleSrc: SrcName, Details: details}
+
+		if err := photo.Save(); err != nil {
+			t.Fatal(err)
+		}
+
+		p := FindPhoto(photo)
+
+		assert.Equal(t, 0, len(p.Labels))
+
+		if err := p.UpdateSubjectLabels(); err != nil {
+			t.Fatal(err)
+		}
+
+		p = FindPhoto(*p)
+
+		assert.Equal(t, "", p.Details.Subject)
+		assert.Equal(t, 0, len(p.Labels))
+	})
+}
+
+func TestPhoto_UpdateKeywordLabels(t *testing.T) {
+	labelOtter := Label{LabelName: "Otter", LabelSlug: "otter"}
+	var deletedTime = time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC)
+	labelSnake := Label{LabelName: "Snake", LabelSlug: "snake", DeletedAt: DeletedAtTime(deletedTime)}
+
+	if err := labelSnake.Save(); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := labelOtter.Save(); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Run("Success", func(t *testing.T) {
+		details := &Details{Keywords: "cow, flower, snake, otter", KeywordsSrc: SrcAuto}
+		photo := Photo{ID: 434567, Details: details}
+
+		if err := photo.Save(); err != nil {
+			t.Fatal(err)
+		}
+
+		p := FindPhoto(photo)
+
+		assert.Equal(t, 0, len(p.Labels))
+
+		if err := p.UpdateKeywordLabels(); err != nil {
+			t.Fatal(err)
+		}
+
+		p = FindPhoto(*p)
+
+		assert.Equal(t, "cow, flower, snake, otter", p.Details.Keywords)
+		assert.Equal(t, 3, len(p.Labels))
+	})
+	t.Run("EmptyKeywords", func(t *testing.T) {
+		details := &Details{Keywords: "", KeywordsSrc: SrcAuto}
+		photo := Photo{ID: 434568, Details: details}
+
+		if err := photo.Save(); err != nil {
+			t.Fatal(err)
+		}
+
+		p := FindPhoto(photo)
+
+		assert.Equal(t, 0, len(p.Labels))
+
+		if err := p.UpdateKeywordLabels(); err != nil {
+			t.Fatal(err)
+		}
+
+		p = FindPhoto(*p)
+
+		assert.Equal(t, "", p.Details.Keywords)
+		assert.Equal(t, 0, len(p.Labels))
 	})
 }
 
 func TestPhoto_LocationLoaded(t *testing.T) {
 	t.Run("Photo", func(t *testing.T) {
-		photo := Photo{PhotoUID: "56798", PhotoName: "Holiday", OriginalName: "holidayOriginal2"}
+		photo := Photo{PhotoUID: rnd.GenerateUID(PhotoUID), PhotoName: "Holiday", OriginalName: "holidayOriginal2"}
 		assert.False(t, photo.LocationLoaded())
 	})
 	t.Run("PhotoWithCell", func(t *testing.T) {
@@ -450,7 +1409,7 @@ func TestPhoto_LoadLocation(t *testing.T) {
 
 func TestPhoto_PlaceLoaded(t *testing.T) {
 	t.Run("False", func(t *testing.T) {
-		photo := Photo{PhotoUID: "56798", PhotoName: "Holiday", OriginalName: "holidayOriginal2"}
+		photo := Photo{PhotoUID: rnd.GenerateUID(PhotoUID), PhotoName: "Holiday", OriginalName: "holidayOriginal2"}
 		assert.False(t, photo.PlaceLoaded())
 	})
 }
@@ -470,28 +1429,6 @@ func TestPhoto_LoadPlace(t *testing.T) {
 	})
 }
 
-func TestPhoto_HasDescription(t *testing.T) {
-	t.Run("False", func(t *testing.T) {
-		photo := Photo{PhotoDescription: ""}
-		assert.False(t, photo.HasDescription())
-	})
-	t.Run("True", func(t *testing.T) {
-		photo := Photo{PhotoDescription: "bcss"}
-		assert.True(t, photo.HasDescription())
-	})
-}
-
-func TestPhoto_NoDescription(t *testing.T) {
-	t.Run("True", func(t *testing.T) {
-		photo := Photo{PhotoDescription: ""}
-		assert.True(t, photo.NoDescription())
-	})
-	t.Run("False", func(t *testing.T) {
-		photo := Photo{PhotoDescription: "bcss"}
-		assert.False(t, photo.NoDescription())
-	})
-}
-
 func TestPhoto_AllFilesMissing(t *testing.T) {
 	t.Run("True", func(t *testing.T) {
 		photo := Photo{ID: 6969866}
@@ -501,21 +1438,21 @@ func TestPhoto_AllFilesMissing(t *testing.T) {
 
 func TestPhoto_Updates(t *testing.T) {
 	t.Run("Ok", func(t *testing.T) {
-		photo := Photo{PhotoDescription: "bcss", PhotoName: "InitialName"}
+		photo := Photo{PhotoCaption: "bcss", PhotoName: "InitialName"}
 
 		if err := photo.Save(); err != nil {
 			t.Fatal(err)
 		}
 
 		assert.Equal(t, "InitialName", photo.PhotoName)
-		assert.Equal(t, "bcss", photo.PhotoDescription)
+		assert.Equal(t, "bcss", photo.PhotoCaption)
 
-		if err := photo.Updates(Photo{PhotoName: "UpdatedName", PhotoDescription: "UpdatedDesc"}); err != nil {
+		if err := photo.Updates(Photo{PhotoName: "UpdatedName", PhotoCaption: "UpdatedDesc"}); err != nil {
 			t.Fatal(err)
 		}
 
 		assert.Equal(t, "UpdatedName", photo.PhotoName)
-		assert.Equal(t, "UpdatedDesc", photo.PhotoDescription)
+		assert.Equal(t, "UpdatedDesc", photo.PhotoCaption)
 
 	})
 }
@@ -587,29 +1524,125 @@ func TestPhoto_Approve(t *testing.T) {
 			t.Fatal(err)
 		}
 
+		assert.False(t, photo.Approved())
+
 		if err := photo.Approve(); err != nil {
 			t.Fatal(err)
 		}
 
 		assert.Equal(t, 3, photo.PhotoQuality)
+		assert.True(t, photo.Approved())
+	})
+	t.Run("NoID", func(t *testing.T) {
+		photo := Photo{PhotoUID: ""}
+
+		assert.False(t, photo.Approved())
+
+		assert.Error(t, photo.Approve())
 	})
 }
 
 func TestPhoto_Links(t *testing.T) {
 	t.Run("OneResult", func(t *testing.T) {
-		photo := Photo{PhotoUID: "pt9k3pw1wowuy3c3"}
+		photo := Photo{PhotoUID: "ps6sg6b1wowuy3c3"}
 		links := photo.Links()
 		assert.Equal(t, "7jxf3jfn2k", links[0].LinkToken)
 	})
 }
 
 func TestPhoto_SetPrimary(t *testing.T) {
-	t.Run("Ok", func(t *testing.T) {
+	t.Run("NoChange", func(t *testing.T) {
 		m := PhotoFixtures.Get("19800101_000002_D640C559")
+
+		f1, err := m.PrimaryFile()
+
+		if err != nil {
+			t.Fatal(err)
+		}
 
 		if err := m.SetPrimary(""); err != nil {
 			t.Fatal(err)
 		}
+
+		f2, err := m.PrimaryFile()
+
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		assert.Equal(t, f1, f2)
+	})
+	t.Run("ChangePrimary", func(t *testing.T) {
+		m := PhotoFixtures.Get("Photo06")
+
+		f1, err := m.PrimaryFile()
+
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		assert.NotEqual(t, f1.FileUID, "fs6sg6bqhhinlplo")
+
+		if err := m.SetPrimary("fs6sg6bqhhinlplo"); err != nil {
+			t.Fatal(err)
+		}
+
+		f2, err := m.PrimaryFile()
+
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		assert.Equal(t, f2.FileUID, "fs6sg6bqhhinlplo")
+
+		if err2 := m.SetPrimary("fs6sg6bqhhinlplp"); err2 != nil {
+			t.Fatal(err2)
+		}
+
+		f3, err3 := m.PrimaryFile()
+
+		if err3 != nil {
+			t.Fatal(err3)
+		}
+
+		assert.Equal(t, f3.FileUID, "fs6sg6bqhhinlplp")
+	})
+	t.Run("PhotoUIDEmpty", func(t *testing.T) {
+		m := Photo{}
+
+		err := m.SetPrimary("")
+		assert.Error(t, err)
+	})
+	t.Run("NoPreviewImage", func(t *testing.T) {
+		m := Photo{PhotoUID: rnd.GenerateUID(PhotoUID)}
+
+		err := m.SetPrimary("")
+		assert.Error(t, err)
+	})
+	t.Run("UpdateQualityErrorIsNonFatal", func(t *testing.T) {
+		originalProvider := dbConn
+		tempConn := &DbConn{
+			Driver: dsn.DriverSQLite3,
+			Dsn:    fmt.Sprintf("%s/%s", t.TempDir(), "set-primary-quality-error.db"),
+		}
+
+		SetDbProvider(tempConn)
+		t.Cleanup(func() {
+			SetDbProvider(originalProvider)
+			tempConn.Close()
+		})
+
+		require.NoError(t, tempConn.Db().AutoMigrate(&File{}))
+
+		m := Photo{
+			ID:           1001,
+			PhotoUID:     rnd.GenerateUID(PhotoUID),
+			PhotoQuality: -1,
+		}
+
+		err := m.SetPrimary("fs-test-primary")
+		require.NoError(t, err)
+		assert.GreaterOrEqual(t, m.PhotoQuality, 0)
 	})
 }
 
@@ -621,10 +1654,12 @@ func TestNewPhoto(t *testing.T) {
 	t.Run("Stackable", func(t *testing.T) {
 		m := NewPhoto(true)
 		assert.Equal(t, IsStackable, m.PhotoStack)
+		assert.Equal(t, tz.Local, m.TimeZone)
 	})
 	t.Run("NotStackable", func(t *testing.T) {
 		m := NewPhoto(false)
 		assert.Equal(t, IsUnstacked, m.PhotoStack)
+		assert.Equal(t, tz.Local, m.TimeZone)
 	})
 }
 
@@ -665,35 +1700,35 @@ func TestPhoto_FirstOrCreate(t *testing.T) {
 }
 
 func TestPhoto_UnknownCamera(t *testing.T) {
-	t.Run("true", func(t *testing.T) {
+	t.Run("True", func(t *testing.T) {
 		photo := Photo{}
 		assert.True(t, photo.UnknownCamera())
 	})
-	t.Run("false", func(t *testing.T) {
+	t.Run("False", func(t *testing.T) {
 		photo := Photo{CameraID: 100000}
 		assert.False(t, photo.UnknownCamera())
 	})
 }
 
 func TestPhoto_UnknownLens(t *testing.T) {
-	t.Run("true", func(t *testing.T) {
+	t.Run("True", func(t *testing.T) {
 		photo := Photo{}
 		assert.True(t, photo.UnknownLens())
 	})
-	t.Run("false", func(t *testing.T) {
+	t.Run("False", func(t *testing.T) {
 		photo := Photo{LensID: 100000}
 		assert.False(t, photo.UnknownLens())
 	})
 }
 
 func TestPhoto_UpdateDateFields(t *testing.T) {
-	t.Run("year < 1000", func(t *testing.T) {
+	t.Run("YearTooSmall", func(t *testing.T) {
 		photo := &Photo{TakenAt: time.Date(900, 11, 11, 9, 7, 18, 0, time.UTC)}
 		photo.UpdateDateFields()
 		assert.Equal(t, time.Date(900, 11, 11, 9, 7, 18, 0, time.UTC), photo.TakenAt)
 		assert.Empty(t, photo.TakenAtLocal)
 	})
-	t.Run("set to unknown", func(t *testing.T) {
+	t.Run("SetToUnknown", func(t *testing.T) {
 		photo := &Photo{TakenAt: time.Date(1900, 11, 11, 9, 7, 18, 0, time.UTC), TakenSrc: SrcAuto, CreatedAt: time.Date(1900, 11, 11, 5, 7, 18, 0, time.UTC)}
 		photo.UpdateDateFields()
 		assert.Equal(t, UnknownYear, photo.PhotoYear)
@@ -701,18 +1736,18 @@ func TestPhoto_UpdateDateFields(t *testing.T) {
 }
 
 func TestPhoto_SetCamera(t *testing.T) {
-	t.Run("camera nil", func(t *testing.T) {
+	t.Run("CameraNil", func(t *testing.T) {
 		photo := &Photo{}
 		photo.SetCamera(nil, SrcAuto)
 		assert.Empty(t, photo.Camera)
 	})
-	t.Run("camera unknown", func(t *testing.T) {
+	t.Run("CameraUnknown", func(t *testing.T) {
 		photo := &Photo{}
 		camera := &Camera{CameraSlug: ""}
 		photo.SetCamera(camera, SrcAuto)
 		assert.Empty(t, photo.Camera)
 	})
-	t.Run("do not overwrite manual changes", func(t *testing.T) {
+	t.Run("DoNotOverwriteManualChanges", func(t *testing.T) {
 		cameraOld := &Camera{CameraSlug: "OldCamera", ID: 10000000111}
 		photo := &Photo{CameraSrc: SrcManual, Camera: cameraOld, CameraID: 10000000111}
 		assert.Equal(t, "OldCamera", photo.Camera.CameraSlug)
@@ -722,7 +1757,7 @@ func TestPhoto_SetCamera(t *testing.T) {
 		photo.SetCamera(camera, SrcAuto)
 		assert.Equal(t, "OldCamera", photo.Camera.CameraSlug)
 	})
-	t.Run("set new camera", func(t *testing.T) {
+	t.Run("SetNewCamera", func(t *testing.T) {
 		cameraOld := &Camera{CameraSlug: "OldCamera", ID: 10000000111}
 		photo := &Photo{CameraSrc: SrcAuto, Camera: cameraOld, CameraID: 10000000111}
 		assert.Equal(t, "OldCamera", photo.Camera.CameraSlug)
@@ -730,21 +1765,31 @@ func TestPhoto_SetCamera(t *testing.T) {
 		photo.SetCamera(camera, SrcMeta)
 		assert.Equal(t, "NewCamera", photo.Camera.CameraSlug)
 	})
+	t.Run("Scanner", func(t *testing.T) {
+		cameraOld := &Camera{CameraSlug: "OldCamera", ID: 10000000111}
+		photo := &Photo{CameraSrc: SrcAuto, Camera: cameraOld, CameraID: 10000000111}
+		assert.Equal(t, "OldCamera", photo.Camera.CameraSlug)
+		assert.False(t, photo.PhotoScan)
+		camera := &Camera{CameraSlug: "MSscanner"}
+		photo.SetCamera(camera, SrcMeta)
+		assert.Equal(t, "MSscanner", photo.Camera.CameraSlug)
+		assert.True(t, photo.PhotoScan)
+	})
 }
 
 func TestPhoto_SetLens(t *testing.T) {
-	t.Run("lens nil", func(t *testing.T) {
+	t.Run("LensNil", func(t *testing.T) {
 		photo := &Photo{}
 		photo.SetLens(nil, SrcAuto)
 		assert.Empty(t, photo.Lens)
 	})
-	t.Run("lens unknown", func(t *testing.T) {
+	t.Run("LensUnknown", func(t *testing.T) {
 		photo := &Photo{}
 		lens := &Lens{LensSlug: ""}
 		photo.SetLens(lens, SrcAuto)
 		assert.Empty(t, photo.Lens)
 	})
-	t.Run("do not overwrite manual changes", func(t *testing.T) {
+	t.Run("DoNotOverwriteManualChanges", func(t *testing.T) {
 		lensOld := &Lens{LensSlug: "OldLens", ID: 10000000111}
 		photo := &Photo{CameraSrc: SrcManual, Lens: lensOld, LensID: 10000000111}
 		assert.Equal(t, "OldLens", photo.Lens.LensSlug)
@@ -752,7 +1797,7 @@ func TestPhoto_SetLens(t *testing.T) {
 		photo.SetLens(lens, SrcAuto)
 		assert.Equal(t, "OldLens", photo.Lens.LensSlug)
 	})
-	t.Run("set new camera", func(t *testing.T) {
+	t.Run("SetNewLens", func(t *testing.T) {
 		lensOld := &Lens{LensSlug: "OldLens", ID: 10000000111}
 		photo := &Photo{CameraSrc: SrcAuto, Lens: lensOld, LensID: 10000000111}
 		assert.Equal(t, "OldLens", photo.Lens.LensSlug)
@@ -763,7 +1808,7 @@ func TestPhoto_SetLens(t *testing.T) {
 }
 
 func TestPhoto_SetExposure(t *testing.T) {
-	t.Run("changes have priority", func(t *testing.T) {
+	t.Run("Priority", func(t *testing.T) {
 		photo := &Photo{PhotoFocalLength: 5, PhotoFNumber: 3, PhotoIso: 300, PhotoExposure: "45", CameraSrc: SrcMeta}
 		photo.SetExposure(8, 9, 500, "66", SrcManual)
 		assert.Equal(t, 8, photo.PhotoFocalLength)
@@ -771,7 +1816,7 @@ func TestPhoto_SetExposure(t *testing.T) {
 		assert.Equal(t, 500, photo.PhotoIso)
 		assert.Equal(t, "66", photo.PhotoExposure)
 	})
-	t.Run("changes have no priority", func(t *testing.T) {
+	t.Run("NoPriority", func(t *testing.T) {
 		photo := &Photo{PhotoFocalLength: 5, PhotoFNumber: 3, PhotoIso: 300, PhotoExposure: "45", CameraSrc: SrcManual}
 		photo.SetExposure(8, 9, 500, "66", SrcMeta)
 		assert.Equal(t, 5, photo.PhotoFocalLength)
@@ -779,24 +1824,37 @@ func TestPhoto_SetExposure(t *testing.T) {
 		assert.Equal(t, 300, photo.PhotoIso)
 		assert.Equal(t, "45", photo.PhotoExposure)
 	})
+	t.Run("ValidRange", func(t *testing.T) {
+		photo := &Photo{}
+		photo.SetExposure(256000, 256000, 256000, "256000", SrcManual)
+		assert.Equal(t, 0, photo.PhotoFocalLength)
+		assert.Equal(t, float32(0), photo.PhotoFNumber)
+		assert.Equal(t, 0, photo.PhotoIso)
+		assert.Equal(t, "256000", photo.PhotoExposure)
+		photo.SetExposure(1, 1, 1, "1", SrcManual)
+		assert.Equal(t, 1, photo.PhotoFocalLength)
+		assert.Equal(t, float32(1), photo.PhotoFNumber)
+		assert.Equal(t, 1, photo.PhotoIso)
+		assert.Equal(t, "1", photo.PhotoExposure)
+	})
 }
 
 func TestPhoto_AllFiles(t *testing.T) {
-	t.Run("photo with files", func(t *testing.T) {
+	t.Run("PhotoWithFiles", func(t *testing.T) {
 		m := PhotoFixtures.Get("Photo01")
 		files := m.AllFiles()
 		assert.Equal(t, 2, len(files))
 	})
-	t.Run("photo without files", func(t *testing.T) {
+	t.Run("PhotoWithoutFiles", func(t *testing.T) {
 		m := &Photo{ID: 100000023456}
 		files := m.AllFiles()
 		assert.Equal(t, 0, len(files))
 	})
 }
 
-func TestPhoto_Archive(t *testing.T) {
-	t.Run("archive not yet archived photo", func(t *testing.T) {
-		m := &Photo{PhotoTitle: "HappyLilly"}
+func TestPhoto_ArchiveRestore(t *testing.T) {
+	t.Run("NotYetArchived", func(t *testing.T) {
+		m := &Photo{ID: 10000, PhotoUID: "prjwufg1z97rcxff", PhotoTitle: "HappyLilly"}
 		assert.Empty(t, m.DeletedAt)
 		err := m.Archive()
 		if err != nil {
@@ -809,16 +1867,131 @@ func TestPhoto_Archive(t *testing.T) {
 		}
 		assert.Empty(t, m.DeletedAt)
 	})
+	t.Run("AlreadyArchived", func(t *testing.T) {
+		var deletedTime = time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC)
+		m := &Photo{ID: 10000, PhotoUID: "prjwufg1z97rcxff", PhotoTitle: "HappyLilly", DeletedAt: DeletedAtTime(deletedTime)}
+		assert.NotEmpty(t, m.DeletedAt)
+		err := m.Archive()
+		if err != nil {
+			t.Fatal(err)
+		}
+		assert.NotEmpty(t, m.DeletedAt)
+		err = m.Restore()
+		if err != nil {
+			t.Fatal(err)
+		}
+		assert.Empty(t, m.DeletedAt)
+	})
+	t.Run("NoID", func(t *testing.T) {
+		m := &Photo{PhotoTitle: "HappyLilly"}
+		err := m.Archive()
+		assert.Error(t, err)
+		err = m.Restore()
+		assert.Error(t, err)
+	})
+}
+
+func TestPhoto_IsArchived(t *testing.T) {
+	deletedAt := time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC)
+
+	t.Run("Archived", func(t *testing.T) {
+		assert.True(t, (&Photo{DeletedAt: DeletedAtTime(deletedAt)}).IsArchived())
+		assert.True(t, (&Photo{DeletedAt: DeletedAtTime(deletedAt), PhotoQuality: 3}).IsArchived())
+	})
+	t.Run("NotArchived", func(t *testing.T) {
+		assert.False(t, (&Photo{}).IsArchived())
+		assert.False(t, (&Photo{PhotoQuality: 3}).IsArchived())
+	})
+	t.Run("Removed", func(t *testing.T) {
+		assert.False(t, (&Photo{DeletedAt: DeletedAtTime(deletedAt), PhotoQuality: -1}).IsArchived())
+		assert.False(t, (&Photo{PhotoQuality: -1}).IsArchived())
+	})
+	t.Run("Nil", func(t *testing.T) {
+		var m *Photo
+		assert.False(t, m.IsArchived())
+	})
 }
 
 func TestPhoto_SetCameraSerial(t *testing.T) {
-	m := &Photo{}
-	assert.Empty(t, m.CameraSerial)
-	m.SetCameraSerial("abcCamera")
-	assert.Equal(t, "abcCamera", m.CameraSerial)
+	t.Run("Success", func(t *testing.T) {
+		m := &Photo{}
+		assert.Empty(t, m.CameraSerial)
+		m.SetCameraSerial("abcCamera")
+		assert.Equal(t, "abcCamera", m.CameraSerial)
+	})
+	t.Run("MultiByteClippedOnRuneBoundary", func(t *testing.T) {
+		// camera_serial is VARBINARY(160), so a long multi-byte value must be byte-clipped
+		// without splitting a rune, keeping the stored value within budget and valid UTF-8.
+		m := &Photo{}
+		m.SetCameraSerial(strings.Repeat("世", 100)) // 100 runes x 3 bytes = 300 bytes.
+		assert.NotEmpty(t, m.CameraSerial)
+		assert.LessOrEqual(t, len(m.CameraSerial), txt.ClipDefault)
+		assert.True(t, utf8.ValidString(m.CameraSerial))
+	})
+}
+
+func TestPhoto_SetDocumentID(t *testing.T) {
+	t.Run("Stored", func(t *testing.T) {
+		m := &Photo{}
+		m.SetDocumentID("adobe:docid:photoshop:7d592d87-eb1e-1040-809a-e16c6b85b3fd")
+		assert.Equal(t, "adobe:docid:photoshop:7d592d87-eb1e-1040-809a-e16c6b85b3fd", m.UUID)
+	})
+	t.Run("EmptyKeepsCurrent", func(t *testing.T) {
+		m := &Photo{UUID: "xmp.did:keep"}
+		m.SetDocumentID("")
+		assert.Equal(t, "xmp.did:keep", m.UUID)
+	})
+	t.Run("OversizeClippedOnRuneBoundary", func(t *testing.T) {
+		// photos.uuid is VARBINARY(255), so an oversized multi-byte DocumentID must be
+		// clipped on a rune boundary, keeping the stored value within budget and valid UTF-8.
+		m := &Photo{}
+		m.SetDocumentID(strings.Repeat("世", 100)) // 100 runes x 3 bytes = 300 bytes.
+		assert.NotEmpty(t, m.UUID)
+		assert.LessOrEqual(t, len(m.UUID), UUIDBytes)
+		assert.True(t, utf8.ValidString(m.UUID))
+	})
 }
 
 func TestPhoto_MapKey(t *testing.T) {
 	m := &Photo{TakenAt: time.Date(2016, 11, 11, 9, 7, 18, 0, time.UTC), CellID: "abc236"}
 	assert.Equal(t, "ogh006/abc236", m.MapKey())
+}
+
+func TestPhoto_FaceCount(t *testing.T) {
+	t.Run("Photo04", func(t *testing.T) {
+		m := PhotoFixtures.Get("Photo04")
+		assert.Equal(t, 3, m.FaceCount())
+	})
+}
+
+func TestPhoto_Indexed(t *testing.T) {
+	t.Run("Success", func(t *testing.T) {
+		photo := Photo{}
+		assert.True(t, photo.IsNewlyIndexed())
+		photo.Indexed()
+		assert.False(t, photo.IsNewlyIndexed())
+		assert.IsType(t, &time.Time{}, photo.IndexedAt)
+	})
+}
+
+func TestPhoto_IsNewlyIndexed(t *testing.T) {
+	t.Run("ChangeStatus", func(t *testing.T) {
+		photo := Photo{IndexedAt: nil}
+		assert.True(t, photo.IsNewlyIndexed())
+		photo.Indexed()
+		assert.False(t, photo.IsNewlyIndexed())
+	})
+	t.Run("ZeroTimestamp", func(t *testing.T) {
+		zero := time.Time{}
+		photo := Photo{IndexedAt: &zero}
+		assert.True(t, photo.IsNewlyIndexed())
+	})
+	t.Run("HasIndexedAt", func(t *testing.T) {
+		photo := Photo{IndexedAt: TimeStamp()}
+		assert.False(t, photo.IsNewlyIndexed())
+	})
+	t.Run("HasDeletedAt", func(t *testing.T) {
+		photo := Photo{IndexedAt: nil, DeletedAt: DeletedAtTime(*TimeStamp())}
+		assert.False(t, photo.IsNewlyIndexed())
+	})
 }

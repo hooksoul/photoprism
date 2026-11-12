@@ -7,17 +7,19 @@ import (
 
 	"github.com/dustin/go-humanize/english"
 
-	"github.com/photoprism/photoprism/internal/classify"
-	"github.com/photoprism/photoprism/internal/maps"
+	"github.com/photoprism/photoprism/internal/ai/classify"
+	"github.com/photoprism/photoprism/internal/service/maps"
 	"github.com/photoprism/photoprism/pkg/clean"
 	"github.com/photoprism/photoprism/pkg/geo"
+	"github.com/photoprism/photoprism/pkg/time/tz"
 	"github.com/photoprism/photoprism/pkg/txt"
-	"gopkg.in/photoprism/go-tz.v2/tz"
 )
 
-// SetCoordinates changes the photo lat, lng and altitude if not empty and from an acceptable source.
-func (m *Photo) SetCoordinates(lat, lng float32, altitude float64, source string) {
+// SetCoordinates updates latitude/longitude while honoring source priority and keeping altitude in sync.
+func (m *Photo) SetCoordinates(lat, lng, altitude float64, source string) {
 	m.SetAltitude(altitude, source)
+
+	lat, lng, _ = geo.NormalizeCoordinateBounds(lat, lng)
 
 	if lat == 0.0 && lng == 0.0 {
 		return
@@ -32,7 +34,7 @@ func (m *Photo) SetCoordinates(lat, lng float32, altitude float64, source string
 	m.PlaceSrc = source
 }
 
-// SetAltitude sets the photo altitude if not empty and from an acceptable source.
+// SetAltitude updates the stored altitude when the new value passes cleanup and the source outranks the current one.
 func (m *Photo) SetAltitude(altitude float64, source string) {
 	a := clean.Altitude(altitude)
 
@@ -52,23 +54,25 @@ func (m *Photo) UnknownLocation() bool {
 	return m.CellID == "" || m.CellID == UnknownLocation.ID || m.NoLatLng()
 }
 
-// SetPosition sets a position estimate.
+// SetPosition records an estimated position, randomizing estimates slightly and refreshing location metadata.
 func (m *Photo) SetPosition(pos geo.Position, source string, force bool) {
+	pos.Lat, pos.Lng, _ = geo.NormalizeCoordinateBounds(pos.Lat, pos.Lng)
+
 	if SrcPriority[m.PlaceSrc] > SrcPriority[source] && !force {
 		return
 	} else if pos.Lat == 0 && pos.Lng == 0 {
 		return
 	}
 
-	if m.CellID != UnknownID && pos.InRange(float64(m.PhotoLat), float64(m.PhotoLng), geo.Meter*50) {
+	if m.CellID != UnknownID && pos.InRange(m.PhotoLat, m.PhotoLng, geo.Meter*50) {
 		log.Debugf("photo: %s keeps position %f, %f", m.String(), m.PhotoLat, m.PhotoLng)
 	} else {
 		if pos.Estimate {
 			pos.Randomize(geo.Meter * 5)
 		}
 
-		m.PhotoLat = float32(pos.Lat)
-		m.PhotoLng = float32(pos.Lng)
+		m.PhotoLat = pos.Lat
+		m.PhotoLng = pos.Lng
 		m.PlaceSrc = source
 		m.CellAccuracy = pos.Accuracy
 		m.SetAltitude(pos.Altitude, source)
@@ -78,16 +82,18 @@ func (m *Photo) SetPosition(pos geo.Position, source string, force bool) {
 		m.UpdateLocation()
 
 		if m.Place == nil {
-			log.Warnf("photo: failed updating position of %s", m)
+			log.Warnf("photo: failed to update position of %s", m)
 		} else {
 			log.Debugf("photo: approximate place of %s is %s (id %s)", m, clean.Log(m.Place.Label()), m.PlaceID)
 		}
 	}
 }
 
-// AdoptPlace sets the place based on another photo.
-func (m *Photo) AdoptPlace(other Photo, source string, force bool) {
-	if SrcPriority[m.PlaceSrc] > SrcPriority[source] && !force {
+// AdoptPlace copies place metadata from another photo when the source priority allows it.
+func (m *Photo) AdoptPlace(other *Photo, source string, force bool) {
+	if other == nil {
+		return
+	} else if SrcPriority[m.PlaceSrc] > SrcPriority[source] && !force {
 		return
 	} else if other.Place == nil {
 		return
@@ -112,7 +118,7 @@ func (m *Photo) AdoptPlace(other Photo, source string, force bool) {
 	log.Debugf("photo: %s now located at %s (id %s)", m.String(), clean.Log(m.Place.Label()), m.PlaceID)
 }
 
-// RemoveLocation removes the current location.
+// RemoveLocation clears the current location metadata when the caller is authorized via source priority.
 func (m *Photo) RemoveLocation(source string, force bool) {
 	if SrcPriority[m.PlaceSrc] > SrcPriority[source] && !force {
 		return
@@ -138,10 +144,10 @@ func (m *Photo) RemoveLocation(source string, force bool) {
 	m.PlaceSrc = SrcAuto
 }
 
-// RemoveLocationLabels removes existing location labels.
+// RemoveLocationLabels removes labels created from prior location data to keep annotations consistent.
 func (m *Photo) RemoveLocationLabels() {
 	if len(m.Labels) == 0 {
-		res := Db().Delete(PhotoLabel{}, "photo_id = ? AND label_src = ?", m.ID, SrcLocation)
+		res := Db().Delete(&PhotoLabel{}, "photo_id = ? AND label_src = ?", m.ID, SrcLocation)
 
 		if res.Error != nil {
 			Log("photo", "remove location labels", res.Error)
@@ -196,7 +202,7 @@ func (m *Photo) LocationLoaded() bool {
 	return !m.Cell.Unknown() && m.Cell.ID == m.CellID
 }
 
-// LoadLocation loads the photo location from the database if not done already.
+// LoadLocation fetches the full Cell record (including Place) from the database when needed.
 func (m *Photo) LoadLocation() error {
 	if m.LocationLoaded() {
 		return nil
@@ -233,7 +239,7 @@ func (m *Photo) PlaceLoaded() bool {
 	return !m.Place.Unknown() && m.Place.ID == m.PlaceID
 }
 
-// LoadPlace loads the photo place from the database if not done already.
+// LoadPlace fetches the associated Place from the database when needed.
 func (m *Photo) LoadPlace() error {
 	if m.PlaceLoaded() {
 		return nil
@@ -259,7 +265,7 @@ func (m *Photo) LoadPlace() error {
 // Position returns the coordinates as geo.Position.
 func (m *Photo) Position() geo.Position {
 	return geo.Position{Name: m.String(), Time: m.TakenAt.UTC(),
-		Lat: float64(m.PhotoLat), Lng: float64(m.PhotoLng), Altitude: float64(m.PhotoAltitude)}
+		Lat: m.PhotoLat, Lng: m.PhotoLng, Altitude: float64(m.PhotoAltitude)}
 }
 
 // HasLatLng checks if the photo has a latitude and longitude.
@@ -292,22 +298,10 @@ func (m *Photo) UnknownCountry() bool {
 	return m.CountryCode() == UnknownCountry.ID
 }
 
-// GetTimeZone uses PhotoLat and PhotoLng to guess the time zone of the photo.
-func (m *Photo) GetTimeZone() string {
-	result := "UTC"
-
-	if m.HasLatLng() {
-		zones, err := tz.GetZone(tz.Point{
-			Lat: float64(m.PhotoLat),
-			Lon: float64(m.PhotoLng),
-		})
-
-		if err == nil && len(zones) > 0 {
-			result = zones[0]
-		}
-	}
-
-	return result
+// LocationTimeZone uses the GPS location to determine the time zone of the photo,
+// and returns "Local" if no location is set or no time zone is found.
+func (m *Photo) LocationTimeZone() string {
+	return tz.Position(m.PhotoLat, m.PhotoLng)
 }
 
 // CountryName returns the photo country name.
@@ -330,9 +324,9 @@ func (m *Photo) CountryCode() string {
 
 // GetTakenAt returns UTC time for TakenAtLocal.
 func (m *Photo) GetTakenAt() time.Time {
-	location, err := time.LoadLocation(m.TimeZone)
+	location := tz.Find(m.TimeZone)
 
-	if err != nil {
+	if location == nil {
 		return m.TakenAt
 	}
 
@@ -345,9 +339,9 @@ func (m *Photo) GetTakenAt() time.Time {
 
 // GetTakenAtLocal returns local time for TakenAt.
 func (m *Photo) GetTakenAtLocal() time.Time {
-	location, err := time.LoadLocation(m.TimeZone)
+	location := tz.Find(m.TimeZone)
 
-	if err != nil {
+	if location == tz.TimeLocal {
 		return m.TakenAtLocal
 	}
 
@@ -358,16 +352,21 @@ func (m *Photo) GetTakenAtLocal() time.Time {
 	}
 }
 
-// UpdateLocation updates location and labels based on latitude and longitude.
+// UpdateLocation resolves cells, places, time zones, and labels from the current coordinates.
 func (m *Photo) UpdateLocation() (keywords []string, labels classify.Labels) {
 	if m.HasLatLng() {
+		if lat, lng, changed := geo.NormalizeCoordinateBounds(m.PhotoLat, m.PhotoLng); changed {
+			m.PhotoLat = lat
+			m.PhotoLng = lng
+		}
+
 		var loc = NewCell(m.PhotoLat, m.PhotoLng)
 
 		if loc.Unknown() {
 			// Empty or unknown S2 cell id... should not happen, unless coordinates are invalid.
 			log.Warnf("photo: unknown cell id for lat %f, lng %f (uid %s)", m.PhotoLat, m.PhotoLng, m.PhotoUID)
 		} else if err := loc.Find(GeoApi); err != nil {
-			log.Errorf("photo: %s (find location)", err)
+			log.Warnf("photo: %s (find location)", err)
 		} else if loc.Place == nil {
 			log.Warnf("photo: failed fetching geo data (uid %s, cell %s)", m.PhotoUID, loc.ID)
 		} else if loc.ID != UnknownLocation.ID {
@@ -384,8 +383,9 @@ func (m *Photo) UpdateLocation() (keywords []string, labels classify.Labels) {
 			m.PlaceID = loc.PlaceID
 			m.PhotoCountry = loc.CountryCode()
 
-			if changed && m.TakenSrc != SrcManual {
-				m.UpdateTimeZone(m.GetTimeZone())
+			// Set time zone based on location.
+			if changed {
+				m.UpdateTimeZone(m.LocationTimeZone())
 			}
 
 			FirstOrCreateCountry(NewCountry(loc.CountryCode(), loc.CountryName()))
@@ -441,7 +441,7 @@ func (m *Photo) UpdateLocation() (keywords []string, labels classify.Labels) {
 	return keywords, labels
 }
 
-// SaveLocation updates location data and saves the photo metadata back to the index.
+// SaveLocation applies UpdateLocation, synchronizes derived labels/keywords, and persists the photo.
 func (m *Photo) SaveLocation() error {
 	locKeywords, labels := m.UpdateLocation()
 
@@ -452,11 +452,11 @@ func (m *Photo) SaveLocation() error {
 
 	m.GetDetails().Keywords = strings.Join(txt.UniqueWords(w), ", ")
 
-	if err := m.SyncKeywordLabels(); err != nil {
-		log.Errorf("photo: %s %s while syncing keywords and labels", m.String(), err)
+	if err := m.UpdateKeywordLabels(); err != nil {
+		log.Errorf("photo: %s %s while updating keyword labels", m.String(), err)
 	}
 
-	if err := m.UpdateTitle(m.ClassifyLabels()); err != nil {
+	if err := m.GenerateTitle(m.ClassifyLabels()); err != nil {
 		log.Info(err)
 	}
 

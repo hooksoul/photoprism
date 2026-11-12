@@ -1,0 +1,377 @@
+package api
+
+import (
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/gin-gonic/gin"
+	"github.com/pquerna/otp/totp"
+	"github.com/stretchr/testify/assert"
+	"github.com/tidwall/gjson"
+
+	"github.com/photoprism/photoprism/internal/config"
+	"github.com/photoprism/photoprism/internal/entity"
+	"github.com/photoprism/photoprism/internal/form"
+	"github.com/photoprism/photoprism/pkg/authn"
+)
+
+func TestCreateUserPasscode(t *testing.T) {
+	t.Run("PublicMode", func(t *testing.T) {
+		app, router, _ := NewApiTest()
+		CreateUserPasscode(router)
+		r := PerformRequest(app, "POST", "/api/v1/users/uqxc08w3d0ej2283/passcode")
+		assert.Equal(t, http.StatusForbidden, r.Code)
+	})
+	t.Run("Unauthorized", func(t *testing.T) {
+		app, router, conf := NewApiTest()
+		conf.SetAuthMode(config.AuthModePasswd)
+		defer conf.SetAuthMode(config.AuthModePublic)
+		CreateUserPasscode(router)
+
+		r := PerformRequest(app, "POST", "/api/v1/users/uqxc08w3d0ej2283/passcode")
+		assert.Equal(t, http.StatusUnauthorized, r.Code)
+	})
+	t.Run("UsersDontMatch", func(t *testing.T) {
+		app, router, conf := NewApiTest()
+		conf.SetAuthMode(config.AuthModePasswd)
+		defer conf.SetAuthMode(config.AuthModePublic)
+		CreateUserPasscode(router)
+		sessId := AuthenticateUser(app, router, "alice", "Alice123!")
+
+		f := form.Passcode{
+			Type:     "totp",
+			Password: "Alice123!",
+			Code:     "",
+		}
+		if pcStr, err := json.Marshal(f); err != nil { //nolint:gosec // test marshals a form with a password field to build the request body
+			log.Fatal(err)
+		} else {
+			r := AuthenticatedRequestWithBody(app, "POST", "/api/v1/users/uqxc08w3d0ej2283/passcode", string(pcStr), sessId)
+			assert.Equal(t, http.StatusForbidden, r.Code)
+		}
+	})
+	t.Run("AliceUnsupportedType", func(t *testing.T) {
+		app, router, conf := NewApiTest()
+		conf.SetAuthMode(config.AuthModePasswd)
+		defer conf.SetAuthMode(config.AuthModePublic)
+		CreateUserPasscode(router)
+		sessId := AuthenticateUser(app, router, "alice", "Alice123!")
+
+		f := form.Passcode{
+			Type:     "xxx",
+			Password: "abcdef",
+			Code:     "",
+		}
+		if pcStr, err := json.Marshal(f); err != nil { //nolint:gosec // test marshals a form with a password field to build the request body
+			log.Fatal(err)
+		} else {
+			r := AuthenticatedRequestWithBody(app, "POST", "/api/v1/users/uqxetse3cy5eo9z2/passcode", string(pcStr), sessId)
+			assert.Equal(t, http.StatusBadRequest, r.Code)
+		}
+	})
+	t.Run("AliceInvalidPassword", func(t *testing.T) {
+		app, router, conf := NewApiTest()
+		conf.SetAuthMode(config.AuthModePasswd)
+		defer conf.SetAuthMode(config.AuthModePublic)
+		CreateUserPasscode(router)
+		sessId := AuthenticateUser(app, router, "alice", "Alice123!")
+
+		f := form.Passcode{
+			Type:     "totp",
+			Password: "wrong",
+			Code:     "",
+		}
+		if pcStr, err := json.Marshal(f); err != nil { //nolint:gosec // test marshals a form with a password field to build the request body
+			log.Fatal(err)
+		} else {
+			r := AuthenticatedRequestWithBody(app, "POST", "/api/v1/users/uqxetse3cy5eo9z2/passcode", string(pcStr), sessId)
+			assert.Equal(t, http.StatusForbidden, r.Code)
+		}
+	})
+	t.Run("RequestTooLarge", func(t *testing.T) {
+		app, router, conf := NewApiTest()
+		conf.SetAuthMode(config.AuthModePasswd)
+		defer conf.SetAuthMode(config.AuthModePublic)
+		CreateUserPasscode(router)
+		sessId := AuthenticateUser(app, router, "alice", "Alice123!")
+
+		body := `{"Type":"totp","Password":"` + strings.Repeat("a", int(MaxAuthRequestBytes)) + `"}`
+		r := AuthenticatedRequestWithBody(app, "POST", "/api/v1/users/uqxetse3cy5eo9z2/passcode", body, sessId)
+
+		assert.Equal(t, http.StatusRequestEntityTooLarge, r.Code)
+	})
+	t.Run("AliceSuccess", func(t *testing.T) {
+		app, router, conf := NewApiTest()
+		conf.SetAuthMode(config.AuthModePasswd)
+		defer conf.SetAuthMode(config.AuthModePublic)
+		CreateUserPasscode(router)
+		sessId := AuthenticateUser(app, router, "alice", "Alice123!")
+
+		f := form.Passcode{
+			Type:     "totp",
+			Password: "Alice123!",
+			Code:     "",
+		}
+		if pcStr, err := json.Marshal(f); err != nil { //nolint:gosec // test marshals a form with a password field to build the request body
+			log.Fatal(err)
+		} else {
+			r := AuthenticatedRequestWithBody(app, "POST", "/api/v1/users/uqxetse3cy5eo9z2/passcode", string(pcStr), sessId)
+			assert.Equal(t, http.StatusCreated, r.Code)
+			assert.Equal(t, "/api/v1/users/uqxetse3cy5eo9z2/passcode", r.Header().Get("Location"))
+		}
+	})
+}
+
+func TestConfirmUserPasscode(t *testing.T) {
+	t.Run("PublicMode", func(t *testing.T) {
+		app, router, _ := NewApiTest()
+		ConfirmUserPasscode(router)
+		r := PerformRequest(app, "POST", "/api/v1/users/uqxc08w3d0ej2283/passcode/confirm")
+		assert.Equal(t, http.StatusForbidden, r.Code)
+	})
+	t.Run("AlicePasscodeTooShort", func(t *testing.T) {
+		app, router, conf := NewApiTest()
+		conf.SetAuthMode(config.AuthModePasswd)
+		defer conf.SetAuthMode(config.AuthModePublic)
+		ConfirmUserPasscode(router)
+		sessId := AuthenticateUser(app, router, "alice", "Alice123!")
+
+		f := form.Passcode{
+			Type:     "totp",
+			Password: "Alice123!",
+			Code:     "123",
+		}
+		if pcStr, err := json.Marshal(f); err != nil { //nolint:gosec // test marshals a form with a password field to build the request body
+			log.Fatal(err)
+		} else {
+			r := AuthenticatedRequestWithBody(app, "POST", "/api/v1/users/uqxetse3cy5eo9z2/passcode/confirm", string(pcStr), sessId)
+			assert.Equal(t, http.StatusForbidden, r.Code)
+		}
+	})
+	t.Run("AliceInvalidPassCode", func(t *testing.T) {
+		app, router, conf := NewApiTest()
+		conf.SetAuthMode(config.AuthModePasswd)
+		defer conf.SetAuthMode(config.AuthModePublic)
+		ConfirmUserPasscode(router)
+		sessId := AuthenticateUser(app, router, "alice", "Alice123!")
+
+		f := form.Passcode{
+			Type:     "totp",
+			Password: "Alice123!",
+			Code:     "123456",
+		}
+		if pcStr, err := json.Marshal(f); err != nil { //nolint:gosec // test marshals a form with a password field to build the request body
+			log.Fatal(err)
+		} else {
+			r := AuthenticatedRequestWithBody(app, "POST", "/api/v1/users/uqxetse3cy5eo9z2/passcode/confirm", string(pcStr), sessId)
+			assert.Equal(t, http.StatusForbidden, r.Code)
+		}
+	})
+}
+
+func TestActivateUserPasscode(t *testing.T) {
+	t.Run("UsersDontMatch", func(t *testing.T) {
+		app, router, conf := NewApiTest()
+		conf.SetAuthMode(config.AuthModePasswd)
+		defer conf.SetAuthMode(config.AuthModePublic)
+		ActivateUserPasscode(router)
+		sessId := AuthenticateUser(app, router, "alice", "Alice123!")
+
+		f := form.Passcode{
+			Type:     "totp",
+			Password: "Alice123!",
+			Code:     "",
+		}
+		if pcStr, err := json.Marshal(f); err != nil { //nolint:gosec // test marshals a form with a password field to build the request body
+			log.Fatal(err)
+		} else {
+			r := AuthenticatedRequestWithBody(app, "POST", "/api/v1/users/uqxc08w3d0ej2283/passcode/activate", string(pcStr), sessId)
+			assert.Equal(t, http.StatusForbidden, r.Code)
+		}
+	})
+	t.Run("InvalidPasscode", func(t *testing.T) {
+		app, router, conf := NewApiTest()
+		conf.SetAuthMode(config.AuthModePasswd)
+		defer conf.SetAuthMode(config.AuthModePublic)
+		ActivateUserPasscode(router)
+		sessId := AuthenticateUser(app, router, "alice", "Alice123!")
+
+		f := form.Passcode{
+			Type:     "totp",
+			Password: "Alice123!",
+			Code:     "",
+		}
+		if pcStr, err := json.Marshal(f); err != nil { //nolint:gosec // test marshals a form with a password field to build the request body
+			log.Fatal(err)
+		} else {
+			r := AuthenticatedRequestWithBody(app, "POST", "/api/v1/users/uqxetse3cy5eo9z2/passcode/activate", string(pcStr), sessId)
+			assert.Equal(t, http.StatusForbidden, r.Code)
+		}
+	})
+}
+
+func TestDeactivateUserPasscode(t *testing.T) {
+	t.Run("Unauthorized", func(t *testing.T) {
+		app, router, conf := NewApiTest()
+		conf.SetAuthMode(config.AuthModePasswd)
+		defer conf.SetAuthMode(config.AuthModePublic)
+		DeactivateUserPasscode(router)
+
+		r := PerformRequest(app, "POST", "/api/v1/users/uqxc08w3d0ej2283/passcode/deactivate")
+		assert.Equal(t, http.StatusUnauthorized, r.Code)
+	})
+	t.Run("AliceInvalidPassword", func(t *testing.T) {
+		app, router, conf := NewApiTest()
+		conf.SetAuthMode(config.AuthModePasswd)
+		defer conf.SetAuthMode(config.AuthModePublic)
+		DeactivateUserPasscode(router)
+		sessId := AuthenticateUser(app, router, "alice", "Alice123!")
+
+		f := form.Passcode{
+			Type:     "totp",
+			Password: "wrong",
+			Code:     "",
+		}
+		if pcStr, err := json.Marshal(f); err != nil { //nolint:gosec // test marshals a form with a password field to build the request body
+			log.Fatal(err)
+		} else {
+			r := AuthenticatedRequestWithBody(app, "POST", "/api/v1/users/uqxetse3cy5eo9z2/passcode/deactivate", string(pcStr), sessId)
+			assert.Equal(t, http.StatusForbidden, r.Code)
+		}
+	})
+}
+
+func TestUserPasscode(t *testing.T) {
+	// create
+	app, router, conf := NewApiTest()
+	conf.SetAuthMode(config.AuthModePasswd)
+	defer conf.SetAuthMode(config.AuthModePublic)
+	CreateUserPasscode(router)
+	sessId := AuthenticateUser(app, router, "alice", "Alice123!")
+
+	f0 := form.Passcode{
+		Type:     "totp",
+		Password: "Alice123!",
+		Code:     "",
+	}
+
+	pcStr, err := json.Marshal(f0) //nolint:gosec // test marshals a form with a password field to build the request body
+
+	if err != nil {
+		t.Fatalf("marshal passcode: %v", err)
+	}
+
+	r := AuthenticatedRequestWithBody(app, "POST", "/api/v1/users/uqxetse3cy5eo9z2/passcode", string(pcStr), sessId)
+	assert.Equal(t, http.StatusCreated, r.Code)
+
+	secret := gjson.Get(r.Body.String(), "Secret").String()
+	activatedAt := gjson.Get(r.Body.String(), "ActivatedAt").String()
+	verifiedAt := gjson.Get(r.Body.String(), "VerifiedAt").String()
+
+	assert.Empty(t, activatedAt)
+	assert.Empty(t, verifiedAt)
+
+	code, err := totp.GenerateCode(secret, time.Now())
+
+	// confirm
+	ConfirmUserPasscode(router)
+
+	if err != nil {
+		t.Fatalf("generate totp code: %v", err)
+	}
+
+	f := form.Passcode{
+		Type:     "totp",
+		Password: "Alice123!",
+		Code:     code,
+	}
+
+	pcStr, err = json.Marshal(f) //nolint:gosec // test marshals a form with a password field to build the request body
+
+	if err != nil {
+		t.Fatalf("marshal passcode confirm: %v", err)
+	}
+
+	r = AuthenticatedRequestWithBody(app, "POST", "/api/v1/users/uqxetse3cy5eo9z2/passcode/confirm", string(pcStr), sessId)
+	assert.Equal(t, http.StatusOK, r.Code)
+
+	activatedAt = gjson.Get(r.Body.String(), "ActivatedAt").String()
+	verifiedAt = gjson.Get(r.Body.String(), "VerifiedAt").String()
+
+	assert.Empty(t, activatedAt)
+	assert.NotEmpty(t, verifiedAt)
+
+	// activate
+	ActivateUserPasscode(router)
+
+	r = AuthenticatedRequestWithBody(app, "POST", "/api/v1/users/uqxetse3cy5eo9z2/passcode/activate", string(pcStr), sessId)
+	assert.Equal(t, http.StatusOK, r.Code)
+
+	activatedAt = gjson.Get(r.Body.String(), "ActivatedAt").String()
+	verifiedAt = gjson.Get(r.Body.String(), "VerifiedAt").String()
+
+	assert.NotEmpty(t, activatedAt)
+	assert.NotEmpty(t, verifiedAt)
+
+	// deactivate
+	DeactivateUserPasscode(router)
+
+	r = AuthenticatedRequestWithBody(app, "POST", "/api/v1/users/uqxetse3cy5eo9z2/passcode/deactivate", string(pcStr), sessId)
+	assert.Equal(t, http.StatusOK, r.Code)
+}
+
+func TestCheckUserPasscodePassword(t *testing.T) {
+	user := &entity.User{UserUID: "uqxc08w3d0ej2283", UserName: "jane", AuthProvider: authn.ProviderLDAP.String()}
+	other := &entity.User{UserUID: "uqxqg7i1kperxvu7", UserName: "jane", AuthProvider: authn.ProviderLDAP.String()}
+
+	stubAuth := func(t *testing.T, found *entity.User, method authn.MethodType, err error) {
+		auth := entity.Auth
+		t.Cleanup(func() { entity.Auth = auth })
+		entity.Auth = func(frm form.Login, s *entity.Session, c *gin.Context) (*entity.User, authn.ProviderType, authn.MethodType, error) {
+			return found, authn.ProviderLDAP, method, err
+		}
+	}
+
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+
+	t.Run("PasscodeRequired", func(t *testing.T) {
+		stubAuth(t, user, authn.Method2FA, authn.ErrPasscodeRequired)
+		code, _, err := checkUserPasscodePassword(c, user, "photoprism")
+		assert.NoError(t, err)
+		assert.Equal(t, http.StatusOK, code)
+	})
+	t.Run("PasscodeRequiredOtherAccount", func(t *testing.T) {
+		stubAuth(t, other, authn.Method2FA, authn.ErrPasscodeRequired)
+		code, _, err := checkUserPasscodePassword(c, user, "photoprism")
+		assert.ErrorIs(t, err, authn.ErrUserDoesNotMatch)
+		assert.Equal(t, http.StatusForbidden, code)
+	})
+	t.Run("PasscodeRequiredNoAccount", func(t *testing.T) {
+		stubAuth(t, nil, authn.Method2FA, authn.ErrPasscodeRequired)
+		code, _, err := checkUserPasscodePassword(c, user, "photoprism")
+		assert.ErrorIs(t, err, authn.ErrAccountNotFound)
+		assert.Equal(t, http.StatusForbidden, code)
+	})
+	t.Run("OtherAccount", func(t *testing.T) {
+		stubAuth(t, other, authn.MethodDefault, nil)
+		code, _, err := checkUserPasscodePassword(c, user, "photoprism")
+		assert.ErrorIs(t, err, authn.ErrUserDoesNotMatch)
+		assert.Equal(t, http.StatusForbidden, code)
+	})
+	t.Run("InvalidPassword", func(t *testing.T) {
+		stubAuth(t, user, authn.MethodDefault, authn.ErrInvalidPassword)
+		code, _, err := checkUserPasscodePassword(c, user, "wrong")
+		assert.ErrorIs(t, err, authn.ErrInvalidPassword)
+		assert.Equal(t, http.StatusForbidden, code)
+	})
+	t.Run("Verified", func(t *testing.T) {
+		stubAuth(t, user, authn.MethodDefault, nil)
+		code, _, err := checkUserPasscodePassword(c, user, "photoprism")
+		assert.NoError(t, err)
+		assert.Equal(t, http.StatusOK, code)
+	})
+}

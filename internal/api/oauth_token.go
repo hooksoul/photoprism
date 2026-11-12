@@ -1,0 +1,302 @@
+package api
+
+import (
+	"errors"
+	"fmt"
+	"net/http"
+
+	"github.com/dustin/go-humanize/english"
+	"github.com/gin-gonic/gin"
+
+	"github.com/photoprism/photoprism/internal/entity"
+	"github.com/photoprism/photoprism/internal/event"
+	"github.com/photoprism/photoprism/internal/form"
+	"github.com/photoprism/photoprism/internal/photoprism/get"
+	"github.com/photoprism/photoprism/internal/server/limiter"
+	"github.com/photoprism/photoprism/pkg/authn"
+	"github.com/photoprism/photoprism/pkg/clean"
+	"github.com/photoprism/photoprism/pkg/http/header"
+	"github.com/photoprism/photoprism/pkg/i18n"
+	"github.com/photoprism/photoprism/pkg/log/status"
+)
+
+// OAuthToken creates a new access token for clients using OAuth2 grant types.
+//
+//	@Summary	create an OAuth2 access token
+//	@Id			OAuthToken
+//	@Tags		Authentication
+//	@Accept		json,x-www-form-urlencoded,mpfd
+//	@Produce	json
+//	@Param		request					body		form.OAuthCreateToken	true	"token request (supports client_credentials, password, session, authorization_code, or refresh_token grant)"
+//	@Success	200						{object}	gin.H
+//	@Failure	400,401,403,413,429,500	{object}	i18n.Response
+//	@Router		/api/v1/oauth/token [post]
+func OAuthToken(router *gin.RouterGroup) {
+	router.POST("/oauth/token", func(c *gin.Context) {
+		// Prevent CDNs from caching this endpoint.
+		if header.IsCdn(c.Request) {
+			AbortNotFound(c)
+			return
+		}
+
+		// Get client IP address for logs and rate limiting checks.
+		clientIp := ClientIP(c)
+		actor := "unknown client"
+		action := "create token"
+
+		// Abort if running in public mode.
+		if get.Config().Public() {
+			event.AuditErr([]string{clientIp, "oauth2", actor, action, authn.ErrDisabledInPublicMode.Error()})
+			AbortForbidden(c)
+			return
+		}
+
+		// Disable caching of responses.
+		c.Header(header.CacheControl, header.CacheControlNoStore)
+
+		// Abort if the client has exhausted its authentication failure budget, checked before the body is read.
+		if limiter.Auth.Reject(clientIp) {
+			limiter.AbortJSON(c)
+			return
+		}
+
+		// The bound precedes the form parse so an over-long body is reported as such; the
+		// peek and the binding below both read the same parsed form.
+		LimitRequestBodyBytes(c, MaxOAuthRequestBytes)
+
+		if IsOAuthFormRequest(c) {
+			// An oversized form counts towards limiter.Authorize.
+			if err := c.Request.ParseForm(); IsRequestBodyTooLarge(err) {
+				if limiter.Authorize.Reject(clientIp) {
+					limiter.AbortJSON(c)
+					return
+				}
+
+				limiter.Authorize.Reserve(clientIp)
+				event.AuditWarn([]string{clientIp, "oauth2", actor, action, "request too large", status.Error(err)})
+				AbortRequestTooLarge(c, i18n.ErrBadRequest)
+				return
+			}
+		}
+
+		// OAuthAuthorizationCodeHandler (the app flow; on Portal a dispatcher) parses the
+		// authorization_code grant itself. This runs before the binding, which rejects the
+		// grant, and is gated on a form content type per RFC 6749.
+		if IsOAuthFormRequest(c) && authn.Grant(c.PostForm("grant_type")) == authn.GrantAuthorizationCode {
+			if OAuthAuthorizationCodeHandler != nil {
+				OAuthAuthorizationCodeHandler(c)
+				return
+			}
+			limiter.Auth.Reserve(clientIp)
+			event.AuditWarn([]string{clientIp, "oauth2", actor, action, authn.ErrInvalidGrantType.Error()})
+			c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{
+				"error":             "unsupported_grant_type",
+				"error_description": "grant_type is not supported",
+			})
+			return
+		}
+
+		// Refresh tokens are only issued to apps, which authenticate without a client secret,
+		// so the grant is handled before HTTP Basic credentials select client_credentials.
+		if IsOAuthFormRequest(c) && authn.Grant(c.PostForm("grant_type")) == authn.GrantRefreshToken {
+			OAuthAppRefresh(c)
+			return
+		}
+
+		// Token create request form.
+		var frm form.OAuthCreateToken
+		var sess *entity.Session
+		var client *entity.Client
+		var err error
+
+		// Allow authentication with basic auth and form values.
+		if clientId, clientSecret, _ := header.BasicAuth(c); clientId != "" && clientSecret != "" {
+			frm.GrantType = authn.GrantClientCredentials
+			frm.ClientID = clientId
+			frm.ClientSecret = clientSecret
+		} else if err = BindOAuthRequest(c, &frm); err != nil {
+			limiter.Auth.Reserve(clientIp)
+
+			if IsRequestBodyTooLarge(err) {
+				event.AuditWarn([]string{clientIp, "oauth2", actor, action, "request too large", status.Error(err)})
+				AbortRequestTooLarge(c, i18n.ErrBadRequest)
+				return
+			}
+
+			event.AuditWarn([]string{clientIp, "oauth2", actor, action, status.Error(err)})
+			AbortBadRequest(c, err)
+			return
+		}
+
+		// Check the credentials for completeness and the correct format.
+		if err = frm.Validate(); err != nil {
+			limiter.Auth.Reserve(clientIp)
+			event.AuditWarn([]string{clientIp, "oauth2", actor, action, status.Error(err)})
+			AbortInvalidCredentials(c)
+			return
+		}
+
+		// Check the failure rate limit for a request that presents credentials. This budget
+		// is shared with interactive sign-in, so it is charged only once a request gets here.
+		r := limiter.Login.Request(clientIp)
+
+		if r.Reject() || limiter.Auth.Reject(clientIp) {
+			limiter.AbortJSON(c)
+			return
+		}
+
+		switch {
+		case frm.ClientID != "":
+			actor = fmt.Sprintf("client %s", clean.Log(frm.ClientID))
+		case frm.Username != "":
+			actor = fmt.Sprintf("user %s", clean.Log(frm.Username))
+		case frm.GrantType == authn.GrantPassword:
+			actor = "unknown user"
+		}
+
+		// Create a new session (access token) based on the grant type specified in the request.
+		switch frm.GrantType {
+		case authn.GrantClientCredentials, authn.GrantUndefined:
+			// Find client with the specified ID.
+			client = entity.FindClientByUID(frm.ClientID)
+
+			// Check if a client has been found, it is enabled, and the credentials are valid.
+			if client == nil {
+				event.AuditWarn([]string{clientIp, "oauth2", actor, action, authn.ErrInvalidClientID.Error()})
+				AbortInvalidCredentials(c)
+				return
+			} else if client.Disabled() {
+				event.AuditWarn([]string{clientIp, "oauth2", actor, action, authn.ErrAuthenticationDisabled.Error()})
+				AbortInvalidCredentials(c)
+				return
+			} else if method := client.Method(); !method.IsDefault() && method != authn.MethodOAuth2 {
+				event.AuditWarn([]string{clientIp, "oauth2", actor, action, "method %s", status.Unsupported}, clean.LogQuote(method.String()))
+				AbortInvalidCredentials(c)
+				return
+			} else if client.InvalidSecret(frm.ClientSecret) {
+				event.AuditWarn([]string{clientIp, "oauth2", actor, action, authn.ErrInvalidClientSecret.Error()})
+				AbortInvalidCredentials(c)
+				return
+			} else if client.HasInactiveUser() {
+				event.AuditWarn([]string{clientIp, "oauth2", actor, action, authn.ErrAccountDisabled.Error()})
+				AbortInvalidCredentials(c)
+				return
+			}
+
+			// Update time of last activity.
+			client.UpdateLastActive(true)
+
+			// Cancel failure rate limit reservation.
+			r.Success()
+
+			// Create new client session.
+			sess = client.NewSession(c, authn.GrantClientCredentials)
+		case authn.GrantPassword, authn.GrantSession:
+			// Reject minting app passwords when the feature is disabled.
+			if get.Config().DisableAppPasswords() {
+				event.AuditWarn([]string{clientIp, "oauth2", actor, action, "app passwords disabled", status.Denied})
+				AbortFeatureDisabled(c)
+				return
+			}
+
+			// Generate an app password for a user account and check the password for confirmation.
+			s := Session(clientIp, AuthToken(c))
+
+			if s == nil || s.VerifyStored() != nil {
+				AbortInvalidCredentials(c)
+				return
+			} else if s.GetUserName() == "" || s.IsClient() || !s.IsRegistered() {
+				event.AuditErr([]string{clientIp, "oauth2", actor, action, authn.ErrInvalidGrantType.Error()})
+				AbortInvalidCredentials(c)
+				return
+			}
+
+			actor = fmt.Sprintf("user %s", clean.Log(s.GetUserName()))
+
+			if s.GetUser().Provider().SupportsPasswordAuthentication() {
+				loginForm := form.Login{
+					Username: s.GetUserName(),
+					Password: frm.Password,
+				}
+
+				authUser, authProvider, authMethod, authErr := entity.Auth(loginForm, nil, c)
+
+				switch {
+				case authProvider.IsClient():
+					event.AuditErr([]string{clientIp, "oauth2", actor, action, status.Denied})
+					AbortInvalidCredentials(c)
+					return
+				case authMethod.Is(authn.Method2FA) && errors.Is(authErr, authn.ErrPasscodeRequired):
+					// Ok.
+				case authErr != nil:
+					event.AuditErr([]string{clientIp, "oauth2", actor, action, status.Error(authErr)})
+					AbortInvalidCredentials(c)
+					return
+				case !authUser.Equal(s.GetUser()):
+					event.AuditErr([]string{clientIp, "oauth2", actor, action, authn.ErrUserDoesNotMatch.Error()})
+					AbortInvalidCredentials(c)
+					return
+				}
+
+				frm.GrantType = authn.GrantPassword
+			} else {
+				frm.GrantType = authn.GrantSession
+			}
+
+			sess = entity.NewClientSession(frm.ClientName, frm.ExpiresIn, frm.Scope, frm.GrantType, s.GetUser())
+
+			// Return the reserved request rate limit tokens after successful authentication.
+			r.Success()
+		default:
+			event.AuditErr([]string{clientIp, "oauth2", actor, action, authn.ErrInvalidGrantType.Error()})
+			AbortInvalidCredentials(c)
+			return
+		}
+
+		// Save new session.
+		sess, err = get.Session().Save(sess)
+
+		switch {
+		case err != nil:
+			event.AuditErr([]string{clientIp, "oauth2", actor, action, status.Error(err)})
+			AbortInvalidCredentials(c)
+			return
+		case sess == nil:
+			event.AuditErr([]string{clientIp, "oauth2", actor, action, StatusFailed.String()})
+			AbortUnexpectedError(c)
+			return
+		case client != nil && client.AuthChanged():
+			// Issue the token only if the stored client matches the copy the request authenticated with.
+			if err = sess.Delete(); err != nil {
+				event.AuditErr([]string{clientIp, "oauth2", actor, action, "delete session", status.Error(err)})
+			}
+
+			event.AuditWarn([]string{clientIp, "oauth2", actor, action, "client changed", status.Denied})
+			AbortInvalidCredentials(c)
+			return
+		default:
+			event.AuditInfo([]string{clientIp, "oauth2", actor, action, status.Created})
+		}
+
+		// Delete any existing client sessions above the configured limit.
+		if client == nil {
+			// Skip deletion if not created by a client.
+		} else if deleted := client.EnforceAuthTokenLimit(sess.ID); deleted > 0 {
+			event.AuditInfo([]string{clientIp, "oauth2", actor, action, "deleted %s to enforce token limit"}, english.Plural(deleted, "session", "sessions"))
+		}
+
+		// Send response with access token, token type, and token lifetime.
+		response := gin.H{
+			"status":       StatusSuccess,
+			"session_id":   sess.ID,
+			"access_token": sess.AuthToken(),
+			"token_type":   sess.AuthTokenType(),
+			"expires_in":   sess.ExpiresIn(),
+			"client_name":  sess.GetClientName(),
+			"client_role":  sess.GetClientRole(),
+			"scope":        sess.Scope(),
+		}
+
+		c.JSON(http.StatusOK, response)
+	})
+}

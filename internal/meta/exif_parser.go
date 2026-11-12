@@ -16,6 +16,8 @@ import (
 	"github.com/photoprism/photoprism/pkg/fs"
 )
 
+// RawExif extracts the raw EXIF block from the given media file, optionally falling back to a
+// brute-force search when native parsers fail.
 func RawExif(fileName string, fileFormat fs.Type, bruteForce bool) (rawExif []byte, err error) {
 	defer func() {
 		if e := recover(); e != nil {
@@ -29,9 +31,15 @@ func RawExif(fileName string, fileFormat fs.Type, bruteForce bool) (rawExif []by
 	// Sanitized and shortened file name for logs.
 	logName := clean.Log(filepath.Base(fileName))
 
+	// The parsers below load the whole file before they look for the Exif block, so the size
+	// must be within the supported range before any of them is given the name.
+	if _, err = ExifFileSize(fileName); err != nil {
+		return rawExif, fmt.Errorf("%w in %s", err, logName)
+	}
+
 	// Try Exif parser for specific media file format first.
 	switch fileFormat {
-	case fs.ImageJPEG:
+	case fs.ImageJpeg:
 		jpegMp := jpegstructure.NewJpegMediaParser()
 
 		sl, err := jpegMp.ParseFile(fileName)
@@ -42,18 +50,19 @@ func RawExif(fileName string, fileFormat fs.Type, bruteForce bool) (rawExif []by
 			_, rawExif, err = sl.Exif()
 
 			if err != nil {
-				if !bruteForce || strings.HasPrefix(err.Error(), "no exif header") {
+				switch {
+				case !bruteForce || strings.HasPrefix(err.Error(), "no exif header"):
 					return rawExif, fmt.Errorf("found no exif header")
-				} else if strings.HasPrefix(err.Error(), "no exif data") {
+				case strings.HasPrefix(err.Error(), "no exif data"):
 					log.Debugf("metadata: failed parsing %s, starting brute-force search (parse jpeg)", logName)
-				} else {
+				default:
 					log.Infof("metadata: %s in %s, starting brute-force search (parse jpeg)", err, logName)
 				}
 			} else {
 				parsed = true
 			}
 		}
-	case fs.ImagePNG:
+	case fs.ImagePng:
 		pngMp := pngstructure.NewPngMediaParser()
 
 		cs, err := pngMp.ParseFile(fileName)
@@ -73,7 +82,7 @@ func RawExif(fileName string, fileFormat fs.Type, bruteForce bool) (rawExif []by
 				parsed = true
 			}
 		}
-	case fs.ImageHEIF, fs.ImageHEIC, fs.ImageHEICS, fs.ImageAVIF, fs.ImageAVIFS:
+	case fs.ImageHeif, fs.ImageHeic, fs.ImageHeicS, fs.ImageAvif, fs.ImageAvifS:
 		heicMp := heicexif.NewHeicExifMediaParser()
 
 		cs, err := heicMp.ParseFile(fileName)
@@ -93,7 +102,7 @@ func RawExif(fileName string, fileFormat fs.Type, bruteForce bool) (rawExif []by
 				parsed = true
 			}
 		}
-	case fs.ImageTIFF:
+	case fs.ImageTiff:
 		tiffMp := tiffstructure.NewTiffMediaParser()
 
 		cs, err := tiffMp.ParseFile(fileName)

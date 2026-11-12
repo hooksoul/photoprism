@@ -3,6 +3,8 @@ package list
 import (
 	"fmt"
 	"strings"
+
+	"github.com/photoprism/photoprism/pkg/enum"
 )
 
 // KeyValue represents a key-value attribute.
@@ -26,6 +28,9 @@ func Key(s string) string {
 	result := strings.Map(func(r rune) rune {
 		switch r {
 		case '.', '@', '-', '+', '_', '#':
+			return r
+		case '*':
+			i++
 			return r
 		}
 		if r >= '0' && r <= '9' {
@@ -52,7 +57,7 @@ func Value(s string) string {
 			return -1
 		}
 		switch r {
-		case '(', ')', '<', '>', '\'', '"':
+		case '(', ')', '<', '>', '\'', '"', '*':
 			return r
 		}
 		return r
@@ -71,8 +76,10 @@ func (f *KeyValue) Parse(s string) *KeyValue {
 	}
 
 	// Default?
-	if v = Value(v); v == "" {
-		f.Value = True
+	if f.Key == Any {
+		return f
+	} else if v = Value(v); v == "" {
+		f.Value = enum.True
 		return f
 	}
 
@@ -92,7 +99,11 @@ func (f *KeyValue) String() string {
 		return ""
 	}
 
-	if Bool[strings.ToLower(f.Value)] == True {
+	if f.Key == Any {
+		return Any
+	}
+
+	if Bool[strings.ToLower(f.Value)] == enum.True {
 		return f.Key
 	}
 
@@ -101,4 +112,9 @@ func (f *KeyValue) String() string {
 	}
 
 	return ""
+}
+
+// Any checks if this represents any value (asterisk).
+func (f *KeyValue) Any() bool {
+	return f.Key == Any
 }

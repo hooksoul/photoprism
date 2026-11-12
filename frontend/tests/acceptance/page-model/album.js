@@ -1,101 +1,119 @@
 import { Selector, t } from "testcafe";
 
 export default class Page {
-  constructor() {}
+  constructor() {
+    this.search = Selector(".input-search input");
+  }
 
   async getNthAlbumUid(type, nth) {
     if (type === "all") {
-      const NthAlbum = await Selector("a.is-album").nth(nth).getAttribute("data-uid");
+      const NthAlbum = await Selector("div.result.is-album").nth(nth).getAttribute("data-uid");
       return NthAlbum;
     } else {
-      const NthAlbum = await Selector("a.type-" + type)
+      const NthAlbum = await Selector("div.type-" + type)
         .nth(nth)
         .getAttribute("data-uid");
       return NthAlbum;
     }
   }
 
+  // getAlbumUidByTitle returns the UID of the album card matching a title.
+  // Callers narrow the list with toolbar.search first. Picking an album by position is
+  // unstable because the moments worker adds moment and calendar albums on a timer,
+  // so a new one can sort ahead of the intended album.
+  async getAlbumUidByTitle(title) {
+    const Card = Selector("div.result.is-album", { timeout: 10000 }).withText(title);
+    await t.expect(Card.exists).ok(`album "${title}" not found`);
+    const AlbumUid = await Card.getAttribute("data-uid");
+    return AlbumUid;
+  }
+
   async getAlbumCount(type) {
     if (type === "all") {
       if (t.browser.platform === "mobile") {
-        const AlbumCount = await Selector("a.is-album", { timeout: 8000 }).count;
+        const AlbumCount = await Selector("div.result.is-album", { timeout: 8000 }).count;
         return AlbumCount;
       } else {
-        const AlbumCount = await Selector("a.is-album", { timeout: 5000 }).count;
+        const AlbumCount = await Selector("div.result.is-album", { timeout: 5000 }).count;
         return AlbumCount;
       }
     } else {
       if (t.browser.platform === "mobile") {
-        const AlbumCount = await Selector("a.type-" + type, { timeout: 8000 }).count;
+        const AlbumCount = await Selector("div.type-" + type, { timeout: 8000 }).count;
         return AlbumCount;
       } else {
-        const AlbumCount = await Selector("a.type-" + type, { timeout: 5000 }).count;
+        const AlbumCount = await Selector("div.type-" + type, { timeout: 5000 }).count;
         return AlbumCount;
       }
     }
   }
 
   async selectAlbumFromUID(uid) {
-    await t
-      .hover(Selector("a.is-album").withAttribute("data-uid", uid))
-      .click(Selector(`.uid-${uid} .input-select`));
+    await t.hover(Selector("div.result.is-album").withAttribute("data-uid", uid)).click(Selector(`.uid-${uid} .input-select`));
   }
 
   async toggleSelectNthAlbum(nth, type) {
     if (type === "all") {
-      await t
-        .hover(Selector("a.is-album", { timeout: 4000 }).nth(nth))
-        .click(Selector("a.is-album .input-select").nth(nth));
+      await t.hover(Selector("div.result.is-album", { timeout: 4000 }).nth(nth)).click(Selector("div.result.is-album .input-select").nth(nth));
     } else {
-      await t
-        .hover(Selector("a.type-" + type, { timeout: 4000 }).nth(nth))
-        .click(Selector("a.type-" + type + " .input-select").nth(nth));
+      await t.hover(Selector("div.type-" + type, { timeout: 4000 }).nth(nth)).click(Selector("div.type-" + type + " .input-select").nth(nth));
     }
   }
 
   async openNthAlbum(nth, type) {
     if (!type || type === "all") {
-      if (await Selector("a.is-album").nth(nth).visible) {
-        await t.click(Selector("a.is-album").nth(nth));
+      if (await Selector("div.result.is-album").nth(nth).visible) {
+        await t.click(Selector("div.result.is-album").nth(nth));
       }
     } else {
-      if (await Selector("a.type-" + type).nth(nth).visible) {
-        await t.click(Selector("a.type-" + type).nth(nth));
+      if (await Selector("div.type-" + type).nth(nth).visible) {
+        await t.click(Selector("div.type-" + type).nth(nth));
       }
     }
   }
 
   async openAlbumWithUid(uid) {
-    await t.click(Selector("a.is-album").withAttribute("data-uid", uid));
+    await t.click(Selector("div.result.is-album").withAttribute("data-uid", uid));
+  }
+
+  async openByTitle(title) {
+    // Enter submits the filter to the backend; without it the grid stays on
+    // the default ordering and a freshly-added album can be pushed off-screen
+    // by virtual scrolling.
+    await t.typeText(this.search, title, { replace: true }).pressKey("enter");
+    const card = Selector("div.result.is-album", { timeout: 10000 }).withText(title);
+    await t.expect(card.exists).ok();
+    await t.click(card);
+    await t.expect(Selector("div.is-photo").visible).ok();
   }
 
   async checkAlbumVisibility(uid, visible) {
     if (visible) {
-      await t.expect(Selector("a").withAttribute("data-uid", uid).visible).ok();
+      await t.expect(Selector("div").withAttribute("data-uid", uid).visible).ok();
     } else {
-      await t.expect(Selector("a").withAttribute("data-uid", uid).visible).notOk();
+      await t.expect(Selector("div").withAttribute("data-uid", uid).visible).notOk();
     }
   }
 
   async triggerHoverAction(mode, uidOrNth, action) {
     if (mode === "uid") {
       if (action === "share") {
-        await t.hover(Selector("a.uid-" + uidOrNth));
-        await t.click(Selector("a.uid-" + uidOrNth + " .action-" + action));
+        await t.hover(Selector("div.uid-" + uidOrNth));
+        await t.click(Selector("div.uid-" + uidOrNth + " .action-" + action));
       } else {
-        await t.hover(Selector("a.uid-" + uidOrNth));
-        await t.click(Selector("a.uid-" + uidOrNth + " .input-" + action));
+        await t.hover(Selector("div.uid-" + uidOrNth));
+        await t.click(Selector("div.uid-" + uidOrNth + " .input-" + action));
       }
     }
     if (mode === "nth") {
-      await t.hover(Selector("a.is-album").nth(uidOrNth));
+      await t.hover(Selector("div.result.is-album").nth(uidOrNth));
       await t.click(Selector(`.input-` + action));
     }
   }
 
   async checkHoverActionAvailability(mode, uidOrNth, action, visible) {
     if (mode === "uid") {
-      await t.hover(Selector("a.is-album").withAttribute("data-uid", uidOrNth));
+      await t.hover(Selector("div.result.is-album").withAttribute("data-uid", uidOrNth));
       if (visible) {
         await t.expect(Selector(`.uid-${uidOrNth} .input-` + action).visible).ok();
       } else {
@@ -103,7 +121,7 @@ export default class Page {
       }
     }
     if (mode === "nth") {
-      await t.hover(Selector("a.is-album").nth(uidOrNth));
+      await t.hover(Selector("div.result.is-album").nth(uidOrNth));
       if (action != "share") {
         if (visible) {
           await t.expect(Selector(`button.input-` + action).visible).ok();
@@ -122,19 +140,19 @@ export default class Page {
 
   async checkHoverActionState(mode, uidOrNth, action, set) {
     if (mode === "uid") {
-      await t.hover(Selector("a").withAttribute("data-uid", uidOrNth));
+      await t.hover(Selector("div").withAttribute("data-uid", uidOrNth));
       if (set) {
-        await t.expect(Selector(`a.uid-${uidOrNth}`).hasClass("is-" + action)).ok();
+        await t.expect(Selector(`div.uid-${uidOrNth}`).hasClass("is-" + action)).ok();
       } else {
-        await t.expect(Selector(`a.uid-${uidOrNth}`).hasClass("is-" + action)).notOk();
+        await t.expect(Selector(`div.uid-${uidOrNth}`).hasClass("is-" + action)).notOk();
       }
     }
     if (mode === "nth") {
-      await t.hover(Selector("a.is-album").nth(uidOrNth));
+      await t.hover(Selector("div.result.is-album").nth(uidOrNth));
       if (set) {
         await t
           .expect(
-            Selector("a.is-album")
+            Selector("div.result.is-album")
               .nth(uidOrNth)
               .hasClass("is-" + action)
           )
@@ -142,12 +160,36 @@ export default class Page {
       } else {
         await t
           .expect(
-            Selector("a.is-album")
+            Selector("div.result.is-album")
               .nth(uidOrNth)
               .hasClass("is-" + action)
           )
           .notOk();
       }
     }
+  }
+
+  async checkSortOptions(type) {
+    await t.click(Selector("i.mdi-tune"));
+    await t.click(Selector(".p-sort-select"));
+    await t.expect(Selector("div[role=listbox]:first-of-type").visible).ok();
+
+    const sortOptionsCount = Selector("div[role=listbox]:first-of-type div[role=option]").count;
+
+    if (type === "album") {
+      await t.expect(sortOptionsCount).eql(7);
+    } else {
+      await t.expect(sortOptionsCount).eql(6);
+    }
+  }
+
+  getAlbumCardPreviewSelector(uid) {
+    return Selector(`div.result.is-album[data-uid="${uid}"] .preview`);
+  }
+
+  async getAlbumCoverStyle(uid) {
+    const selector = this.getAlbumCardPreviewSelector(uid);
+    const style = await selector.getStyleProperty("background-image");
+    return style;
   }
 }

@@ -1,19 +1,24 @@
 package entity
 
 import (
+	"errors"
+	"fmt"
 	"sync"
 	"time"
 
-	"github.com/jinzhu/gorm"
+	"github.com/ulule/deepcopier"
+	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 
-	"github.com/photoprism/photoprism/internal/classify"
+	"github.com/photoprism/photoprism/internal/ai/classify"
 	"github.com/photoprism/photoprism/internal/event"
-
+	"github.com/photoprism/photoprism/internal/form"
 	"github.com/photoprism/photoprism/pkg/clean"
 	"github.com/photoprism/photoprism/pkg/rnd"
 	"github.com/photoprism/photoprism/pkg/txt"
 )
 
+// Label constants, including the prefix that identifies a generated label UID.
 const (
 	LabelUID = byte('l')
 )
@@ -21,27 +26,29 @@ const (
 var labelMutex = sync.Mutex{}
 var labelCategoriesMutex = sync.Mutex{}
 
+// Labels is a convenience alias for slices of Label.
 type Labels []Label
 
-// Label is used for photo, album and location categorization
+// Label represents a taxonomy entry used for categorizing photos, albums, and locations.
 type Label struct {
-	ID               uint       `gorm:"primary_key" json:"ID" yaml:"-"`
-	LabelUID         string     `gorm:"type:VARBINARY(42);unique_index;" json:"UID" yaml:"UID"`
-	LabelSlug        string     `gorm:"type:VARBINARY(160);unique_index;" json:"Slug" yaml:"-"`
-	CustomSlug       string     `gorm:"type:VARBINARY(160);index;" json:"CustomSlug" yaml:"-"`
-	LabelName        string     `gorm:"type:VARCHAR(160);" json:"Name" yaml:"Name"`
-	LabelPriority    int        `json:"Priority" yaml:"Priority,omitempty"`
-	LabelFavorite    bool       `json:"Favorite" yaml:"Favorite,omitempty"`
-	LabelDescription string     `gorm:"type:VARCHAR(2048);" json:"Description" yaml:"Description,omitempty"`
-	LabelNotes       string     `gorm:"type:VARCHAR(1024);" json:"Notes" yaml:"Notes,omitempty"`
-	LabelCategories  []*Label   `gorm:"many2many:categories;association_jointable_foreignkey:category_id" json:"-" yaml:"-"`
-	PhotoCount       int        `gorm:"default:1" json:"PhotoCount" yaml:"-"`
-	Thumb            string     `gorm:"type:VARBINARY(128);index;default:''" json:"Thumb" yaml:"Thumb,omitempty"`
-	ThumbSrc         string     `gorm:"type:VARBINARY(8);default:''" json:"ThumbSrc,omitempty" yaml:"ThumbSrc,omitempty"`
+	ID               uint       `gorm:"primaryKey;size:32" json:"ID" yaml:"-"`
+	LabelUID         string     `gorm:"type:bytes;size:42;uniqueIndex:uix_labels_label_uid;" json:"UID" yaml:"UID"`
+	LabelSlug        string     `gorm:"type:bytes;size:160;uniqueIndex:uix_labels_label_slug;" json:"Slug" yaml:"-"`
+	CustomSlug       string     `gorm:"type:bytes;size:160;index;" json:"CustomSlug" yaml:"-"`
+	LabelName        string     `gorm:"size:160;" json:"Name" yaml:"Name"`
+	LabelFavorite    bool       `gorm:"default:0;" json:"Favorite" yaml:"Favorite,omitempty"`
+	LabelPriority    int        `gorm:"default:0;size:32;" json:"Priority" yaml:"Priority,omitempty"`
+	LabelNSFW        bool       `gorm:"column:label_nsfw;default:0;" json:"NSFW,omitempty" yaml:"NSFW,omitempty"`
+	LabelDescription string     `gorm:"size:2048;" json:"Description" yaml:"Description,omitempty"`
+	LabelNotes       string     `gorm:"size:1024;" json:"Notes" yaml:"Notes,omitempty"`
+	LabelCategories  []*Label   `gorm:"many2many:categories;joinForeignKey:LabelID;joinReferences:CategoryID;-:migration" json:"-" yaml:"-"`
+	PhotoCount       int        `gorm:"default:1;size:32" json:"PhotoCount" yaml:"-"`
+	Thumb            string     `gorm:"type:bytes;size:128;index;default:''" json:"Thumb" yaml:"Thumb,omitempty"`
+	ThumbSrc         string     `gorm:"type:bytes;size:8;default:''" json:"ThumbSrc,omitempty" yaml:"ThumbSrc,omitempty"`
 	CreatedAt        time.Time  `json:"CreatedAt" yaml:"-"`
 	UpdatedAt        time.Time  `json:"UpdatedAt" yaml:"-"`
-	PublishedAt      *time.Time `sql:"index" json:"PublishedAt,omitempty" yaml:"PublishedAt,omitempty"`
-	DeletedAt        *time.Time `sql:"index" json:"DeletedAt,omitempty" yaml:"-"`
+	PublishedAt      *time.Time `gorm:"index" json:"PublishedAt,omitempty" yaml:"PublishedAt,omitempty"`
+	DeletedAt        DeletedAt  `gorm:"index" json:"DeletedAt,omitzero" yaml:"-"`
 	New              bool       `gorm:"-" json:"-" yaml:"-"`
 }
 
@@ -50,16 +57,37 @@ func (Label) TableName() string {
 	return "labels"
 }
 
+// AfterUpdate flushes the label cache when a label is updated.
+func (m *Label) AfterUpdate(tx *gorm.DB) (err error) {
+	FlushLabelCache()
+	return
+}
+
+// AfterDelete flushes the label cache when a label is deleted.
+func (m *Label) AfterDelete(tx *gorm.DB) (err error) {
+	FlushLabelCache()
+	return
+}
+
+// AfterCreate sets the New column used for database callback
+func (m *Label) AfterCreate(tx *gorm.DB) error {
+	m.New = true
+	FlushLabelCache()
+	return nil
+}
+
 // BeforeCreate creates a random UID if needed before inserting a new row to the database.
-func (m *Label) BeforeCreate(scope *gorm.Scope) error {
+func (m *Label) BeforeCreate(tx *gorm.DB) error {
 	if rnd.IsUnique(m.LabelUID, LabelUID) {
 		return nil
 	}
 
-	return scope.SetColumn("LabelUID", rnd.GenerateUID(LabelUID))
+	tx.Statement.SetColumn("LabelUID", rnd.GenerateUID(LabelUID))
+
+	return nil
 }
 
-// NewLabel returns a new label.
+// NewLabel constructs a label entity from a name and priority, normalizing title/slug fields.
 func NewLabel(name string, priority int) *Label {
 	labelName := txt.Clip(name, txt.ClipDefault)
 
@@ -67,7 +95,7 @@ func NewLabel(name string, priority int) *Label {
 		labelName = "Unknown"
 	}
 
-	labelName = txt.Title(labelName)
+	labelName = normalizeLabelName(labelName)
 	labelSlug := txt.Slug(labelName)
 
 	result := &Label{
@@ -81,61 +109,171 @@ func NewLabel(name string, priority int) *Label {
 	return result
 }
 
-// Save updates the record in the database or inserts a new record if it does not already exist.
+// Save persists label changes while holding the global label mutex.
 func (m *Label) Save() error {
 	labelMutex.Lock()
 	defer labelMutex.Unlock()
 
+	if err := ensureUniqueLabelSlugs(m); err != nil {
+		return err
+	}
+
 	return Db().Save(m).Error
 }
 
-// Create inserts the label to the database.
+// SaveForm copies validated form data into the label and persists it.
+func (m *Label) SaveForm(f *form.Label) error {
+	if f == nil {
+		return fmt.Errorf("form is nil")
+	} else if f.LabelName == "" || txt.Slug(f.LabelName) == "" {
+		return ErrInvalidName
+	}
+
+	labelMutex.Lock()
+	defer labelMutex.Unlock()
+
+	if err := deepcopier.Copy(m).From(f); err != nil {
+		return err
+	}
+
+	m.LabelDescription = clean.Text(m.LabelDescription)
+	m.LabelNotes = clean.Text(m.LabelNotes)
+	m.Thumb = clean.StripControl(m.Thumb)
+	m.ThumbSrc = clean.StripControl(m.ThumbSrc)
+
+	if m.SetName(f.LabelName) {
+		if err := ensureUniqueLabelSlugs(m); err != nil {
+			return err
+		}
+
+		return Db().Save(m).Error
+	} else {
+		return ErrInvalidName
+	}
+}
+
+// Create inserts the label into the database while holding the global label mutex.
 func (m *Label) Create() error {
 	labelMutex.Lock()
 	defer labelMutex.Unlock()
 
-	return Db().Create(m).Error
+	if err := ensureUniqueLabelSlugs(m); err != nil {
+		return err
+	}
+
+	return UnscopedDb().Create(m).Error
 }
 
 // Delete removes the label from the database.
 func (m *Label) Delete() error {
 	Db().Where("label_id = ? OR category_id = ?", m.ID, m.ID).Delete(&Category{})
 	Db().Where("label_id = ?", m.ID).Delete(&PhotoLabel{})
-	return Db().Delete(m).Error
-}
+	FlushLabelCache()
 
-// Deleted returns true if the label is deleted.
-func (m *Label) Deleted() bool {
-	if m.DeletedAt == nil {
-		return false
-	}
-
-	return !m.DeletedAt.IsZero()
-}
-
-// Restore restores the label in the database.
-func (m *Label) Restore() error {
-	if m.Deleted() {
-		return UnscopedDb().Model(m).Update("DeletedAt", nil).Error
+	if err := Db().Delete(m).Error; err != nil {
+		return err
 	}
 
 	return nil
 }
 
-// Update a label property in the database.
-func (m *Label) Update(attr string, value interface{}) error {
-	return UnscopedDb().Model(m).UpdateColumn(attr, value).Error
+// Deleted returns true if the label is deleted.
+func (m *Label) Deleted() bool {
+	if !m.DeletedAt.Valid {
+		return false
+	}
+
+	return !m.DeletedAt.Time.IsZero()
 }
 
-// FirstOrCreateLabel returns the existing label, inserts a new label or nil in case of errors.
-func FirstOrCreateLabel(m *Label) *Label {
-	result := Label{}
+// Restore restores the label in the database.
+func (m *Label) Restore() error {
+	if !m.Deleted() {
+		return nil
+	}
 
-	if err := UnscopedDb().Where("label_slug = ? OR custom_slug = ?", m.LabelSlug, m.CustomSlug).First(&result).Error; err == nil {
-		return &result
-	} else if createErr := m.Create(); createErr == nil {
+	if err := UnscopedDb().Model(m).Update("DeletedAt", nil).Error; err != nil {
+		return err
+	}
+
+	m.DeletedAt = DeletedAt{}
+
+	return nil
+}
+
+// HasID tests if the entity has an ID and a valid UID.
+func (m *Label) HasID() bool {
+	if m == nil {
+		return false
+	}
+
+	return m.ID > 0 && m.HasUID()
+}
+
+// HasUID tests if the entity has a valid UID.
+func (m *Label) HasUID() bool {
+	if m == nil {
+		return false
+	}
+
+	return rnd.IsUID(m.LabelUID, LabelUID)
+}
+
+// Skip tests if the entity has invalid IDs or has been deleted and therefore should not be assigned.
+func (m *Label) Skip() bool {
+	if m == nil {
+		return true
+	} else if !m.HasID() {
+		return true
+	} else if m.Deleted() {
+		return true
+	}
+
+	return false
+}
+
+// Update a label property in the database.
+func (m *Label) Update(attr string, value any) error {
+	if m == nil {
+		return errors.New("label must not be nil - you may have found a bug")
+	} else if !m.HasID() {
+		return errors.New("label ID must not be empty - you may have found a bug")
+	}
+
+	return UnscopedDb().Model(m).Update(attr, value).Error
+}
+
+// Updates multiple columns in the database.
+func (m *Label) Updates(values any) error {
+	if values == nil {
+		return nil
+	} else if m == nil {
+		return errors.New("label must not be nil - you may have found a bug")
+	} else if !m.HasID() {
+		return errors.New("label ID must not be empty - you may have found a bug")
+	}
+
+	return UnscopedDb().Model(m).Updates(values).Error
+}
+
+// FirstOrCreateLabel reuses an existing label matched by slug/custom slug or creates and returns a new one; nil signals lookup/create failure.
+func FirstOrCreateLabel(m *Label) *Label {
+	if m.LabelSlug == "" && m.CustomSlug == "" {
+		return nil
+	}
+
+	if result := findLabelByExactName(m.LabelName); result != nil {
+		return result
+	}
+
+	if err := ensureUniqueLabelSlugs(m); err != nil {
+		log.Errorf("label: %s (prepare %s)", err, clean.Log(m.LabelName))
+		return nil
+	}
+
+	if createErr := m.Create(); createErr == nil {
 		if m.LabelPriority >= 0 {
-			event.EntitiesCreated("labels", []*Label{m})
+			event.EntitiesCreated("labels", []string{m.LabelUID})
 
 			event.Publish("count.labels", event.Data{
 				"count": 1,
@@ -143,8 +281,10 @@ func FirstOrCreateLabel(m *Label) *Label {
 		}
 
 		return m
-	} else if err := UnscopedDb().Where("label_slug = ? OR custom_slug = ?", m.LabelSlug, m.CustomSlug).First(&result).Error; err == nil {
-		return &result
+	} else if result := findLabelByExactName(m.LabelName); result != nil {
+		return result
+	} else if result := findLabelBySlugValue(m.CustomSlug, 0); result != nil && sameLabelName(result.LabelName, m.LabelName) {
+		return result
 	} else {
 		log.Errorf("label: %s (find or create %s)", createErr, m.LabelSlug)
 	}
@@ -152,35 +292,91 @@ func FirstOrCreateLabel(m *Label) *Label {
 	return nil
 }
 
-// FindLabel returns an existing row if exists.
-func FindLabel(s string) *Label {
-	labelSlug := txt.Slug(s)
-
-	result := Label{}
-
-	if err := Db().Where("label_slug = ? OR custom_slug = ?", labelSlug, labelSlug).First(&result).Error; err == nil {
-		return &result
-	}
-
-	return nil
-}
-
-// AfterCreate sets the New column used for database callback
-func (m *Label) AfterCreate(scope *gorm.Scope) error {
-	m.New = true
-	return nil
-}
-
 // SetName changes the label name.
-func (m *Label) SetName(name string) {
-	name = clean.NameCapitalized(name)
+func (m *Label) SetName(name string) bool {
+	labelName := normalizeLabelName(name)
 
-	if name == "" {
-		return
+	if labelName == "" {
+		return false
 	}
 
-	m.LabelName = txt.Clip(name, txt.ClipName)
-	m.CustomSlug = txt.Slug(name)
+	labelSlug := txt.Slug(labelName)
+
+	if labelSlug == "" {
+		return false
+	}
+
+	m.LabelName = labelName
+	m.CustomSlug = labelSlug
+
+	if m.LabelSlug == "" {
+		m.LabelSlug = labelSlug
+	}
+
+	return true
+}
+
+// Rename updates the display name and derived slugs while preserving label identity and other properties.
+func (m *Label) Rename(name string) error {
+	if m == nil || !m.HasID() {
+		return ErrInvalidName
+	}
+	labelMutex.Lock()
+	defer labelMutex.Unlock()
+	renamed := *m
+	if !renamed.SetName(name) {
+		return ErrInvalidName
+	}
+	if err := ensureUniqueLabelSlugs(&renamed); err != nil {
+		return err
+	}
+	values := Values{"label_name": renamed.LabelName, "custom_slug": renamed.CustomSlug}
+	if m.LabelSlug == "" {
+		values["label_slug"] = renamed.LabelSlug
+	} else {
+		renamed.LabelSlug = m.LabelSlug
+	}
+	var res *gorm.DB
+	if err := RetryDeadlock("rename label", func() error {
+		res = Db().Model(&Label{}).Where("id = ?", m.ID).UpdateColumns(values)
+		return res.Error
+	}); err != nil {
+		return err
+	}
+	if res.RowsAffected == 0 {
+		var count int64
+		if err := Db().Model(&Label{}).Where("id = ?", m.ID).Count(&count).Error; err != nil {
+			return err
+		}
+		if count == 0 {
+			return gorm.ErrRecordNotFound
+		}
+	}
+	m.LabelName, m.CustomSlug, m.LabelSlug = renamed.LabelName, renamed.CustomSlug, renamed.LabelSlug
+	FlushLabelCache()
+	return nil
+}
+
+// InvalidName checks if the label name is invalid.
+func (m *Label) InvalidName() bool {
+	labelName := normalizeLabelName(m.LabelName)
+
+	if labelName == "" {
+		return true
+	}
+
+	return txt.Slug(labelName) == ""
+}
+
+// GetSlug returns the label slug.
+func (m *Label) GetSlug() string {
+	if m.CustomSlug != "" {
+		return m.CustomSlug
+	} else if m.LabelSlug != "" {
+		return m.LabelSlug
+	}
+
+	return txt.Slug(m.LabelName)
 }
 
 // UpdateClassify updates a label if necessary
@@ -202,8 +398,11 @@ func (m *Label) UpdateClassify(label classify.Label) error {
 	}
 
 	if m.CustomSlug == m.LabelSlug && label.Title() != m.LabelName {
-		m.SetName(label.Title())
-		save = true
+		if m.SetName(label.Title()) {
+			save = true
+		} else {
+			return ErrInvalidName
+		}
 	}
 
 	// Save label.
@@ -225,12 +424,14 @@ func (m *Label) UpdateClassify(label classify.Label) error {
 				continue
 			}
 
-			if sn.Deleted() {
+			if sn.Skip() {
 				continue
 			}
 
-			if err := db.Model(m).Association("LabelCategories").Append(sn).Error; err != nil {
+			if err := db.Clauses(clause.OnConflict{DoNothing: true}).Create(&Category{LabelID: m.ID, CategoryID: sn.ID}).Error; err != nil {
 				log.Debugf("index: failed saving label category %s (%s)", clean.Log(category), err)
+			} else {
+				m.LabelCategories = append(m.LabelCategories, sn)
 			}
 		}
 	}

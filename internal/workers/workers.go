@@ -1,7 +1,7 @@
 /*
 Package workers provides index, sync, and metadata optimization background workers.
 
-Copyright (c) 2018 - 2023 PhotoPrism UG. All rights reserved.
+Copyright (c) 2018 - 2026 PhotoPrism UG. All rights reserved.
 
 	This program is free software: you can redistribute it and/or modify
 	it under Version 3 of the GNU Affero General Public License (the "AGPL"):
@@ -14,7 +14,7 @@ Copyright (c) 2018 - 2023 PhotoPrism UG. All rights reserved.
 
 	The AGPL is supplemented by our Trademark and Brand Guidelines,
 	which describe how our Brand Assets may be used:
-	<https://www.photoprism.app/trademark>
+	<https://www.photoprism.app/trademark/>
 
 Feel free to send an email to hello@photoprism.app if you have questions,
 want to support our work, or just want to say hello.
@@ -25,22 +25,76 @@ Additional information can be found in our Developer Guide:
 package workers
 
 import (
+	"path/filepath"
 	"time"
 
+	"github.com/go-co-op/gocron/v2"
+
 	"github.com/photoprism/photoprism/internal/config"
+	"github.com/photoprism/photoprism/internal/config/ttl"
 	"github.com/photoprism/photoprism/internal/entity"
 	"github.com/photoprism/photoprism/internal/event"
 	"github.com/photoprism/photoprism/internal/mutex"
+	"github.com/photoprism/photoprism/pkg/clean"
+	"github.com/photoprism/photoprism/pkg/fs"
 )
 
 var log = event.Log
 var stop = make(chan bool, 1)
 
-// Start runs the metadata, share & sync background workers at regular intervals.
+// Start launches background workers and scheduled tasks based on the current
+// configuration. It sets up the cron scheduler and the periodic metadata/share
+// workers.
 func Start(conf *config.Config) {
+	if scheduler, err := gocron.NewScheduler(gocron.WithLocation(conf.DefaultTimezone())); err != nil {
+		log.Errorf("scheduler: %s (start)", err)
+		return
+	} else if scheduler != nil {
+		Scheduler = scheduler
+
+		// Schedule backup job.
+		if err = NewJob("backup", conf.BackupSchedule(), NewBackup(conf).StartScheduled); err != nil {
+			log.Errorf("scheduler: %s (backup)", err)
+		}
+
+		// Only portals issue JWTs, so only they need a signing key to rotate. The startup
+		// check runs as well, since a portal that is never up at the scheduled hour would
+		// otherwise never reach a tick.
+		if conf.Portal() {
+			if err = NewJob("jwt-keys", JWTKeySchedule, func() { RunJWTKeyRotation(conf) }); err != nil {
+				event.SystemError([]string{"scheduler", "jwt keys", "%s"}, clean.ErrorFull(err))
+			}
+
+			go event.Safe(func() { RunJWTKeyRotation(conf) })
+		}
+
+		// Only schedule index and vision jobs if this is not a portal.
+		if !conf.Portal() {
+			// Schedule indexing job.
+			if err = NewJob("index", conf.IndexSchedule(), NewIndex(conf).StartScheduled); err != nil {
+				log.Errorf("scheduler: %s (index)", err)
+			}
+
+			// Schedule vision job.
+			if err = NewJob("vision", conf.VisionSchedule(), NewVision(conf).StartScheduled); err != nil {
+				log.Errorf("scheduler: %s (vision)", err)
+			}
+		}
+
+		// Start the scheduler.
+		Scheduler.Start()
+	}
+
+	// Only run metadata, share & sync background workers if this is not a portal.
+	if conf.Portal() {
+		log.Infof("config: disabled metadata, share & sync background workers")
+		return
+	}
+
+	// Start the other background workers.
 	interval := conf.WakeupInterval()
 
-	// Disabled in safe mode?
+	// Other workers can be disabled in safe mode by setting the execution interval to a value < 1.
 	if interval.Seconds() <= 0 {
 		log.Warnf("config: disabled metadata, share & sync background workers")
 		return
@@ -52,29 +106,39 @@ func Start(conf *config.Config) {
 		for {
 			select {
 			case <-stop:
-				log.Info("shutting down workers")
 				ticker.Stop()
 				mutex.MetaWorker.Cancel()
 				mutex.ShareWorker.Cancel()
 				mutex.SyncWorker.Cancel()
 				return
 			case <-ticker.C:
-				RunMeta(conf)
-				RunShare(conf)
-				RunSync(conf)
+				event.Safe(func() {
+					RunMeta(conf)
+					RunShare(conf)
+					RunSync(conf)
+					RunPurgeExpired(conf)
+				})
 			}
 		}
 	}()
 }
 
-// Stop shuts down all service workers.
-func Stop() {
+// Shutdown stops the background workers and shuts down the scheduler.
+func Shutdown() {
+	log.Info("shutting down workers")
+
 	stop <- true
+
+	if Scheduler != nil {
+		if err := Scheduler.Shutdown(); err != nil {
+			log.Warnf("scheduler: %s (shutdown)", err)
+		}
+	}
 }
 
 // RunMeta runs the metadata worker once.
 func RunMeta(conf *config.Config) {
-	if !mutex.IndexWorkersRunning() {
+	if !mutex.WorkersRunning() {
 		go func() {
 			worker := NewMeta(conf)
 
@@ -97,6 +161,30 @@ func RunShare(conf *config.Config) {
 				log.Warnf("share: %s", err)
 			}
 		}()
+	}
+}
+
+// RunPurgeArchives removes expired download archives from the temp directory once.
+// It returns without disk access while mutex.TempArchives is clear, so an idle instance never wakes up
+// sleeping storage, and clears the flag before scanning so a concurrent creation that re-arms it during
+// the sweep is not overwritten.
+func RunPurgeArchives(conf *config.Config) {
+	if !mutex.TempArchives.Load() {
+		return
+	}
+
+	mutex.TempArchives.Store(false)
+
+	maxAge := time.Duration(ttl.DownloadArchiveAge.Int()) * time.Second
+	removed, remaining, failed := fs.PurgeExpired(filepath.Join(conf.TempPath(), fs.ZipDir), fs.ExtZip, maxAge)
+
+	// Keep scanning while archives are left, e.g. because they have not expired yet.
+	if remaining > 0 {
+		mutex.TempArchives.Store(true)
+	}
+
+	if removed > 0 || failed > 0 {
+		log.Debugf("download: removed %d expired archives, %d could not be deleted", removed, failed)
 	}
 }
 

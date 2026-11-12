@@ -1,13 +1,15 @@
 package form
 
 import (
+	"net/http"
+	"net/http/httptest"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 )
 
 func TestNewService(t *testing.T) {
-	t.Run("success", func(t *testing.T) {
+	t.Run("Success", func(t *testing.T) {
 		service := Service{AccName: "Foo", AccOwner: "bar", AccURL: "test.com", AccType: "test", AccKey: "123", AccUser: "testuser", AccPass: "testpass",
 			AccError: "", AccShare: true, AccSync: true, RetryLimit: 4, SharePath: "/home", ShareSize: "500", ShareExpires: 3500, SyncPath: "/sync",
 			SyncInterval: 5, SyncUpload: true, SyncDownload: false, SyncFilenames: true, SyncRaw: false}
@@ -42,16 +44,26 @@ func TestNewService(t *testing.T) {
 }
 
 func TestService_Discovery(t *testing.T) {
-	t.Run("error = nil", func(t *testing.T) {
-		service := Service{AccName: "Foo", AccOwner: "bar", AccURL: "photoprism.app", AccType: "test", SyncDownload: false, AccShare: true}
+	t.Run("ErrorEqualNil", func(t *testing.T) {
+		// Use a local WebDAV-like server so discovery is deterministic instead of probing a
+		// live website whose responses can change; the WebDAV heuristic matches any status
+		// below 400 (here a PROPFIND 207 Multi-Status) on a reachable path.
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusMultiStatus)
+		}))
+		defer srv.Close()
 
-		err := service.Discovery()
-		assert.Equal(t, nil, err)
+		service := Service{AccName: "Foo", AccOwner: "bar", AccURL: srv.URL, AccType: "test", SyncDownload: false, AccShare: true}
+
+		// Allow the loopback test server; discovery blocks private hosts unless permitted.
+		err := service.Discovery("127.0.0.0/8")
+		assert.NoError(t, err)
+		assert.Equal(t, "webdav", service.AccType)
 	})
-	t.Run("error != nil", func(t *testing.T) {
+	t.Run("ErrorNotEqualNil", func(t *testing.T) {
 		service := Service{AccName: "XXX", AccOwner: "bar"}
 
-		err := service.Discovery()
+		err := service.Discovery("")
 		assert.Equal(t, "service URL is empty", err.Error())
 	})
 }

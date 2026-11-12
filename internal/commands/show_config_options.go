@@ -2,26 +2,23 @@ package commands
 
 import (
 	"fmt"
+	"strings"
 
 	"github.com/sirupsen/logrus"
-	"github.com/urfave/cli"
+	"github.com/urfave/cli/v2"
 
 	"github.com/photoprism/photoprism/internal/config"
-	"github.com/photoprism/photoprism/pkg/report"
+	"github.com/photoprism/photoprism/pkg/txt/report"
 )
 
 // ShowConfigOptionsCommand configures the command name, flags, and action.
-var ShowConfigOptionsCommand = cli.Command{
-	Name:   "config-options",
-	Usage:  "Displays supported environment variables and CLI flags",
-	Flags:  report.CliFlags,
-	Action: showConfigOptionsAction,
+var ShowConfigOptionsCommand = &cli.Command{
+	Name:        "config-options",
+	Usage:       "Displays supported environment variables and CLI flags",
+	Description: "For readability, standard and Markdown text output is divided into sections. The --json, --csv, and --tsv options return a flat list.",
+	Flags:       report.CliFlags,
+	Action:      showConfigOptionsAction,
 }
-
-var faceFlagsInfo = `!!! info ""
-    To [recognize faces](https://docs.photoprism.app/user-guide/organize/people/), PhotoPrism first extracts crops from your images using a [library](https://github.com/esimov/pigo) based on [pixel intensity comparisons](https://dl.photoprism.app/pdf/20140820-Pixel_Intensity_Comparisons.pdf). These are then fed into TensorFlow to compute [512-dimensional vectors](https://dl.photoprism.app/pdf/20150101-FaceNet.pdf) for characterization. In the final step, the [DBSCAN algorithm](https://en.wikipedia.org/wiki/DBSCAN) attempts to cluster these so-called face embeddings, so they can be matched to persons with just a few clicks. A reasonable range for the similarity distance between face embeddings is between 0.60 and 0.70, with a higher value being more aggressive and leading to larger clusters with more false positives. To cluster a smaller number of faces, you can reduce the core to 3 or 2 similar faces.
-
-We recommend that only advanced users change these parameters:`
 
 // showConfigOptionsAction displays supported environment variables and CLI flags.
 func showConfigOptionsAction(ctx *cli.Context) error {
@@ -29,48 +26,68 @@ func showConfigOptionsAction(ctx *cli.Context) error {
 	conf.SetLogLevel(logrus.FatalLevel)
 
 	rows, cols := config.Flags.Report()
+	format, formatErr := report.CliFormatStrict(ctx)
+	if formatErr != nil {
+		return formatErr
+	}
 
-	// CSV Export?
-	if ctx.Bool("csv") || ctx.Bool("tsv") {
-		result, err := report.RenderFormat(rows, cols, report.CliFormat(ctx))
-
+	// CSV/TSV/JSON exports use default single-table rendering.
+	if format == report.CSV || format == report.TSV || format == report.JSON {
+		result, err := report.RenderFormat(rows, cols, format)
 		fmt.Println(result)
-
 		return err
 	}
 
-	type Section struct {
-		Start string
-		Title string
-		Info  string
-	}
+	// JSON aggregation path (commented out because non-nested output is preferred for now).
+	/* if format == report.JSON {
+		type section struct {
+			Title string              `json:"title"`
+			Info  string              `json:"info,omitempty"`
+			Items []map[string]string `json:"items"`
+		}
+		sectionsCfg := config.OptionsReportSections
+		agg := make([]section, 0, len(sectionsCfg))
+		j := 0
+		for i, sec := range sectionsCfg {
+			secRows := make([][]string, 0)
+			for {
+				row := rows[j]
+				if len(row) < 1 {
+					continue
+				}
+				if i < len(sectionsCfg)-1 && sectionsCfg[i+1].Start == row[0] {
+					break
+				}
+				secRows = append(secRows, row)
+				j++
+				if j >= len(rows) {
+					break
+				}
+			}
+			agg = append(agg, section{Title: sec.Title, Info: sec.Info, Items: report.RowsToObjects(secRows, cols)})
+			if j >= len(rows) {
+				break
+			}
+		}
+		b, _ := report.MarshalJSON(map[string]interface{}{"sections": agg})
+		fmt.Println(string(b))
+		return nil
+	} */
 
-	s := []Section{
-		{Start: "PHOTOPRISM_ADMIN_PASSWORD", Title: "Authentication"},
-		{Start: "PHOTOPRISM_LOG_LEVEL", Title: "Logging"},
-		{Start: "PHOTOPRISM_CONFIG_PATH", Title: "Storage"},
-		{Start: "PHOTOPRISM_WORKERS", Title: "Index Workers"},
-		{Start: "PHOTOPRISM_READONLY", Title: "Feature Flags"},
-		{Start: "PHOTOPRISM_DEFAULT_LOCALE", Title: "Customization"},
-		{Start: "PHOTOPRISM_CDN_URL", Title: "Site Information"},
-		{Start: "PHOTOPRISM_HTTPS_PROXY", Title: "Proxy Servers"},
-		{Start: "PHOTOPRISM_DISABLE_TLS", Title: "Web Server"},
-		{Start: "PHOTOPRISM_DATABASE_DRIVER", Title: "Database Connection"},
-		{Start: "PHOTOPRISM_SIPS_BIN", Title: "File Converters"},
-		{Start: "PHOTOPRISM_DOWNLOAD_TOKEN", Title: "Security Tokens"},
-		{Start: "PHOTOPRISM_THUMB_COLOR", Title: "Image Quality"},
-		{Start: "PHOTOPRISM_FACE_SIZE", Title: "Face Recognition",
-			Info: faceFlagsInfo},
-		{Start: "PHOTOPRISM_PID_FILENAME", Title: "Daemon Mode",
-			Info: "If you start the server as a *daemon* in the background, you can additionally specify a filename for the log and the process ID:"},
-	}
+	markDown := ctx.Bool("md")
+	sections := config.OptionsReportSections
 
 	j := 0
 
-	for i, sec := range s {
-		fmt.Printf("### %s ###\n\n", sec.Title)
-		if sec.Info != "" && ctx.Bool("md") {
-			fmt.Printf("%s\n\n", sec.Info)
+	for i, section := range sections {
+		if markDown {
+			fmt.Printf("### %s\n\n", section.Title)
+		} else {
+			fmt.Printf("%s\n\n", strings.ToUpper(section.Title))
+		}
+
+		if section.Info != "" && markDown {
+			fmt.Printf("%s\n\n", section.Info)
 		}
 
 		secRows := make([][]string, 0, len(rows))
@@ -82,8 +99,8 @@ func showConfigOptionsAction(ctx *cli.Context) error {
 				continue
 			}
 
-			if i < len(s)-1 {
-				if s[i+1].Start == row[0] {
+			if i < len(sections)-1 {
+				if sections[i+1].Start == row[0] {
 					break
 				}
 			}
@@ -96,7 +113,8 @@ func showConfigOptionsAction(ctx *cli.Context) error {
 			}
 		}
 
-		result, err := report.RenderFormat(secRows, cols, report.CliFormat(ctx))
+		// JSON handled earlier; Markdown and default render per section below.
+		result, err := report.RenderFormat(secRows, cols, format)
 
 		if err != nil {
 			return err

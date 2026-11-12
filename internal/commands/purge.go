@@ -3,20 +3,19 @@ package commands
 import (
 	"context"
 	"path/filepath"
-	"strings"
 	"time"
 
 	"github.com/dustin/go-humanize/english"
-	"github.com/urfave/cli"
+	"github.com/urfave/cli/v2"
 
-	"github.com/photoprism/photoprism/internal/get"
 	"github.com/photoprism/photoprism/internal/photoprism"
+	"github.com/photoprism/photoprism/internal/photoprism/get"
 	"github.com/photoprism/photoprism/pkg/clean"
 	"github.com/photoprism/photoprism/pkg/fs"
 )
 
 // PurgeCommand configures the command name, flags, and action.
-var PurgeCommand = cli.Command{
+var PurgeCommand = &cli.Command{
 	Name:   "purge",
 	Usage:  "Updates missing files, photo counts, and album covers",
 	Flags:  purgeFlags,
@@ -24,14 +23,11 @@ var PurgeCommand = cli.Command{
 }
 
 var purgeFlags = []cli.Flag{
-	cli.BoolFlag{
+	&cli.BoolFlag{
 		Name:  "hard",
-		Usage: "permanently remove from index",
+		Usage: "permanently removes data from the index",
 	},
-	cli.BoolFlag{
-		Name:  "dry",
-		Usage: "dry run, don't actually remove anything",
-	},
+	DryRunFlag("performs a dry run that doesn't actually remove anything"),
 }
 
 // purgeAction removes missing files from search results
@@ -50,8 +46,12 @@ func purgeAction(ctx *cli.Context) error {
 	conf.InitDb()
 	defer conf.Shutdown()
 
-	// get cli first argument
-	subPath := strings.TrimSpace(ctx.Args().First())
+	// Use first argument to limit scope if set.
+	subPath, err := sanitizeSubfolderArg(ctx.Args().First())
+
+	if err != nil {
+		return err
+	}
 
 	if subPath == "" {
 		log.Infof("purge: removing missing files in %s", clean.Log(filepath.Base(conf.OriginalsPath())))
@@ -67,7 +67,7 @@ func purgeAction(ctx *cli.Context) error {
 
 	opt := photoprism.PurgeOptions{
 		Path:  subPath,
-		Dry:   ctx.Bool("dry"),
+		Dry:   ctx.Bool("dry-run"),
 		Hard:  ctx.Bool("hard"),
 		Force: true,
 	}

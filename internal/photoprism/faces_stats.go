@@ -2,12 +2,19 @@ package photoprism
 
 import (
 	"github.com/montanaflynn/stats"
-	"github.com/photoprism/photoprism/internal/query"
+
+	"github.com/photoprism/photoprism/internal/ai/face"
+	"github.com/photoprism/photoprism/internal/entity/query"
 )
 
 // Stats shows statistics on face embeddings.
+//
+// Over what clustering would read rather than over every stored vector: passing no size bar still
+// applies the crop-detail condition, so a marker embedded from a crop its source could not fill is
+// left out. That is deliberate - the distances an operator reads here are the ones the clustering
+// distances are compared against - and it is the only caller that passes no bar at all.
 func (w *Faces) Stats() (err error) {
-	if embeddings, err := query.Embeddings(true, false, 0, 0); err != nil {
+	if embeddings, err := query.Embeddings(true, false, 0, 0, face.EmbeddingModelName()); err != nil {
 		return err
 	} else if samples := len(embeddings); samples == 0 {
 		log.Infof("faces: found no samples")
@@ -17,11 +24,11 @@ func (w *Faces) Stats() (err error) {
 		distMin := make([]float64, samples)
 		distMax := make([]float64, samples)
 
-		for i := 0; i < samples; i++ {
+		for i := range samples {
 			min := -1.0
 			max := -1.0
 
-			for j := 0; j < samples; j++ {
+			for j := range samples {
 				if i == j {
 					continue
 				}
@@ -54,14 +61,14 @@ func (w *Faces) Stats() (err error) {
 		log.Infof("faces: max Ø %f < median %f < %f", maxMin, maxMedian, maxMax)
 	}
 
-	if faces, err := query.Faces(true, false, false, false); err != nil {
+	if faces, err := query.MatchableFaces(true, false, false, false); err != nil {
 		log.Errorf("faces: %s", err)
 	} else if samples := len(faces); samples > 0 {
 		log.Infof("faces: computing distance of faces matching to the same person")
 
 		dist := make(map[string][]float64)
 
-		for i := 0; i < samples; i++ {
+		for i := range samples {
 			f1 := faces[i]
 
 			e1 := f1.Embedding()
@@ -73,7 +80,7 @@ func (w *Faces) Stats() (err error) {
 				max = k[1]
 			}
 
-			for j := 0; j < samples; j++ {
+			for j := range samples {
 				if i == j {
 					continue
 				}

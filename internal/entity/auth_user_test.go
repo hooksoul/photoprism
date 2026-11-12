@@ -1,15 +1,57 @@
 package entity
 
 import (
+	"errors"
+	"flag"
+	"fmt"
+	"path"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"github.com/zitadel/oidc/v3/pkg/oidc"
 
-	"github.com/photoprism/photoprism/internal/acl"
+	"github.com/urfave/cli/v2"
+	"gorm.io/gorm"
+
+	"github.com/photoprism/photoprism/internal/auth/acl"
 	"github.com/photoprism/photoprism/internal/form"
 	"github.com/photoprism/photoprism/pkg/authn"
+	"github.com/photoprism/photoprism/pkg/clean"
+	"github.com/photoprism/photoprism/pkg/dsn"
+	"github.com/photoprism/photoprism/pkg/fs"
+	"github.com/photoprism/photoprism/pkg/list"
 	"github.com/photoprism/photoprism/pkg/rnd"
+	"github.com/photoprism/photoprism/pkg/time/unix"
+	"github.com/photoprism/photoprism/pkg/txt"
 )
+
+func createScopedTestUser(t *testing.T) *User {
+	t.Helper()
+
+	user := NewUser()
+	user.UserName = "scope-" + rnd.Base36(6)
+	user.DisplayName = "Scoped User"
+	user.UserEmail = user.UserName + "@example.com"
+	user.UserRole = acl.RoleAdmin.String()
+	user.SuperAdmin = true
+	user.CanLogin = true
+
+	require.NoError(t, user.Create())
+
+	t.Cleanup(func() {
+		if err := UnscopedDb().Delete(&Password{}, "uid = ?", user.UserUID).Error; err != nil {
+			t.Fatalf("cleanup password: %v", err)
+		}
+		if err := UnscopedDb().Delete(&User{}, "user_uid = ?", user.UserUID).Error; err != nil {
+			t.Fatalf("cleanup user: %v", err)
+		}
+	})
+
+	return user
+}
 
 func TestNewUser(t *testing.T) {
 	m := NewUser()
@@ -18,12 +60,112 @@ func TestNewUser(t *testing.T) {
 	assert.True(t, rnd.IsUID(m.UserUID, UserUID))
 }
 
+func TestOidcUser(t *testing.T) {
+	t.Run("UnverifiedEmail", func(t *testing.T) {
+		info := &oidc.UserInfo{}
+		info.Email = "jane@doe.com"
+		info.Subject = "e3a9f4a6-9d60-47cb-9bf5-02bd15b0c68d"
+
+		m := OidcUser(info, "", "jane.doe")
+
+		assert.Equal(t, "", m.UserEmail)
+		assert.Equal(t, "jane.doe", m.UserName)
+	})
+	t.Run("VerifiedEmailNotASCII", func(t *testing.T) {
+		info := &oidc.UserInfo{}
+		info.Email = "\u212Aate@doe.com"
+		info.EmailVerified = true
+		info.Subject = "e3a9f4a6-9d60-47cb-9bf5-02bd15b0c68d"
+
+		m := OidcUser(info, "", "kate")
+
+		assert.Equal(t, "", m.UserEmail)
+		assert.Equal(t, "kate", m.UserName)
+	})
+	t.Run("Success", func(t *testing.T) {
+		info := &oidc.UserInfo{}
+		info.Name = "Jane Doe"
+		info.GivenName = "Jane"
+		info.FamilyName = "Doe"
+		info.Email = "jane@doe.com"
+		info.EmailVerified = true
+		info.Subject = "e3a9f4a6-9d60-47cb-9bf5-02bd15b0c68d"
+		info.PreferredUsername = "Jane Doe"
+
+		m := OidcUser(info, "", "jane.doe")
+
+		assert.Equal(t, "oidc", m.AuthProvider)
+		assert.Equal(t, "", m.AuthIssuer)
+		assert.Equal(t, "e3a9f4a6-9d60-47cb-9bf5-02bd15b0c68d", m.AuthID)
+		assert.Equal(t, "jane@doe.com", m.UserEmail)
+		assert.Equal(t, "jane.doe", m.UserName)
+		assert.Equal(t, "Jane Doe", m.DisplayName)
+	})
+	t.Run("LongNumberAsSubject", func(t *testing.T) {
+		info := &oidc.UserInfo{}
+		info.Name = "Jane Doe"
+		info.GivenName = "Jane"
+		info.FamilyName = "Doe"
+		info.Email = "jane@doe.com"
+		info.EmailVerified = true
+		info.Subject = "12345678901234567890"
+		info.PreferredUsername = "Jane Doe"
+
+		m := OidcUser(info, "", "jane.doe")
+
+		assert.Equal(t, "oidc", m.AuthProvider)
+		assert.Equal(t, "", m.AuthIssuer)
+		assert.Equal(t, "12345678901234567890", m.AuthID)
+		assert.Equal(t, "jane@doe.com", m.UserEmail)
+		assert.Equal(t, "jane.doe", m.UserName)
+		assert.Equal(t, "Jane Doe", m.DisplayName)
+	})
+	t.Run("NoUsername", func(t *testing.T) {
+		info := &oidc.UserInfo{}
+		info.Name = "Jane Doe"
+		info.GivenName = "Jane"
+		info.FamilyName = "Doe"
+		info.Email = "jane@doe.com"
+		info.EmailVerified = true
+		info.Subject = "e3a9f4a6-9d60-47cb-9bf5-02bd15b0c68d"
+		info.PreferredUsername = "Jane Doe"
+
+		m := OidcUser(info, "https://accounts.google.com", "")
+
+		assert.Equal(t, "oidc", m.AuthProvider)
+		assert.Equal(t, "https://accounts.google.com", m.AuthIssuer)
+		assert.Equal(t, "e3a9f4a6-9d60-47cb-9bf5-02bd15b0c68d", m.AuthID)
+		assert.Equal(t, "jane@doe.com", m.UserEmail)
+		assert.Equal(t, "", m.UserName)
+		assert.Equal(t, "Jane Doe", m.DisplayName)
+	})
+	t.Run("NoSubject", func(t *testing.T) {
+		info := &oidc.UserInfo{}
+		info.Name = "Jane Doe"
+		info.GivenName = "Jane"
+		info.FamilyName = "Doe"
+		info.Nickname = "Jens Mander"
+		info.Email = "jane@doe.com"
+		info.EmailVerified = true
+		info.Subject = ""
+
+		m := OidcUser(info, "https://accounts.google.com", "jane.doe")
+
+		assert.Equal(t, "", m.AuthProvider)
+		assert.Equal(t, "", m.AuthIssuer)
+		assert.Equal(t, "", m.AuthID)
+		assert.Equal(t, "", m.UserEmail)
+		assert.Equal(t, "", m.UserName)
+		assert.Equal(t, "", m.DisplayName)
+	})
+}
+
 func TestFindLocalUser(t *testing.T) {
 	t.Run("Admin", func(t *testing.T) {
 		m := FindLocalUser("admin")
 
 		if m == nil {
-			t.Fatal("result should not be nil")
+			t.Fatal("result must not be nil")
 		}
 
 		assert.Equal(t, 1, m.ID)
@@ -37,18 +179,19 @@ func TestFindLocalUser(t *testing.T) {
 		assert.Equal(t, acl.RoleAdmin, m.AclRole())
 		assert.Equal(t, "", m.Attr())
 		assert.False(t, m.IsVisitor())
+		assert.False(t, m.HasSharedAccessOnly(acl.ResourcePhotos))
+		assert.False(t, m.HasSharedAccessOnly(acl.ResourceAlbums))
 		assert.True(t, m.SuperAdmin)
 		assert.True(t, m.CanLogin)
 		assert.True(t, m.CanInvite)
 		assert.NotEmpty(t, m.CreatedAt)
 		assert.NotEmpty(t, m.UpdatedAt)
 	})
-
 	t.Run("Alice", func(t *testing.T) {
 		m := FindLocalUser("alice")
 
 		if m == nil {
-			t.Fatal("result should not be nil")
+			t.Fatal("result must not be nil")
 		}
 
 		assert.Equal(t, 5, m.ID)
@@ -60,16 +203,17 @@ func TestFindLocalUser(t *testing.T) {
 		assert.Equal(t, acl.RoleAdmin, m.AclRole())
 		assert.NotEqual(t, acl.RoleVisitor, m.AclRole())
 		assert.False(t, m.IsVisitor())
+		assert.False(t, m.HasSharedAccessOnly(acl.ResourcePhotos))
+		assert.False(t, m.HasSharedAccessOnly(acl.ResourceAlbums))
 		assert.True(t, m.CanLogin)
 		assert.NotEmpty(t, m.CreatedAt)
 		assert.NotEmpty(t, m.UpdatedAt)
 	})
-
 	t.Run("Bob", func(t *testing.T) {
 		m := FindLocalUser("bob")
 
 		if m == nil {
-			t.Fatal("result should not be nil")
+			t.Fatal("result must not be nil")
 		}
 
 		assert.Equal(t, 7, m.ID)
@@ -79,11 +223,12 @@ func TestFindLocalUser(t *testing.T) {
 		assert.Equal(t, "bob@example.com", m.UserEmail)
 		assert.False(t, m.SuperAdmin)
 		assert.False(t, m.IsVisitor())
+		assert.False(t, m.HasSharedAccessOnly(acl.ResourcePhotos))
+		assert.False(t, m.HasSharedAccessOnly(acl.ResourceAlbums))
 		assert.True(t, m.CanLogin)
 		assert.NotEmpty(t, m.CreatedAt)
 		assert.NotEmpty(t, m.UpdatedAt)
 	})
-
 	t.Run("Unknown", func(t *testing.T) {
 		m := FindLocalUser("")
 
@@ -91,13 +236,25 @@ func TestFindLocalUser(t *testing.T) {
 			t.Fatal("result should be nil")
 		}
 	})
-
 	t.Run("NotFound", func(t *testing.T) {
 		m := FindLocalUser("xxx")
 
 		if m != nil {
 			t.Fatal("result should be nil")
 		}
+	})
+	t.Run("NotASCII", func(t *testing.T) {
+		existing := newExistingTestUser(t, "local-josé", acl.RoleGuest)
+
+		found := FindLocalUser("Local-José")
+		require.NotNil(t, found)
+		assert.Equal(t, existing.UserUID, found.UserUID)
+		assert.Equal(t, "local-josé", found.UserName)
+
+		assert.Nil(t, FindLocalUser("local-jose"))
+		other := newExistingTestUser(t, "local-jose", acl.RoleGuest)
+		assert.Equal(t, other.UserUID, FindLocalUser("local-jose").UserUID)
+		assert.Equal(t, existing.UserUID, FindLocalUser("local-josé").UserUID)
 	})
 }
 
@@ -106,7 +263,7 @@ func TestFindUserByName(t *testing.T) {
 		m := FindUserByName("admin")
 
 		if m == nil {
-			t.Fatal("result should not be nil")
+			t.Fatal("result must not be nil")
 		}
 
 		assert.Equal(t, 1, m.ID)
@@ -126,12 +283,11 @@ func TestFindUserByName(t *testing.T) {
 		assert.NotEmpty(t, m.CreatedAt)
 		assert.NotEmpty(t, m.UpdatedAt)
 	})
-
 	t.Run("Alice", func(t *testing.T) {
 		m := FindUserByName("alice")
 
 		if m == nil {
-			t.Fatal("result should not be nil")
+			t.Fatal("result must not be nil")
 		}
 
 		assert.Equal(t, 5, m.ID)
@@ -147,12 +303,11 @@ func TestFindUserByName(t *testing.T) {
 		assert.NotEmpty(t, m.CreatedAt)
 		assert.NotEmpty(t, m.UpdatedAt)
 	})
-
 	t.Run("Bob", func(t *testing.T) {
 		m := FindUserByName("bob")
 
 		if m == nil {
-			t.Fatal("result should not be nil")
+			t.Fatal("result must not be nil")
 		}
 
 		assert.Equal(t, 7, m.ID)
@@ -166,7 +321,6 @@ func TestFindUserByName(t *testing.T) {
 		assert.NotEmpty(t, m.CreatedAt)
 		assert.NotEmpty(t, m.UpdatedAt)
 	})
-
 	t.Run("Unknown", func(t *testing.T) {
 		m := FindUserByName("")
 
@@ -174,13 +328,30 @@ func TestFindUserByName(t *testing.T) {
 			t.Fatal("result should be nil")
 		}
 	})
-
 	t.Run("NotFound", func(t *testing.T) {
 		m := FindUserByName("xxx")
 
 		if m != nil {
 			t.Fatal("result should be nil")
 		}
+	})
+	t.Run("NotASCII", func(t *testing.T) {
+		existing := newExistingTestUser(t, "find-josé", acl.RoleGuest)
+
+		found := FindUserByName("Find-José")
+		require.NotNil(t, found)
+		assert.Equal(t, existing.UserUID, found.UserUID)
+		assert.Equal(t, "find-josé", found.UserName)
+
+		// MariaDB compares names that differ only by accents as equal.
+		if IsDialect(dsn.DriverMySQL) {
+			return
+		}
+
+		assert.Nil(t, FindUserByName("find-jose"))
+		other := newRenameTestUser(t, "find-jose", acl.RoleGuest)
+		assert.Equal(t, other.UserUID, FindUserByName("find-jose").UserUID)
+		assert.Equal(t, existing.UserUID, FindUserByName("find-josé").UserUID)
 	})
 }
 
@@ -210,6 +381,46 @@ func TestUser_Create(t *testing.T) {
 			t.Fatal(err)
 		}
 	})
+	t.Run("LongNumericAuthID", func(t *testing.T) {
+		useruid := rnd.GenerateUID(UserUID)
+		var m = User{
+			UserUID:      useruid,
+			UserName:     "examplelong",
+			UserRole:     string(acl.RoleGuest),
+			DisplayName:  "Example Long",
+			SuperAdmin:   false,
+			CanLogin:     true,
+			AuthID:       "012345678901234567890",
+			AuthProvider: string(authn.ProviderOIDC),
+		}
+
+		if err := m.Create(); err != nil {
+			t.Fatal(err)
+		}
+
+		t.Cleanup(func() {
+			assert.NoError(t, m.Delete())
+			UnscopedDb().Delete(&m)
+		})
+
+		assert.Equal(t, "examplelong", m.Username())
+		assert.Equal(t, "examplelong", m.UserName)
+		assert.Equal(t, "012345678901234567890", m.AuthID)
+	})
+	t.Run("NotASCII", func(t *testing.T) {
+		m := NewUser()
+		m.UserName = "create-josé"
+		m.UserRole = acl.RoleGuest.String()
+
+		require.ErrorIs(t, m.Create(), authn.ErrNotASCII)
+		assert.Nil(t, FindUserByName("create-josé"))
+	})
+	t.Run("AdminNotASCII", func(t *testing.T) {
+		m := &User{ID: 1, UserName: "adminé", UserRole: acl.RoleAdmin.String()}
+
+		require.ErrorIs(t, m.Create(), authn.ErrNotASCII)
+		assert.Equal(t, "", m.UserUID)
+	})
 }
 
 func TestUser_UpdateUsername(t *testing.T) {
@@ -226,17 +437,44 @@ func TestUser_UpdateUsername(t *testing.T) {
 		if err := m.UpdateUsername("admin"); err == nil {
 			t.Fatal("error expected")
 		} else {
-			t.Logf("expected errror: %s", err)
+			t.Logf("expected error: %s", err)
 		}
+	})
+	t.Run("Success", func(t *testing.T) {
+		var m = User{
+			ID:          5000,
+			UserName:    "",
+			UserRole:    "user",
+			DisplayName: "Foo",
+			SuperAdmin:  false,
+			CanLogin:    true,
+		}
+
+		err := m.Save()
+
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		assert.Nil(t, FindUserByName("bar"))
+
+		err2 := m.UpdateUsername("bar")
+
+		if err2 != nil {
+			t.Fatal(err2)
+		}
+
+		assert.NotNil(t, FindUserByName("bar"))
+
 	})
 }
 
 func TestUser_SetUsername(t *testing.T) {
-	t.Run("photoprism", func(t *testing.T) {
+	t.Run("PhotoPrism", func(t *testing.T) {
 		m := FindUserByName("admin")
 
 		if m == nil {
-			t.Fatal("result should not be nil")
+			t.Fatal("result must not be nil")
 		}
 
 		assert.Equal(t, "admin", m.Username())
@@ -249,43 +487,59 @@ func TestUser_SetUsername(t *testing.T) {
 		assert.Equal(t, "photoprism", m.Username())
 		assert.Equal(t, "photoprism", m.UserName)
 	})
+	t.Run("SystemUsersCannotBeModified", func(t *testing.T) {
+		assert.Equal(t, "system users cannot be modified", Visitor.SetUsername("newname").Error())
+	})
+	t.Run("UsernameIsEmpty", func(t *testing.T) {
+		assert.Equal(t, "username is empty", Admin.SetUsername("").Error())
+	})
+	t.Run("SameName", func(t *testing.T) {
+		assert.Nil(t, Admin.SetUsername("admin"))
+	})
+	t.Run("NotASCII", func(t *testing.T) {
+		m := &User{ID: 999902, UserUID: rnd.GenerateUID(UserUID), UserName: ""}
+
+		require.ErrorIs(t, m.SetUsername("Josè"), authn.ErrNotASCII)
+		require.ErrorIs(t, m.SetUsername("\u212Aate"), authn.ErrNotASCII)
+		assert.Equal(t, "", m.UserName)
+	})
 }
 
-func TestUser_WrongPassword(t *testing.T) {
-	t.Run("admin", func(t *testing.T) {
+func TestUser_InvalidPassword(t *testing.T) {
+	t.Run("Admin", func(t *testing.T) {
 		m := FindUserByName("admin")
 
 		if m == nil {
-			t.Fatal("result should not be nil")
+			t.Fatal("result must not be nil")
 		}
 
-		assert.False(t, m.WrongPassword("photoprism"))
+		assert.False(t, m.InvalidPassword("photoprism"))
 	})
-	t.Run("admin invalid password", func(t *testing.T) {
+	t.Run("AdminInvalidPassword", func(t *testing.T) {
 		m := FindUserByName("admin")
 
 		if m == nil {
-			t.Fatal("result should not be nil")
+			t.Fatal("result must not be nil")
 		}
 
-		assert.True(t, m.WrongPassword("wrong-password"))
+		assert.True(t, m.InvalidPassword("wrong-password"))
 	})
-	t.Run("no password existing", func(t *testing.T) {
+	t.Run("NoPasswordExisting", func(t *testing.T) {
 		p := User{UserUID: "u000000000000010", UserName: "Hans", DisplayName: ""}
 		err := p.Save()
 		if err != nil {
 			t.Fatal(err)
 		}
-		assert.True(t, p.WrongPassword("abcdef"))
+		assert.True(t, p.InvalidPassword("abcdef"))
 
 	})
 	t.Run("NotRegistered", func(t *testing.T) {
 		p := User{UserUID: "u12", UserName: "", DisplayName: ""}
-		assert.True(t, p.WrongPassword("abcdef"))
+		assert.True(t, p.InvalidPassword("abcdef"))
 	})
 	t.Run("PasswordEmpty", func(t *testing.T) {
 		p := User{UserUID: "u000000000000011", UserName: "User", DisplayName: ""}
-		assert.True(t, p.WrongPassword(""))
+		assert.True(t, p.InvalidPassword(""))
 	})
 }
 
@@ -299,7 +553,6 @@ func TestUser_Save(t *testing.T) {
 			t.Fatal(err)
 		}
 	})
-
 	t.Run("NewUser", func(t *testing.T) {
 		if err := NewUser().Save(); err != nil {
 			t.Fatal(err)
@@ -313,7 +566,7 @@ func TestFirstOrCreateUser(t *testing.T) {
 
 		result := FirstOrCreateUser(p)
 		if result == nil {
-			t.Fatal("result should not be nil")
+			t.Fatal("result must not be nil")
 		}
 
 		assert.NotEmpty(t, result.ID)
@@ -330,18 +583,51 @@ func TestFirstOrCreateUser(t *testing.T) {
 		result := FirstOrCreateUser(p)
 
 		if result == nil {
-			t.Fatal("result should not be nil")
+			t.Fatal("result must not be nil")
 		}
 		assert.NotEmpty(t, result.ID)
 	})
 }
 
+func TestUser_EmailVerified(t *testing.T) {
+	t.Run("NilVerifiedAt", func(t *testing.T) {
+		assert.False(t, (&User{}).EmailVerified())
+	})
+	t.Run("ZeroVerifiedAt", func(t *testing.T) {
+		zero := time.Time{}
+		assert.False(t, (&User{VerifiedAt: &zero}).EmailVerified())
+	})
+	t.Run("SetVerifiedAt", func(t *testing.T) {
+		assert.True(t, (&User{VerifiedAt: TimeStamp()}).EmailVerified())
+	})
+}
+
+// deleteTestUser removes an account created by a test, including its details and settings.
+func deleteTestUser(t *testing.T, m *User) {
+	t.Helper()
+
+	if m == nil || m.UserUID == "" {
+		return
+	}
+
+	assert.NoError(t, UnscopedDb().Delete(&UserDetails{}, "user_uid = ?", m.UserUID).Error)
+	assert.NoError(t, UnscopedDb().Delete(&UserSettings{}, "user_uid = ?", m.UserUID).Error)
+	assert.NoError(t, UnscopedDb().Delete(&User{}, "user_uid = ?", m.UserUID).Error)
+}
+
 func TestFindUser(t *testing.T) {
+	t.Run("EmailOnly", func(t *testing.T) {
+		alice := FindUserByName("alice")
+		require.NotNil(t, alice)
+		require.NotEmpty(t, alice.UserEmail)
+
+		assert.Nil(t, FindUser(User{UserEmail: alice.UserEmail}))
+	})
 	t.Run("ID", func(t *testing.T) {
 		m := FindUser(User{ID: 1})
 
 		if m == nil {
-			t.Fatal("result should not be nil")
+			t.Fatal("result must not be nil")
 		}
 
 		assert.Equal(t, 1, m.ID)
@@ -354,7 +640,7 @@ func TestFindUser(t *testing.T) {
 		m := FindUser(User{ID: 2, UserName: "admin"})
 
 		if m == nil {
-			t.Fatal("result should not be nil")
+			t.Fatal("result must not be nil")
 		}
 
 		assert.Equal(t, 1, m.ID)
@@ -367,7 +653,7 @@ func TestFindUser(t *testing.T) {
 		m := FindUser(User{UserUID: "u000000000000002"})
 
 		if m == nil {
-			t.Fatal("result should not be nil")
+			t.Fatal("result must not be nil")
 		}
 
 		assert.Equal(t, -2, m.ID)
@@ -377,11 +663,45 @@ func TestFindUser(t *testing.T) {
 		assert.NotEmpty(t, m.CreatedAt)
 		assert.NotEmpty(t, m.UpdatedAt)
 	})
+	t.Run("OIDCUser", func(t *testing.T) {
+		info := &oidc.UserInfo{}
+		info.Name = "Jane Doe"
+		info.Email = "jane@doe.com"
+		info.EmailVerified = true
+		info.Subject = "e3a9f4a6-9d60-47cb-9bf5-02bd15b0c888"
+		info.PreferredUsername = "Jane Doe"
+
+		u := OidcUser(info, "", "jane.doe")
+
+		err := u.Save()
+
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		m := FindUser(User{UserUID: u.UserUID})
+
+		if m == nil {
+			t.Fatal("result must not be nil")
+		}
+
+		assert.NotEmpty(t, m.UserUID)
+		assert.Equal(t, "jane.doe", m.UserName)
+		assert.Equal(t, "oidc", m.AuthProvider)
+
+		n := FindUser(User{AuthProvider: authn.ProviderOIDC.String(), AuthID: info.Subject})
+
+		require.NotNil(t, n)
+
+		assert.NotEmpty(t, n.UserUID)
+		assert.Equal(t, "jane.doe", n.UserName)
+		assert.Equal(t, "oidc", n.AuthProvider)
+	})
 	t.Run("UserName", func(t *testing.T) {
 		m := FindUser(User{UserName: "admin"})
 
 		if m == nil {
-			t.Fatal("result should not be nil")
+			t.Fatal("result must not be nil")
 		}
 
 		assert.Equal(t, 1, m.ID)
@@ -411,7 +731,7 @@ func TestFindUserByUID(t *testing.T) {
 		m := FindUserByUID("u000000000000002")
 
 		if m == nil {
-			t.Fatal("result should not be nil")
+			t.Fatal("result must not be nil")
 		}
 
 		assert.Equal(t, -2, m.ID)
@@ -439,7 +759,7 @@ func TestFindUserByUID(t *testing.T) {
 		m := FindUserByUID("uqxetse3cy5eo9z2")
 
 		if m == nil {
-			t.Fatal("result should not be nil")
+			t.Fatal("result must not be nil")
 		}
 
 		assert.Equal(t, 5, m.ID)
@@ -459,7 +779,7 @@ func TestFindUserByUID(t *testing.T) {
 		m := FindUserByUID("uqxc08w3d0ej2283")
 
 		if m == nil {
-			t.Fatal("result should not be nil")
+			t.Fatal("result must not be nil")
 		}
 
 		assert.Equal(t, 7, m.ID)
@@ -479,7 +799,7 @@ func TestFindUserByUID(t *testing.T) {
 		m := FindUserByUID("uqxqg7i1kperxvu7")
 
 		if m == nil {
-			t.Fatal("result should not be nil")
+			t.Fatal("result must not be nil")
 		}
 
 		assert.Equal(t, 8, m.ID)
@@ -490,6 +810,40 @@ func TestFindUserByUID(t *testing.T) {
 		assert.True(t, m.CanLogin)
 		assert.NotEmpty(t, m.CreatedAt)
 		assert.NotEmpty(t, m.UpdatedAt)
+		assert.True(t, m.HasUID())
+		assert.False(t, m.InvalidUID())
+	})
+}
+
+func TestUser_SameUID(t *testing.T) {
+	t.Run("True", func(t *testing.T) {
+		m := FindUserByUID("uqxc08w3d0ej2283")
+
+		if m == nil {
+			t.Fatal("result must not be nil")
+		}
+
+		assert.True(t, m.SameUID("uqxc08w3d0ej2283"))
+		assert.True(t, m.HasUID())
+		assert.False(t, m.InvalidUID())
+	})
+	t.Run("False", func(t *testing.T) {
+		m := FindUserByUID("uqxc08w3d0ej2283")
+
+		if m == nil {
+			t.Fatal("result must not be nil")
+		}
+
+		assert.False(t, m.SameUID("uqxc08w3d0ej2276"))
+	})
+	t.Run("Invalid", func(t *testing.T) {
+		m := FindUserByUID("uqxc08w3d0ej2283")
+
+		if m == nil {
+			t.Fatal("result must not be nil")
+		}
+
+		assert.False(t, m.SameUID("xxx"))
 	})
 }
 
@@ -510,75 +864,102 @@ func TestUser_String(t *testing.T) {
 
 func TestUser_Admin(t *testing.T) {
 	t.Run("SuperAdmin", func(t *testing.T) {
-		p := User{UserUID: "u000000000000008", UserName: "Hanna", DisplayName: "", SuperAdmin: true}
+		p := User{ID: 8, UserUID: "u000000000000008", UserName: "Hanna", DisplayName: "", SuperAdmin: true}
 		assert.True(t, p.IsAdmin())
 	})
 	t.Run("RoleAdmin", func(t *testing.T) {
-		p := User{UserUID: "u000000000000008", UserName: "Hanna", DisplayName: "", UserRole: acl.RoleAdmin.String()}
+		p := User{ID: 8, UserUID: "u000000000000008", UserName: "Hanna", DisplayName: "", UserRole: acl.RoleAdmin.String()}
 		assert.True(t, p.IsAdmin())
 	})
+	t.Run("NoID", func(t *testing.T) {
+		p := User{UserUID: "u000000000000008", UserName: "Hanna", DisplayName: "", UserRole: acl.RoleAdmin.String()}
+		assert.False(t, p.IsAdmin())
+	})
 	t.Run("False", func(t *testing.T) {
-		p := User{UserUID: "u000000000000008", UserName: "Hanna", DisplayName: "", SuperAdmin: false, UserRole: ""}
+		p := User{ID: 8, UserUID: "u000000000000008", UserName: "Hanna", DisplayName: "", SuperAdmin: false, UserRole: ""}
 		assert.False(t, p.IsAdmin())
 	})
 }
 
-func TestUser_Anonymous(t *testing.T) {
-	t.Run("True", func(t *testing.T) {
-		p := User{UserUID: "", UserName: "Hanna", DisplayName: ""}
+func TestUser_IsUnknown(t *testing.T) {
+	t.Run("ID", func(t *testing.T) {
+		p := User{ID: UnknownUser.ID, UserUID: "u000000000000008", UserName: "", DisplayName: "", SuperAdmin: false, UserRole: acl.RoleAdmin.String()}
 		assert.True(t, p.IsUnknown())
 	})
-	t.Run("False", func(t *testing.T) {
-		p := User{UserUID: "u000000000000008", UserName: "Hanna", DisplayName: "", SuperAdmin: true}
+	t.Run("UID", func(t *testing.T) {
+		p := User{ID: 123, UserUID: "", UserName: "Hanna", DisplayName: "", SuperAdmin: false, UserRole: acl.RoleAdmin.String()}
+		assert.True(t, p.IsUnknown())
+	})
+	t.Run("Name", func(t *testing.T) {
+		p := User{ID: 123, UserUID: "u000000000000008", UserName: "", DisplayName: "", SuperAdmin: false, UserRole: acl.RoleAdmin.String()}
+		assert.False(t, p.IsUnknown())
+	})
+	t.Run("Role", func(t *testing.T) {
+		p := User{ID: 123, UserUID: "u000000000000008", UserName: "Hanna", DisplayName: "", SuperAdmin: false, UserRole: ""}
+		assert.True(t, p.IsUnknown())
+	})
+	t.Run("Admin", func(t *testing.T) {
+		p := User{ID: 123, UserUID: "u000000000000008", UserName: "Hanna", DisplayName: "", SuperAdmin: false, UserRole: acl.RoleAdmin.String()}
+		assert.False(t, p.IsUnknown())
+	})
+	t.Run("SuperAdmin", func(t *testing.T) {
+		p := User{ID: 123, UserUID: "u000000000000008", UserName: "Hanna", DisplayName: "", SuperAdmin: true, UserRole: ""}
 		assert.False(t, p.IsUnknown())
 	})
 }
 
-func TestUser_Guest(t *testing.T) {
+func TestUser_IsVisitor(t *testing.T) {
 	t.Run("True", func(t *testing.T) {
-		p := User{UserUID: "", UserName: "Hanna", DisplayName: "", UserRole: acl.RoleVisitor.String()}
+		p := User{UserUID: "u000000000000008", UserName: "Hanna", DisplayName: "", UserRole: acl.RoleVisitor.String()}
 		assert.True(t, p.IsVisitor())
 	})
-	t.Run("False", func(t *testing.T) {
-		p := User{UserUID: "", UserName: "Hanna", DisplayName: ""}
+	t.Run("Unknown", func(t *testing.T) {
+		p := User{UserUID: "u000000000000008", UserName: "Hanna", DisplayName: ""}
+		assert.False(t, p.IsVisitor())
+	})
+	t.Run("Admin", func(t *testing.T) {
+		p := User{UserUID: "u000000000000008", UserName: "Hanna", DisplayName: "", UserRole: acl.RoleAdmin.String()}
 		assert.False(t, p.IsVisitor())
 	})
 }
 
 func TestUser_SetPassword(t *testing.T) {
 	t.Run("Ok", func(t *testing.T) {
-		p := User{UserUID: "u000000000000008", UserName: "Hanna", DisplayName: ""}
-		if err := p.SetPassword("insecure"); err != nil {
-			t.Fatal(err)
-		}
+		m := User{ID: 8, UserUID: "u000000000000008", UserName: "Hanna", DisplayName: "", UserRole: acl.RoleAdmin.String()}
+		assert.NoError(t, m.SetPassword("insecure"))
+		assert.NoError(t, m.DeletePassword())
+		assert.NoError(t, m.SetPassword("insecure"))
 	})
 	t.Run("NotRegistered", func(t *testing.T) {
-		p := User{UserUID: "", UserName: "Hanna", DisplayName: ""}
-		assert.Error(t, p.SetPassword("insecure"))
-
+		m := User{ID: 0, UserUID: "", UserName: "Hanna", DisplayName: "", UserRole: acl.RoleAdmin.String()}
+		assert.Error(t, m.SetPassword("insecure"))
 	})
 	t.Run("PasswordTooShort", func(t *testing.T) {
-		p := User{UserUID: "u000000000000008", UserName: "Hanna", DisplayName: ""}
-		assert.Error(t, p.SetPassword("cat"))
+		m := User{ID: 8, UserUID: "u000000000000008", UserName: "Hanna", DisplayName: "", UserRole: acl.RoleAdmin.String()}
+		assert.Error(t, m.SetPassword("cat"))
+	})
+	t.Run("PasswordTooLong", func(t *testing.T) {
+		m := User{ID: 8, UserUID: "u000000000000008", UserName: "Hanna", DisplayName: "", UserRole: acl.RoleAdmin.String()}
+		assert.Error(t, m.SetPassword("hfnoehurhgfoeuro7584othgiyruifh85hglhiryhgbbyeirygbubgirgtheuogfugfkhsbdgiyerbgeuigbdtiyrgehbik"))
 	})
 }
 
-func TestUser_InitLogin(t *testing.T) {
+func TestUser_InitAccount(t *testing.T) {
 	t.Run("Ok", func(t *testing.T) {
-		p := User{UserUID: "u000000000000009", UserName: "Hanna", DisplayName: ""}
+		p := User{ID: 9, UserUID: "u000000000000009", UserName: "Hanna", DisplayName: "", UserRole: acl.RoleAdmin.String(), AuthProvider: authn.ProviderLocal.String(), CanLogin: true}
 		assert.Nil(t, FindPassword("u000000000000009"))
-		p.InitAccount("admin", "insecure")
+		assert.True(t, p.InitAccount("Hanna", "insecure", ""))
 		m := FindPassword("u000000000000009")
 
 		if m == nil {
-			t.Fatal("result should not be nil")
+			t.Fatal("result must not be nil")
 		}
 	})
 	t.Run("AlreadyExists", func(t *testing.T) {
-		p := User{UserUID: "u000000000000010", UserName: "Hans", DisplayName: ""}
+		p := User{ID: 10, UserUID: "u000000000000010", UserName: "Hans", DisplayName: "", UserRole: acl.RoleAdmin.String()}
 
 		if err := p.Save(); err != nil {
-			t.Logf("cannot user %s: ", err)
+			t.Logf("failed to create user: %s", err)
 		}
 
 		if err := p.SetPassword("insecure"); err != nil {
@@ -586,49 +967,85 @@ func TestUser_InitLogin(t *testing.T) {
 		}
 
 		assert.NotNil(t, FindPassword("u000000000000010"))
-		p.InitAccount("admin", "insecure")
+		assert.False(t, p.InitAccount("admin", "insecure", ""))
 		m := FindPassword("u000000000000010")
 
 		if m == nil {
-			t.Fatal("result should not be nil")
+			t.Fatal("result must not be nil")
 		}
 	})
 	t.Run("NotRegistered", func(t *testing.T) {
 		p := User{UserUID: "u12", UserName: "", DisplayName: ""}
 		assert.Nil(t, FindPassword("u12"))
-		p.InitAccount("admin", "insecure")
+		assert.False(t, p.InitAccount("admin", "insecure", ""))
 		assert.Nil(t, FindPassword("u12"))
 	})
 	t.Run("EmptyPassword", func(t *testing.T) {
 		p := User{UserUID: "u000000000000011", UserName: "User", DisplayName: ""}
 		assert.Nil(t, FindPassword("u000000000000011"))
-		p.InitAccount("admin", "")
+		assert.False(t, p.InitAccount("admin", "", ""))
 		assert.Nil(t, FindPassword("u000000000000011"))
+	})
+	t.Run("SetsScope", func(t *testing.T) {
+		user := createScopedTestUser(t)
+
+		assert.True(t, user.InitAccount(user.UserName, "insecure", "photos:view"))
+		assert.Equal(t, "photos:view", user.UserScope)
+		assert.True(t, user.HasScope())
+
+		m := FindPassword(user.UserUID)
+		if m == nil {
+			t.Fatal("expected password to be created")
+		}
+	})
+	t.Run("NotASCIIName", func(t *testing.T) {
+		// Only the initial admin account is renamed.
+		m := &User{ID: 1, UserUID: rnd.GenerateUID(UserUID), UserName: "init-admin", UserRole: acl.RoleAdmin.String(), AuthProvider: authn.ProviderLocal.String(), CanLogin: true}
+		t.Cleanup(func() { assert.NoError(t, UnscopedDb().Delete(&Password{}, "uid = ?", m.UserUID).Error) })
+
+		assert.True(t, m.InitAccount("init-ädmin", "insecure", ""))
+		assert.Equal(t, "init-admin", m.UserName)
+		assert.NotNil(t, FindPassword(m.UserUID))
+		assert.Equal(t, "admin", FindUser(User{ID: 1}).UserName)
+	})
+	t.Run("EmptyName", func(t *testing.T) {
+		m := &User{ID: 1, UserUID: rnd.GenerateUID(UserUID), UserName: "init-jürgen", UserRole: acl.RoleAdmin.String(), AuthProvider: authn.ProviderLocal.String(), CanLogin: true}
+		t.Cleanup(func() { assert.NoError(t, UnscopedDb().Delete(&Password{}, "uid = ?", m.UserUID).Error) })
+
+		assert.True(t, m.InitAccount("", "insecure", ""))
+		assert.Equal(t, "init-jürgen", m.UserName)
+		assert.Equal(t, "admin", FindUser(User{ID: 1}).UserName)
 	})
 }
 
 func TestUser_AclRole(t *testing.T) {
 	t.Run("SuperAdmin", func(t *testing.T) {
-		p := User{UserUID: "u000000000000008", UserName: "Hanna", DisplayName: "", SuperAdmin: true, UserRole: ""}
+		p := User{ID: 8, UserUID: "u000000000000008", UserName: "Hanna", DisplayName: "", SuperAdmin: true, UserRole: ""}
 		assert.Equal(t, acl.RoleAdmin, p.AclRole())
 		assert.True(t, p.IsAdmin())
 		assert.False(t, p.IsVisitor())
 	})
 	t.Run("RoleAdmin", func(t *testing.T) {
-		p := User{UserUID: "u000000000000008", UserName: "Hanna", DisplayName: "", SuperAdmin: false, UserRole: acl.RoleAdmin.String()}
+		p := User{ID: 8, UserUID: "u000000000000008", UserName: "Hanna", DisplayName: "", SuperAdmin: false, UserRole: acl.RoleAdmin.String()}
 		assert.Equal(t, acl.RoleAdmin, p.AclRole())
 		assert.True(t, p.IsAdmin())
 		assert.False(t, p.IsVisitor())
 	})
 	t.Run("NoName", func(t *testing.T) {
-		p := User{UserUID: "u000000000000008", UserName: "", DisplayName: "", UserRole: acl.RoleAdmin.String()}
+		p := User{ID: 8, UserUID: "u000000000000008", UserName: "", DisplayName: "", UserRole: acl.RoleAdmin.String()}
 		assert.Equal(t, acl.RoleVisitor, p.AclRole())
 		assert.False(t, p.IsAdmin())
 		assert.True(t, p.IsVisitor())
 	})
+	t.Run("NoID", func(t *testing.T) {
+		p := User{ID: 0, UserUID: "u000000000000008", UserName: "Hanna", DisplayName: "", SuperAdmin: false, UserRole: acl.RoleAdmin.String()}
+		assert.Equal(t, acl.RoleAdmin, p.AclRole())
+		assert.False(t, p.IsAdmin())
+		assert.False(t, p.IsVisitor())
+	})
 	t.Run("Unauthorized", func(t *testing.T) {
-		p := User{UserUID: "u000000000000008", UserName: "Hanna", DisplayName: ""}
-		assert.Equal(t, acl.RoleUnknown, p.AclRole())
+		p := User{ID: 8, UserUID: "u000000000000008", UserName: "Hanna", DisplayName: ""}
+		assert.Equal(t, acl.RoleNone, p.AclRole())
 		assert.False(t, p.IsAdmin())
 		assert.False(t, p.IsVisitor())
 	})
@@ -644,6 +1061,12 @@ func TestUser_Validate(t *testing.T) {
 		}
 
 		assert.NoError(t, u.Validate())
+	})
+	t.Run("NameWithoutHandle", func(t *testing.T) {
+		for _, name := range []string{"..", "...", ".gitignore", "..@example.com", "@example.com"} {
+			u := &User{UserName: name, DisplayName: "Validate", UserRole: acl.RoleAdmin.String()}
+			assert.Error(t, u.Validate(), name)
+		}
 	})
 	t.Run("NameEmpty", func(t *testing.T) {
 		u := &User{
@@ -669,27 +1092,34 @@ func TestUser_Validate(t *testing.T) {
 
 		assert.Error(t, u.Validate())
 	})
-	t.Run("EmailNotUnique", func(t *testing.T) {
-		FirstOrCreateUser(&User{
-			UserEmail: "notunique2@example.com",
+	t.Run("EmailShared", func(t *testing.T) {
+		shared := FirstOrCreateUser(&User{
+			UserName:    "sharedemail1",
+			UserEmail:   "sharedemail@example.com",
+			DisplayName: "Shared Email",
+			UserRole:    acl.RoleAdmin.String(),
 		})
+		require.NotNil(t, shared)
+		require.Equal(t, "sharedemail@example.com", shared.UserEmail)
+		t.Cleanup(func() { deleteTestUser(t, shared) })
 
 		u := &User{
-			UserName:    "notunique2",
-			UserEmail:   "notunique2@example.com",
-			DisplayName: "Not Unique",
+			UserName:    "sharedemail2",
+			UserEmail:   "sharedemail@example.com",
+			DisplayName: "Shared Email",
 			UserRole:    acl.RoleAdmin.String(),
 		}
 
-		assert.Error(t, u.Validate())
+		assert.NoError(t, u.Validate())
 	})
-	t.Run("EmailNotUnique", func(t *testing.T) {
-		FirstOrCreateUser(&User{
+	t.Run("NameNotUniqueSameEmail", func(t *testing.T) {
+		existing := FirstOrCreateUser(&User{
 			UserName:    "notunique3",
 			UserEmail:   "notunique3@example.com",
 			DisplayName: "Not Unique",
 			UserRole:    acl.RoleAdmin.String(),
 		})
+		t.Cleanup(func() { deleteTestUser(t, existing) })
 
 		u := FirstOrCreateUser(&User{
 			UserName:    "notunique30",
@@ -697,8 +1127,30 @@ func TestUser_Validate(t *testing.T) {
 			DisplayName: "Not Unique",
 			UserRole:    acl.RoleAdmin.String(),
 		})
+		require.NotNil(t, u)
+		t.Cleanup(func() { deleteTestUser(t, u) })
 
 		u.UserName = "notunique3"
+
+		assert.Error(t, u.Validate())
+	})
+	t.Run("EmailInvalid", func(t *testing.T) {
+		u := &User{
+			UserName:    "12",
+			DisplayName: "Validate",
+			UserEmail:   "validate",
+			UserRole:    acl.RoleAdmin.String(),
+		}
+
+		assert.Error(t, u.Validate())
+	})
+	t.Run("EmailInvalid2", func(t *testing.T) {
+		u := &User{
+			UserName:    "12",
+			DisplayName: "Validate",
+			UserEmail:   "validate@",
+			UserRole:    acl.RoleAdmin.String(),
+		}
 
 		assert.Error(t, u.Validate())
 	})
@@ -746,9 +1198,186 @@ func TestUser_Validate(t *testing.T) {
 
 		assert.Error(t, u.Validate())
 	})
+	t.Run("NewNotASCII", func(t *testing.T) {
+		u := &User{UserName: "Validate-José", DisplayName: "José", UserRole: acl.RoleAdmin.String()}
+
+		err := u.Validate()
+		require.ErrorIs(t, err, authn.ErrNotASCII)
+		assert.EqualError(t, err, "username may only contain ASCII characters, e.g. 'validate-jose'")
+		assert.Equal(t, "Validate-José", u.UserName)
+	})
+	t.Run("ExistingNotASCII", func(t *testing.T) {
+		m := newExistingTestUser(t, "validate-zoë", acl.RoleAdmin)
+
+		require.NoError(t, m.Validate())
+		assert.Equal(t, "validate-zoë", m.UserName)
+
+		m.DisplayName = "Zoë Example"
+		require.NoError(t, m.Save())
+		assert.Equal(t, "validate-zoë", storedUser(t, m.UserUID).UserName)
+	})
+	t.Run("ExistingBesideOtherName", func(t *testing.T) {
+		newExistingTestUser(t, "validate-twin-josé", acl.RoleAdmin)
+		m := newExistingTestUser(t, "validate-twin-jose", acl.RoleAdmin)
+
+		assert.NoError(t, m.Validate())
+	})
+	t.Run("ExistingLegacyBesideOtherName", func(t *testing.T) {
+		newExistingTestUser(t, "validate-keep-josé", acl.RoleAdmin)
+		m := newExistingTestUser(t, "Validate-Keep-Jose", acl.RoleAdmin)
+
+		require.NoError(t, m.Validate())
+
+		// MariaDB finds the normalized name held by the other account, so the stored form is kept.
+		if IsDialect(dsn.DriverMySQL) {
+			assert.Equal(t, "Validate-Keep-Jose", m.UserName)
+		} else {
+			assert.Equal(t, "validate-keep-jose", m.UserName)
+		}
+	})
+	t.Run("ExistingSameName", func(t *testing.T) {
+		newExistingTestUser(t, "validate-same-twice", acl.RoleAdmin)
+		m := newExistingTestUser(t, "validate-same-twice", acl.RoleAdmin)
+
+		assert.EqualError(t, m.Validate(), "user 'validate-same-twice' already exists")
+	})
+	t.Run("NewBesideOtherName", func(t *testing.T) {
+		newExistingTestUser(t, "validate-new-josé", acl.RoleAdmin)
+		u := &User{UserName: "validate-new-jose", UserRole: acl.RoleAdmin.String()}
+
+		// MariaDB compares names that differ only by accents as equal.
+		if IsDialect(dsn.DriverMySQL) {
+			assert.EqualError(t, u.Validate(), "user 'validate-new-jose' already exists")
+		} else {
+			assert.NoError(t, u.Validate())
+		}
+	})
+	t.Run("NewNotASCIIHeld", func(t *testing.T) {
+		newExistingTestUser(t, "validate-held-josé", acl.RoleAdmin)
+		u := &User{UserName: "validate-held-josé", DisplayName: "José", UserRole: acl.RoleAdmin.String()}
+
+		assert.EqualError(t, u.Validate(), "user 'validate-held-josé' already exists")
+	})
+	t.Run("ExistingNotASCIIUppercase", func(t *testing.T) {
+		m := newExistingTestUser(t, "Validate-Zoë-Upper", acl.RoleAdmin)
+
+		require.NoError(t, m.Validate())
+		assert.Equal(t, "validate-zoë-upper", m.UserName)
+	})
+}
+
+func TestIsUserValidationError(t *testing.T) {
+	t.Run("Wrapped", func(t *testing.T) {
+		assert.True(t, IsUserValidationError(UserValidationError{Err: authn.ErrAuthIDRequired}))
+		assert.True(t, IsUserValidationError(fmt.Errorf("add: %w", UserValidationError{Err: authn.ErrAuthIDRequired})))
+	})
+	t.Run("Other", func(t *testing.T) {
+		assert.False(t, IsUserValidationError(nil))
+		assert.False(t, IsUserValidationError(authn.ErrAuthIDRequired))
+	})
+}
+
+// closedDbProvider returns a database whose connection pool is closed, so that every query fails.
+type closedDbProvider struct {
+	db *gorm.DB
+}
+
+// Db returns the closed database.
+func (p closedDbProvider) Db() *gorm.DB {
+	return p.db
+}
+
+func TestUser_ValidateQueryError(t *testing.T) {
+	conn, ok := dbConn.(*DbConn)
+	require.True(t, ok, "test database provider")
+
+	db, err := OpenDb(conn.Driver, conn.Dsn)
+	require.NoError(t, err)
+	require.NoError(t, CloseDb(db))
+
+	SetDbProvider(closedDbProvider{db: db})
+	t.Cleanup(func() { SetDbProvider(conn) })
+
+	m := NewUser()
+	m.UserName = "validate-query-error"
+	m.UserRole = acl.RoleAdmin.String()
+
+	err = m.Validate()
+	require.Error(t, err)
+	assert.False(t, IsUserValidationError(err), err.Error())
 }
 
 func TestAddUser(t *testing.T) {
+	t.Run("SettingsAndDetails", func(t *testing.T) {
+		t.Cleanup(func() { deleteTestUser(t, FindUserByName("adduser-related")) })
+		require.NoError(t, AddUser(form.User{UserName: "adduser-related", UserRole: acl.RoleAdmin.String(),
+			AuthProvider: "none"}))
+		// Rows are counted before the user is loaded, as loading creates missing ones.
+		var uid string
+		require.NoError(t, UnscopedDb().Raw("SELECT user_uid FROM auth_users WHERE user_name = ?", "adduser-related").Row().Scan(&uid))
+
+		var settings, details int64
+		require.NoError(t, UnscopedDb().Model(&UserSettings{}).Where("user_uid = ?", uid).Count(&settings).Error)
+		require.NoError(t, UnscopedDb().Model(&UserDetails{}).Where("user_uid = ?", uid).Count(&details).Error)
+		assert.Equal(t, int64(1), settings)
+		assert.Equal(t, int64(1), details)
+	})
+	t.Run("AuthID", func(t *testing.T) {
+		const authId = "adduser-subject-5f3a"
+
+		t.Cleanup(func() {
+			deleteTestUser(t, FindUserByName("adduser-holder"))
+			deleteTestUser(t, FindUserByName("adduser-taker"))
+		})
+
+		require.NoError(t, AddUser(form.User{UserName: "adduser-holder", UserRole: acl.RoleAdmin.String(),
+			AuthProvider: authn.ProviderOIDC.String(), AuthID: authId, Password: "adduser-password"}))
+
+		holder := func() *User {
+			u := FindUserByName("adduser-holder")
+			require.NotNil(t, u)
+			return u
+		}
+
+		// A refused add leaves the account that holds the auth ID unchanged.
+		err := AddUser(form.User{UserName: "adduser-tak\u00e9r", UserRole: acl.RoleAdmin.String(),
+			AuthProvider: authn.ProviderOIDC.String(), AuthID: authId, Password: "adduser-password"})
+		require.ErrorIs(t, err, authn.ErrNotASCII)
+		assert.Equal(t, authId, holder().AuthID)
+		assert.Equal(t, authn.ProviderOIDC.String(), holder().AuthProvider)
+
+		// An added account takes the auth ID over.
+		require.NoError(t, AddUser(form.User{UserName: "adduser-taker", UserRole: acl.RoleAdmin.String(),
+			AuthProvider: authn.ProviderOIDC.String(), AuthID: authId, AuthIssuer: "https://adduser.example.com",
+			Password: "adduser-password"}))
+		assert.Equal(t, "", holder().AuthID)
+		assert.Equal(t, authn.ProviderNone.String(), holder().AuthProvider)
+
+		taker := FindUserByName("adduser-taker")
+		require.NotNil(t, taker)
+		assert.Equal(t, authId, taker.AuthID)
+		assert.Equal(t, "https://adduser.example.com", taker.AuthIssuer)
+		assert.Equal(t, authn.ProviderOIDC.String(), taker.AuthProvider)
+	})
+	t.Run("ValidationError", func(t *testing.T) {
+		err := AddUser(form.User{UserName: "adduser-bad-email", UserEmail: "x@localhost", UserRole: acl.RoleAdmin.String(),
+			AuthProvider: "none"})
+		require.Error(t, err)
+		assert.True(t, IsUserValidationError(err))
+		assert.Equal(t, "email 'x@localhost' does not have a fully qualified domain", err.Error())
+		assert.Nil(t, FindUserByName("adduser-bad-email"))
+
+		err = AddUser(form.User{UserName: "adduser-josé", UserRole: acl.RoleAdmin.String(), AuthProvider: "none"})
+		assert.True(t, IsUserValidationError(err))
+		assert.ErrorIs(t, err, authn.ErrNotASCII)
+	})
+	t.Run("NotASCII", func(t *testing.T) {
+		for _, name := range []string{"adduser-josé", "\u212Aate-adduser", "adduser-jo\u200bse"} {
+			err := AddUser(form.User{UserName: name, UserRole: acl.RoleAdmin.String(), AuthProvider: "none"})
+			assert.ErrorIs(t, err, authn.ErrNotASCII, name)
+			assert.Nil(t, FindUserByName(clean.Username(name)), name)
+		}
+	})
 	t.Run("TooShort", func(t *testing.T) {
 		u := form.User{
 			UserName:  "thomas1",
@@ -758,17 +1387,69 @@ func TestAddUser(t *testing.T) {
 
 		err := AddUser(u)
 		assert.Error(t, err)
+		assert.True(t, IsUserValidationError(err))
 	})
-	t.Run("Valid", func(t *testing.T) {
+	t.Run("TooLong", func(t *testing.T) {
 		u := form.User{
-			UserName:  "thomas2",
-			UserEmail: "thomas2@example.com",
-			Password:  "helloworld",
+			UserName:  "thomas3",
+			UserEmail: "thomas3@example.com",
+			Password:  "1234567725244364789969hhkvnsgjlb;ghfnbn nd;dhewy8ortfgbkryeti7gfbie57yteoubgvlsiruwojflger",
 			UserRole:  acl.RoleAdmin.String(),
 		}
 
 		err := AddUser(u)
+		assert.Error(t, err)
+		assert.True(t, IsUserValidationError(err))
+	})
+	t.Run("InvalidRole", func(t *testing.T) {
+		u := form.User{
+			UserName:  "thomas4",
+			UserEmail: "thomas4@example.com",
+			Password:  "helloworld",
+			UserRole:  "invalid",
+		}
+
+		err := AddUser(u)
+		assert.Error(t, err)
+		assert.True(t, IsUserValidationError(err))
+	})
+	t.Run("ValidLocalUser", func(t *testing.T) {
+		u := form.User{
+			UserName:     "thomas2",
+			UserEmail:    "thomas2@example.com",
+			Password:     "helloworld",
+			UserRole:     acl.RoleAdmin.String(),
+			AuthProvider: "local",
+		}
+
+		err := AddUser(u)
 		assert.Nil(t, err)
+	})
+	t.Run("ValidOidcUser", func(t *testing.T) {
+		u := form.User{
+			UserName:     "thomasoidc",
+			UserEmail:    "thomasoidc@example.com",
+			Password:     "helloworld",
+			UserRole:     acl.RoleAdmin.String(),
+			AuthProvider: "oidc",
+			AuthID:       "12378696",
+		}
+
+		err := AddUser(u)
+		assert.Nil(t, err)
+	})
+	t.Run("AuthIDMissing", func(t *testing.T) {
+		u := form.User{
+			UserName:     "thomasoidc",
+			UserEmail:    "thomasoidc@example.com",
+			Password:     "helloworld",
+			UserRole:     acl.RoleAdmin.String(),
+			AuthProvider: "oidc",
+		}
+
+		err := AddUser(u)
+		assert.Error(t, err)
+		assert.True(t, IsUserValidationError(err))
 	})
 }
 
@@ -790,8 +1471,16 @@ func TestDeleteUser(t *testing.T) {
 			UserName:    "thomasdel2",
 			UserEmail:   "thomasdel2@example.com",
 			DisplayName: "Thomas Delete 2",
-			UserRole:    acl.RoleUnknown.String(),
+			UserRole:    acl.RoleNone.String(),
 		}
+
+		err := u.Delete()
+		assert.Error(t, err)
+	})
+	t.Run("EmptyUid", func(t *testing.T) {
+		u := NewUser()
+		u.UserUID = ""
+		u.ID = 500
 
 		err := u.Delete()
 		assert.Error(t, err)
@@ -799,42 +1488,133 @@ func TestDeleteUser(t *testing.T) {
 }
 
 func TestUser_Deleted(t *testing.T) {
-	assert.False(t, UserFixtures.Pointer("alice").Deleted())
-	assert.True(t, UserFixtures.Pointer("deleted").Deleted())
+	assert.False(t, UserFixtures.Pointer("alice").IsDeleted())
+	assert.True(t, UserFixtures.Pointer("deleted").IsDeleted())
 }
 
 func TestUser_Expired(t *testing.T) {
-	assert.False(t, UserFixtures.Pointer("alice").Expired())
-	assert.False(t, UserFixtures.Pointer("deleted").Expired())
+	t.Run("False", func(t *testing.T) {
+		assert.False(t, UserFixtures.Pointer("alice").IsExpired())
+		assert.False(t, UserFixtures.Pointer("deleted").IsExpired())
+	})
+	t.Run("True", func(t *testing.T) {
+		u := NewUser()
+		var expired = time.Date(2020, 3, 6, 2, 6, 51, 0, time.UTC)
+		u.ExpiresAt = &expired
+
+		assert.True(t, u.IsExpired())
+	})
 }
 
 func TestUser_Disabled(t *testing.T) {
-	assert.False(t, UserFixtures.Pointer("alice").Disabled())
-	assert.True(t, UserFixtures.Pointer("deleted").Disabled())
+	assert.False(t, UserFixtures.Pointer("alice").IsDisabled())
+	assert.True(t, UserFixtures.Pointer("deleted").IsDisabled())
 }
 
 func TestUser_UpdateLoginTime(t *testing.T) {
-	alice := UserFixtures.Get("alice")
-	time1 := alice.LoginAt
-	assert.Nil(t, time1)
-	alice.UpdateLoginTime()
-	time2 := alice.LoginAt
-	assert.NotNil(t, time2)
-	alice.UpdateLoginTime()
-	time3 := alice.LoginAt
-	assert.NotNil(t, time3)
-	assert.True(t, time3.After(*time2) || time3.Equal(*time2))
+	t.Run("Success", func(t *testing.T) {
+		alice := UserFixtures.Get("alice")
+		time1 := alice.LoginAt
+		assert.Nil(t, time1)
+		alice.UpdateLoginTime()
+		time2 := alice.LoginAt
+		assert.NotNil(t, time2)
+		alice.UpdateLoginTime()
+		time3 := alice.LoginAt
+		assert.NotNil(t, time3)
+		assert.True(t, time3.After(*time2) || time3.Equal(*time2))
+	})
+	t.Run("UserDeleted", func(t *testing.T) {
+		u := NewUser()
+		var deleted = time.Date(2020, 3, 6, 2, 6, 51, 0, time.UTC)
+		u.DeletedAt = DeletedAtTime(deleted)
+		assert.Nil(t, u.UpdateLoginTime())
+	})
+	t.Run("NormalizesOutOfEditionSuperAdminRole", func(t *testing.T) {
+		u := NewUser()
+		u.UserName = "normalize-login"
+		u.DisplayName = "Normalize Login"
+		u.SuperAdmin = true
+		u.UserRole = acl.RoleAdmin.String()
+		u.CanLogin = true
+
+		if err := u.Save(); err != nil {
+			t.Fatal(err)
+		}
+
+		// Simulate a leftover out-of-edition role written outside this edition's
+		// validation (e.g. a Portal cluster_admin row on a Plus instance).
+		if err := Db().Model(u).UpdateColumn("UserRole", acl.RoleClusterAdmin.String()).Error; err != nil {
+			t.Fatal(err)
+		}
+		u.UserRole = acl.RoleClusterAdmin.String()
+
+		// Logging in normalizes the stored role back to the edition's admin role.
+		// CE/Plus/Pro register only admin (not cluster_admin), so the target is admin.
+		u.UpdateLoginTime()
+		assert.Equal(t, acl.RoleAdmin.String(), u.UserRole)
+
+		m := FindUser(User{UserUID: u.UserUID})
+		if m == nil {
+			t.Fatal("result must not be nil")
+		}
+		assert.Equal(t, acl.RoleAdmin.String(), m.UserRole)
+	})
+}
+
+func TestUser_NormalizeAdminRole(t *testing.T) {
+	// CE registers admin but not cluster_admin, so the edition target is admin.
+	t.Run("ForeignSuperAdminRoleReset", func(t *testing.T) {
+		m := &User{UserName: "norm-foreign", SuperAdmin: true, UserRole: acl.RoleClusterAdmin.String()}
+		assert.True(t, m.NormalizeAdminRole())
+		assert.Equal(t, acl.RoleAdmin.String(), m.UserRole)
+	})
+	t.Run("RegisteredAdminRoleKept", func(t *testing.T) {
+		m := &User{UserName: "norm-admin", SuperAdmin: true, UserRole: acl.RoleAdmin.String()}
+		assert.False(t, m.NormalizeAdminRole())
+		assert.Equal(t, acl.RoleAdmin.String(), m.UserRole)
+	})
+	t.Run("NonAdminTierSuperAdminRoleReset", func(t *testing.T) {
+		m := &User{UserName: "norm-guest", SuperAdmin: true, UserRole: acl.RoleGuest.String()}
+		assert.True(t, m.NormalizeAdminRole())
+		assert.Equal(t, acl.RoleAdmin.String(), m.UserRole)
+	})
+	t.Run("RegularAccountUntouched", func(t *testing.T) {
+		m := &User{UserName: "norm-regular", SuperAdmin: false, UserRole: acl.RoleClusterAdmin.String()}
+		assert.False(t, m.NormalizeAdminRole())
+		assert.Equal(t, acl.RoleClusterAdmin.String(), m.UserRole)
+	})
+	t.Run("NilUser", func(t *testing.T) {
+		var m *User
+		assert.False(t, m.NormalizeAdminRole())
+	})
 }
 
 func TestUser_CanLogIn(t *testing.T) {
-	alice := UserFixtures.Get("alice")
-	assert.True(t, alice.CanLogIn())
-	alice.SetProvider(authn.ProviderNone)
-	assert.False(t, alice.CanLogIn())
-	alice.SetProvider(authn.ProviderLocal)
-	assert.True(t, alice.CanLogIn())
+	t.Run("True", func(t *testing.T) {
+		alice := UserFixtures.Get("alice")
+		assert.True(t, alice.CanLogIn())
+		alice.SetProvider(authn.ProviderNone)
+		assert.False(t, alice.CanLogIn())
+		alice.SetProvider(authn.ProviderLocal)
+		assert.True(t, alice.CanLogIn())
 
-	assert.False(t, UserFixtures.Pointer("deleted").CanLogIn())
+		assert.False(t, UserFixtures.Pointer("deleted").CanLogIn())
+	})
+	t.Run("FalseCanlogin", func(t *testing.T) {
+		u := NewUser()
+		u.AuthProvider = "local"
+		u.CanLogin = false
+		assert.False(t, u.CanLogIn())
+	})
+	t.Run("FalseUnknownRole", func(t *testing.T) {
+		unknown := UserFixtures.Get("unauthorized")
+		assert.False(t, unknown.CanLogIn())
+		unknown.SetProvider(authn.ProviderLocal)
+		assert.False(t, unknown.CanLogIn())
+		unknown.SetProvider(authn.ProviderNone)
+		assert.False(t, unknown.CanLogIn())
+	})
 }
 
 func TestUser_CanUseWebDAV(t *testing.T) {
@@ -847,6 +1627,14 @@ func TestUser_CanUseWebDAV(t *testing.T) {
 
 	assert.False(t, UserFixtures.Pointer("deleted").CanUseWebDAV())
 	assert.False(t, UserFixtures.Pointer("friend").CanUseWebDAV())
+
+	// Disabling web login must not affect WebDAV access: the API gate denies app
+	// passwords when CanLogin is off, while WebDAV stays governed by CanUseWebDAV.
+	// bob is a non-super-admin with WebDAV enabled (super admins always keep login).
+	webdavUser := UserFixtures.Get("bob")
+	webdavUser.CanLogin = false
+	assert.False(t, webdavUser.CanLogIn())
+	assert.True(t, webdavUser.CanUseWebDAV())
 }
 
 func TestUser_CanUpload(t *testing.T) {
@@ -859,6 +1647,14 @@ func TestUser_CanUpload(t *testing.T) {
 
 	assert.False(t, UserFixtures.Pointer("deleted").CanUpload())
 	assert.True(t, UserFixtures.Pointer("friend").CanUpload())
+
+	unknown := UserFixtures.Get("unauthorized")
+	assert.False(t, unknown.CanUpload())
+	unknown.SetProvider(authn.ProviderLocal)
+	assert.False(t, unknown.CanUpload())
+	unknown.SetProvider(authn.ProviderNone)
+	assert.False(t, unknown.CanUpload())
+
 }
 
 func TestUser_SharedUIDs(t *testing.T) {
@@ -869,7 +1665,7 @@ func TestUser_SharedUIDs(t *testing.T) {
 		result := m.SharedUIDs()
 		assert.NotNil(t, result)
 		assert.Len(t, result, 1)
-		assert.Equal(t, UIDs{"at9lxuqxpogaaba9"}, result)
+		assert.Equal(t, UIDs{"as6sg6bxpogaaba9"}, result)
 	})
 }
 
@@ -878,7 +1674,7 @@ func TestUser_Form(t *testing.T) {
 		m := FindUserByName("alice")
 
 		if m == nil {
-			t.Fatal("result should not be nil")
+			t.Fatal("result must not be nil")
 		}
 
 		frm, err := m.Form()
@@ -891,22 +1687,185 @@ func TestUser_Form(t *testing.T) {
 		t.Logf("User.UserDetails: %#v", m.UserDetails)
 		t.Logf("Form: %#v", frm)
 		t.Logf("Form.UserDetails: %#v", frm.UserDetails)
+		assert.Nil(t, frm.DeletedAt)
+	})
+	t.Run("Deleted", func(t *testing.T) {
+		deletedAt := time.Date(2022, 10, 18, 8, 15, 21, 0, time.UTC)
+		m := &User{UserName: "form-deleted", UserDetails: &UserDetails{}, DeletedAt: DeletedAtTime(deletedAt)}
+
+		frm, err := m.Form()
+		require.NoError(t, err)
+		require.NotNil(t, frm.DeletedAt)
+		assert.True(t, deletedAt.Equal(*frm.DeletedAt))
+	})
+}
+
+func TestUser_PrivilegeLevelChange(t *testing.T) {
+	t.Run("TrueRoleChanged", func(t *testing.T) {
+		m := FindUserByName("alice")
+
+		if m == nil {
+			t.Fatal("result must not be nil")
+		}
+
+		frm, err := m.Form()
+
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		frm.UserRole = "guest"
+
+		assert.True(t, m.PrivilegeLevelChange(frm))
+	})
+	t.Run("TruePathChanged", func(t *testing.T) {
+		m := FindUserByName("alice")
+
+		if m == nil {
+			t.Fatal("result must not be nil")
+		}
+
+		frm, err := m.Form()
+
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		frm.UploadPath = "uploads-alice"
+
+		assert.True(t, m.PrivilegeLevelChange(frm))
+	})
+	t.Run("TrueCanLoginChanged", func(t *testing.T) {
+		m := FindUserByName("alice")
+
+		if m == nil {
+			t.Fatal("result must not be nil")
+		}
+
+		frm, err := m.Form()
+
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		frm.CanLogin = false
+
+		assert.True(t, m.PrivilegeLevelChange(frm))
+	})
+	t.Run("TrueWebdavChanged", func(t *testing.T) {
+		m := FindUserByName("alice")
+
+		if m == nil {
+			t.Fatal("result must not be nil")
+		}
+
+		frm, err := m.Form()
+
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		frm.WebDAV = false
+
+		assert.True(t, m.PrivilegeLevelChange(frm))
+	})
+	t.Run("FalseNameChanged", func(t *testing.T) {
+		m := FindUserByName("alice")
+
+		if m == nil {
+			t.Fatal("result must not be nil")
+		}
+
+		frm, err := m.Form()
+
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		frm.UserName = "alice-new"
+
+		assert.False(t, m.PrivilegeLevelChange(frm))
+	})
+	t.Run("FalseNoChange", func(t *testing.T) {
+		m := FindUserByName("alice")
+
+		if m == nil {
+			t.Fatal("result must not be nil")
+		}
+
+		frm, err := m.Form()
+
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		assert.False(t, m.PrivilegeLevelChange(frm))
 	})
 }
 
 func TestUser_SaveForm(t *testing.T) {
+	t.Run("EmailChangeClearsVerification", func(t *testing.T) {
+		m := FirstOrCreateUser(&User{
+			UserName:    "saveformemail",
+			UserEmail:   "saveform-old@example.com",
+			DisplayName: "Save Form Email",
+			UserRole:    acl.RoleGuest.String(),
+		})
+		require.NotNil(t, m)
+		t.Cleanup(func() { deleteTestUser(t, m) })
+		require.NoError(t, UnscopedDb().Model(m).Update("VerifiedAt", TimeStamp()).Error)
+
+		m = FindUserByUID(m.UserUID)
+		require.True(t, m.EmailVerified())
+		frm, err := m.Form()
+		require.NoError(t, err)
+
+		frm.UserEmail = "saveform-old@example.com"
+		require.NoError(t, m.SaveForm(frm, UserFixtures.Pointer("alice"), true, false))
+		assert.True(t, FindUserByUID(m.UserUID).EmailVerified())
+
+		frm.UserEmail = "saveform-new@example.com"
+		require.NoError(t, m.SaveForm(frm, UserFixtures.Pointer("alice"), true, false))
+		saved := FindUserByUID(m.UserUID)
+		assert.Equal(t, "saveform-new@example.com", saved.UserEmail)
+		assert.False(t, saved.EmailVerified())
+	})
+	t.Run("EmailRequiresAdmin", func(t *testing.T) {
+		m := FirstOrCreateUser(&User{
+			UserName:    "saveformemailowner",
+			UserEmail:   "saveform-owner@example.com",
+			DisplayName: "Save Form Email Owner",
+			UserRole:    acl.RoleGuest.String(),
+		})
+		require.NotNil(t, m)
+		t.Cleanup(func() { deleteTestUser(t, m) })
+		require.NoError(t, UnscopedDb().Model(m).Update("VerifiedAt", TimeStamp()).Error)
+
+		m = FindUserByUID(m.UserUID)
+		frm, err := m.Form()
+		require.NoError(t, err)
+
+		frm.UserEmail = "saveform-changed@example.com"
+		frm.DisplayName = "Changed By Owner"
+		require.NoError(t, m.SaveForm(frm, m, false, false))
+
+		saved := FindUserByUID(m.UserUID)
+		assert.Equal(t, "saveform-owner@example.com", saved.UserEmail)
+		assert.True(t, saved.EmailVerified())
+		assert.Equal(t, "Changed By Owner", saved.DisplayName)
+	})
 	t.Run("UnknownUser", func(t *testing.T) {
 		frm, err := UnknownUser.Form()
 		assert.NoError(t, err)
 
-		err = UnknownUser.SaveForm(frm, false)
+		err = UnknownUser.SaveForm(frm, UserFixtures.Pointer("guest"), false, false)
 		assert.Error(t, err)
 	})
 	t.Run("Admin", func(t *testing.T) {
 		m := FindUser(Admin)
 
 		if m == nil {
-			t.Fatal("result should not be nil")
+			t.Fatal("result must not be nil")
 		}
 
 		frm, err := m.Form()
@@ -917,7 +1876,7 @@ func TestUser_SaveForm(t *testing.T) {
 
 		frm.UserEmail = "admin@example.com"
 		frm.UserDetails.UserLocation = "GoLand"
-		err = Admin.SaveForm(frm, false)
+		err = Admin.SaveForm(frm, &Admin, true, false)
 
 		assert.NoError(t, err)
 		assert.Equal(t, "admin@example.com", Admin.UserEmail)
@@ -931,7 +1890,7 @@ func TestUser_SaveForm(t *testing.T) {
 		m := FindUser(Admin)
 
 		if m == nil {
-			t.Fatal("result should not be nil")
+			t.Fatal("result must not be nil")
 		}
 
 		frm, err := m.Form()
@@ -942,7 +1901,7 @@ func TestUser_SaveForm(t *testing.T) {
 
 		frm.UserEmail = "admin@example.com"
 		frm.UserDetails.UserLocation = "GoLand"
-		err = Admin.SaveForm(frm, true)
+		err = Admin.SaveForm(frm, UserFixtures.Pointer("alice"), true, false)
 
 		assert.NoError(t, err)
 		assert.Equal(t, "admin@example.com", Admin.UserEmail)
@@ -951,6 +1910,382 @@ func TestUser_SaveForm(t *testing.T) {
 		m = FindUserByUID(Admin.UserUID)
 		assert.Equal(t, "admin@example.com", m.UserEmail)
 		assert.Equal(t, "GoLand", m.Details().UserLocation)
+	})
+	t.Run("ChangeDisplayName", func(t *testing.T) {
+		m := FindUser(Admin)
+
+		if m == nil {
+			t.Fatal("result must not be nil")
+		}
+
+		frm, err := m.Form()
+
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		frm.DisplayName = "New Name"
+		err = Admin.SaveForm(frm, UserFixtures.Pointer("alice"), true, false)
+
+		assert.NoError(t, err)
+		assert.Equal(t, "New Name", Admin.DisplayName)
+
+		m = FindUserByUID(Admin.UserUID)
+		assert.Equal(t, "New Name", m.DisplayName)
+	})
+	t.Run("AnotherSuperAdminCanDisableInitialAdminLogin", func(t *testing.T) {
+		// The seed admin is no longer special-cased: another super admin may
+		// disable its login (e.g. a cluster-managed instance that keeps no local
+		// super admin). The acting admin still cannot lock itself out.
+		m := FindUser(Admin)
+
+		if m == nil {
+			t.Fatal("result must not be nil")
+		}
+
+		frm, err := m.Form()
+
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		frm.CanLogin = false
+		err = Admin.SaveForm(frm, UserFixtures.Pointer("alice"), true, false)
+
+		assert.NoError(t, err)
+		assert.False(t, Admin.CanLogin)
+
+		m = FindUserByUID(Admin.UserUID)
+		assert.False(t, m.CanLogin)
+
+		// Restore the seed admin so later subtests see a login-capable account.
+		Admin.CanLogin = true
+		if err = Admin.Save(); err != nil {
+			t.Fatal(err)
+		}
+	})
+	t.Run("AnotherSuperAdminCanDemoteInitialAdmin", func(t *testing.T) {
+		// With the hard ID-1 lock removed, a second super admin can fully demote
+		// the seed admin (clear super admin, drop to a non-admin role, disable
+		// login). The form must request SuperAdmin=false so the role normalization
+		// does not re-promote it.
+		m := FindUser(Admin)
+
+		if m == nil {
+			t.Fatal("result must not be nil")
+		}
+
+		frm, err := m.Form()
+
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		frm.UserRole = acl.RoleGuest.String()
+		frm.SuperAdmin = false
+		frm.CanLogin = false
+		err = Admin.SaveForm(frm, UserFixtures.Pointer("alice"), true, false)
+
+		assert.NoError(t, err)
+		assert.False(t, Admin.SuperAdmin)
+		assert.Equal(t, acl.RoleGuest.String(), Admin.UserRole)
+		assert.False(t, Admin.CanLogin)
+
+		m = FindUserByUID(Admin.UserUID)
+		assert.False(t, m.SuperAdmin)
+		assert.Equal(t, acl.RoleGuest.String(), m.UserRole)
+		assert.False(t, m.CanLogin)
+
+		// Restore the seed admin so later subtests see a usable super admin.
+		Admin.SuperAdmin = true
+		Admin.CanLogin = true
+		Admin.SetRole(acl.RoleAdmin.String())
+		if err = Admin.Save(); err != nil {
+			t.Fatal(err)
+		}
+	})
+	t.Run("PreventInitialAdminFromDisablingOwnLogin", func(t *testing.T) {
+		m := FindUser(Admin)
+
+		if m == nil {
+			t.Fatal("result must not be nil")
+		}
+
+		frm, err := m.Form()
+
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		frm.CanLogin = false
+		err = Admin.SaveForm(frm, &Admin, true, false)
+
+		assert.NoError(t, err)
+		assert.Equal(t, true, Admin.CanLogin)
+
+		m = FindUserByUID(Admin.UserUID)
+		assert.Equal(t, true, m.CanLogin)
+	})
+	t.Run("PreventInitialAdminFromSettingAuthProviderNone", func(t *testing.T) {
+		m := FindUser(Admin)
+
+		if m == nil {
+			t.Fatal("result must not be nil")
+		}
+
+		frm, err := m.Form()
+
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		frm.AuthProvider = authn.ProviderNone.String()
+		err = Admin.SaveForm(frm, &Admin, true, false)
+
+		assert.NoError(t, err)
+		assert.Equal(t, "local", Admin.AuthProvider)
+
+		m = FindUserByUID(Admin.UserUID)
+		assert.Equal(t, "local", m.AuthProvider)
+	})
+	t.Run("PreventAdminFromSettingAuthProviderNone", func(t *testing.T) {
+		alice := UserFixtures.Get("alice")
+
+		m := FindUser(alice)
+
+		if m == nil {
+			t.Fatal("result must not be nil")
+		}
+
+		frm, err := m.Form()
+
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		frm.AuthProvider = authn.ProviderNone.String()
+		err = alice.SaveForm(frm, &alice, true, false)
+
+		assert.NoError(t, err)
+		assert.Equal(t, "local", alice.AuthProvider)
+
+		m = FindUserByUID(alice.UserUID)
+		assert.Equal(t, "local", m.AuthProvider)
+	})
+	t.Run("AliceChangeAdminRights", func(t *testing.T) {
+		user := UserFixtures.Get("alice")
+		m := FindUser(user)
+
+		if m == nil {
+			t.Fatal("result must not be nil")
+		}
+
+		assert.Equal(t, "admin", m.UserRole)
+		assert.True(t, m.SuperAdmin)
+		assert.True(t, m.CanLogin)
+
+		frm, err := m.Form()
+
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		assert.Equal(t, "admin", frm.UserRole)
+		assert.True(t, frm.SuperAdmin)
+		assert.True(t, frm.CanLogin)
+
+		frm.UserRole = "user"
+		frm.SuperAdmin = false
+		frm.CanLogin = false
+
+		err = user.SaveForm(frm, &user, true, false)
+
+		assert.NoError(t, err)
+		assert.Equal(t, "admin", m.UserRole)
+		assert.True(t, m.SuperAdmin)
+		assert.True(t, m.CanLogin)
+	})
+	t.Run("TryToChangeRoleOfInitialAdmin", func(t *testing.T) {
+		m := FindUser(Admin)
+
+		if m == nil {
+			t.Fatal("result must not be nil")
+		}
+
+		frm, err := m.Form()
+
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		frm.UserRole = "user"
+		err = Admin.SaveForm(frm, UserFixtures.Pointer("guest"), false, false)
+
+		assert.Error(t, err)
+		assert.Equal(t, "super admin must not have a non-admin role", err.Error())
+
+		m = FindUserByUID(Admin.UserUID)
+		assert.Equal(t, "admin", m.UserRole)
+	})
+	t.Run("InvalidBasePath", func(t *testing.T) {
+		m := FindUser(Admin)
+
+		if m == nil {
+			t.Fatal("result must not be nil")
+		}
+
+		frm, err := m.Form()
+
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		frm.BasePath = "//*?"
+		err = Admin.SaveForm(frm, &Admin, true, false)
+
+		assert.Error(t, err)
+		assert.Equal(t, "invalid base folder", err.Error())
+
+		m = FindUserByUID(Admin.UserUID)
+		assert.Equal(t, "", m.BasePath)
+	})
+	t.Run("InvalidUploadPath", func(t *testing.T) {
+		m := FindUser(Admin)
+
+		if m == nil {
+			t.Fatal("result must not be nil")
+		}
+
+		frm, err := m.Form()
+
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		frm.UploadPath = "//*?"
+		err = Admin.SaveForm(frm, &Admin, true, false)
+
+		assert.Error(t, err)
+		assert.Equal(t, "invalid upload folder", err.Error())
+
+		m = FindUserByUID(Admin.UserUID)
+		assert.Equal(t, "", m.UploadPath)
+	})
+	t.Run("ClusterServicePrincipalDisablesLogin", func(t *testing.T) {
+		// A trusted cluster service principal (e.g. the Portal syncing user
+		// state) has no end-user identity, so SaveForm receives an unknown
+		// actor. With byAdmin set it must still persist privilege fields such as
+		// CanLogin; otherwise the Portal login toggle is silently ignored.
+		u := &User{UserName: "cluster-login-off", UserRole: acl.RoleUser.String(), CanLogin: true}
+		if err := u.Create(); err != nil {
+			t.Fatal(err)
+		}
+
+		frm, err := u.Form()
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		frm.CanLogin = false
+		err = u.SaveForm(frm, &User{}, true, false)
+
+		assert.NoError(t, err)
+		assert.False(t, u.CanLogin)
+
+		m := FindUserByUID(u.UserUID)
+		assert.False(t, m.CanLogin)
+	})
+	t.Run("UnprivilegedActorKeepsLogin", func(t *testing.T) {
+		// Without admin authorization the privilege block is skipped, so
+		// CanLogin stays unchanged even when the form requests false.
+		u := &User{UserName: "cluster-login-keep", UserRole: acl.RoleUser.String(), CanLogin: true}
+		if err := u.Create(); err != nil {
+			t.Fatal(err)
+		}
+
+		frm, err := u.Form()
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		frm.CanLogin = false
+		err = u.SaveForm(frm, &User{}, false, false)
+
+		assert.NoError(t, err)
+		assert.True(t, u.CanLogin)
+
+		m := FindUserByUID(u.UserUID)
+		assert.True(t, m.CanLogin)
+	})
+	t.Run("ClusterServicePrincipalDisables2FA", func(t *testing.T) {
+		// Disabling 2FA is super-admin-level; the cluster principal isn't a super admin, so
+		// without bySuperAdmin the auth method change would be dropped.
+		u := &User{UserName: "cluster-2fa-off", UserRole: acl.RoleUser.String(), CanLogin: true, AuthMethod: authn.Method2FA.String()}
+		if err := u.Create(); err != nil {
+			t.Fatal(err)
+		}
+
+		frm, err := u.Form()
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		frm.AuthMethod = authn.MethodDefault.String()
+		err = u.SaveForm(frm, &User{}, true, true)
+
+		assert.NoError(t, err)
+		assert.False(t, u.Method().Is(authn.Method2FA))
+
+		m := FindUserByUID(u.UserUID)
+		assert.False(t, m.Method().Is(authn.Method2FA))
+	})
+	t.Run("UnprivilegedAdminKeeps2FA", func(t *testing.T) {
+		// A regular admin (byAdmin, not super-admin-level) must not disable another user's 2FA.
+		u := &User{UserName: "admin-2fa-keep", UserRole: acl.RoleUser.String(), CanLogin: true, AuthMethod: authn.Method2FA.String()}
+		if err := u.Create(); err != nil {
+			t.Fatal(err)
+		}
+
+		frm, err := u.Form()
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		frm.AuthMethod = authn.MethodDefault.String()
+		err = u.SaveForm(frm, &User{}, true, false)
+
+		assert.NoError(t, err)
+		assert.True(t, u.Method().Is(authn.Method2FA))
+
+		m := FindUserByUID(u.UserUID)
+		assert.True(t, m.Method().Is(authn.Method2FA))
+	})
+	t.Run("RestoreHeld", func(t *testing.T) {
+		deleted := newRenameTestUser(t, "saveform-restore-held", acl.RoleGuest)
+		require.NoError(t, Db().Delete(deleted).Error)
+		newRenameTestUser(t, "saveform-restore-held", acl.RoleGuest)
+
+		m := FindUser(User{UserUID: deleted.UserUID})
+		require.NotNil(t, m)
+		frm, err := m.Form()
+		require.NoError(t, err)
+		frm.DeletedAt = nil
+
+		require.EqualError(t, m.SaveForm(frm, FindUserByName("admin"), true, true), "user 'saveform-restore-held' already exists")
+		assert.True(t, FindUser(User{UserUID: deleted.UserUID}).IsDeleted())
+	})
+	t.Run("Restore", func(t *testing.T) {
+		deleted := newRenameTestUser(t, "saveform-restore-free", acl.RoleGuest)
+		require.NoError(t, Db().Delete(deleted).Error)
+
+		m := FindUser(User{UserUID: deleted.UserUID})
+		require.NotNil(t, m)
+		frm, err := m.Form()
+		require.NoError(t, err)
+		frm.DeletedAt = nil
+
+		require.NoError(t, m.SaveForm(frm, FindUserByName("admin"), true, true))
+		assert.False(t, FindUser(User{UserUID: deleted.UserUID}).IsDeleted())
 	})
 }
 
@@ -964,26 +2299,96 @@ func TestUser_SetDisplayName(t *testing.T) {
 		assert.Equal(t, "Henry Gates", d.FamilyName)
 		assert.Equal(t, "III", d.NameSuffix)
 	})
+	t.Run("EmptyName", func(t *testing.T) {
+		user := NewUser()
+		user.SetDisplayName("", SrcAuto)
+		d := user.Details()
+		assert.Equal(t, "", d.NameTitle)
+		assert.Equal(t, "", d.GivenName)
+		assert.Equal(t, "", d.FamilyName)
+		assert.Equal(t, "", d.NameSuffix)
+	})
+	t.Run("PriorityTooLow", func(t *testing.T) {
+		user := User{
+			ID:      1234567,
+			UserUID: "urqdrfb72479n047",
+			UserDetails: &UserDetails{
+				GivenName:  "John",
+				MiddleName: "Percival",
+				FamilyName: "Doe",
+				NameSrc:    "manual",
+			},
+		}
+		user.SetDisplayName("Sir William Henry Gates III", SrcAuto)
+		d := user.Details()
+		assert.Equal(t, "", d.NameTitle)
+		assert.Equal(t, "John", d.GivenName)
+		assert.Equal(t, "Doe", d.FamilyName)
+		assert.Equal(t, "", d.NameSuffix)
+	})
+}
+
+func TestUser_SetGivenName(t *testing.T) {
+	user := User{
+		ID:      1234567,
+		UserUID: "urqdrfb72479n047",
+		UserDetails: &UserDetails{
+			GivenName:  "John",
+			MiddleName: "Percival",
+			FamilyName: "Doe",
+		},
+	}
+	assert.Equal(t, "John", user.Details().GivenName)
+	user.SetGivenName("Jane")
+	assert.Equal(t, "Jane", user.Details().GivenName)
+	user.SetGivenName("")
+	assert.Equal(t, "Jane", user.Details().GivenName)
+}
+
+func TestUser_SetFamilyName(t *testing.T) {
+	user := User{
+		ID:      1234567,
+		UserUID: "urqdrfb72479n047",
+		UserDetails: &UserDetails{
+			GivenName:  "John",
+			MiddleName: "Percival",
+			FamilyName: "Doe",
+		},
+	}
+	assert.Equal(t, "Doe", user.Details().FamilyName)
+	user.SetFamilyName("Maier")
+	assert.Equal(t, "Maier", user.Details().FamilyName)
+	user.SetFamilyName("")
+	assert.Equal(t, "Maier", user.Details().FamilyName)
 }
 
 func TestUser_SetAvatar(t *testing.T) {
 	t.Run("Visitor", func(t *testing.T) {
+		assert.False(t, Visitor.HasAvatar())
 		err := Visitor.SetAvatar("ebfc0aea7d3fd018b5fff57c76806b35181855ed", SrcManual)
 		assert.Error(t, err)
 	})
 	t.Run("UnknownUser", func(t *testing.T) {
+		assert.False(t, UnknownUser.HasAvatar())
 		err := UnknownUser.SetAvatar("ebfc0aea7d3fd018b5fff57c76806b35181855ed", SrcManual)
 		assert.Error(t, err)
 	})
 	t.Run("Admin", func(t *testing.T) {
+		assert.False(t, Admin.HasAvatar())
 		err := Admin.SetAvatar("ebfc0aea7d3fd018b5fff57c76806b35181855ed", SrcManual)
 		assert.NoError(t, err)
 		assert.Equal(t, "ebfc0aea7d3fd018b5fff57c76806b35181855ed", Admin.Thumb)
 		assert.Equal(t, SrcManual, Admin.ThumbSrc)
+		assert.True(t, Admin.HasAvatar())
 
 		m := FindUserByUID(Admin.UserUID)
 		assert.Equal(t, "ebfc0aea7d3fd018b5fff57c76806b35181855ed", m.Thumb)
 		assert.Equal(t, SrcManual, m.ThumbSrc)
+		assert.True(t, Admin.HasAvatar())
+	})
+	t.Run("NoPermissions", func(t *testing.T) {
+		err := Admin.SetAvatar("ebfc0aea7d3fd018b5fff57c76806b35181855ed", SrcAuto)
+		assert.Error(t, err)
 	})
 }
 
@@ -1002,12 +2407,168 @@ func TestUser_Username(t *testing.T) {
 func TestUser_Provider(t *testing.T) {
 	t.Run("Visitor", func(t *testing.T) {
 		assert.Equal(t, authn.ProviderLink, Visitor.Provider())
+		Visitor.AuthProvider = ""
+		assert.Equal(t, authn.ProviderLink, Visitor.Provider())
+		Visitor.SetProvider(authn.ProviderLink)
 	})
 	t.Run("UnknownUser", func(t *testing.T) {
 		assert.Equal(t, authn.ProviderNone, UnknownUser.Provider())
 	})
 	t.Run("Admin", func(t *testing.T) {
 		assert.Equal(t, authn.ProviderLocal, Admin.Provider())
+		Admin.AuthProvider = ""
+		assert.Equal(t, authn.ProviderLocal, Admin.Provider())
+		Admin.SetProvider(authn.ProviderLocal)
+	})
+	t.Run("UsernameEmpty", func(t *testing.T) {
+		user := NewUser()
+		user.ID = 500
+		user.AuthProvider = ""
+		user.UserName = "test"
+		assert.Equal(t, authn.ProviderDefault, user.Provider())
+	})
+}
+
+func TestUser_SetProvider(t *testing.T) {
+	t.Run("TwoFa", func(t *testing.T) {
+		m := UserFixtures.Get("alice")
+		assert.Equal(t, authn.ProviderLocal, m.Provider())
+		assert.Equal(t, authn.MethodDefault, m.Method())
+		m.SetMethod(authn.Method2FA)
+		assert.Equal(t, authn.ProviderLocal, m.Provider())
+		assert.Equal(t, authn.Method2FA, m.Method())
+		m.SetProvider(authn.ProviderNone)
+		assert.Equal(t, authn.ProviderNone, m.Provider())
+		assert.Equal(t, authn.MethodUndefined, m.Method())
+		m.SetProvider(authn.ProviderLocal)
+	})
+}
+
+func TestUser_SetMethod(t *testing.T) {
+	t.Run("TwoFa", func(t *testing.T) {
+		m := UserFixtures.Get("unauthorized")
+		assert.Equal(t, authn.ProviderNone, m.Provider())
+		assert.Equal(t, authn.MethodDefault, m.Method())
+		m.SetMethod(authn.Method2FA)
+		assert.Equal(t, authn.ProviderNone, m.Provider())
+		assert.Equal(t, authn.MethodDefault, m.Method())
+	})
+}
+
+func TestUser_SetAuthID(t *testing.T) {
+	uuid := rnd.UUID()
+	issuer := "http://dummy-oidc:9998"
+
+	t.Run("UUID", func(t *testing.T) {
+		m := UserFixtures.Get("guest")
+
+		m.SetAuthID(uuid, issuer)
+		assert.Equal(t, uuid, m.AuthID)
+		assert.Equal(t, issuer, m.AuthIssuer)
+		m.SetAuthID(uuid, "")
+		assert.Equal(t, uuid, m.AuthID)
+		assert.Equal(t, "", m.AuthIssuer)
+		m.SetAuthID("", issuer)
+		assert.Equal(t, uuid, m.AuthID)
+		assert.Equal(t, "", m.AuthIssuer)
+	})
+	t.Run("DupeAuthProviderAndID", func(t *testing.T) {
+		m := UserFixtures.Get("guest")
+		n := NewUser()
+		n.UserName = "guest2"
+		n.DisplayName = "Guest User2"
+		n.UserEmail = "guest2@example.com"
+		n.UserRole = acl.RoleGuest.String()
+		n.AuthProvider = authn.ProviderOIDC.String()
+		n.AuthMethod = authn.MethodDefault.String()
+		n.SuperAdmin = false
+		n.CanLogin = true
+		n.SetAuthID(uuid, issuer)
+		assert.NoError(t, n.Save())
+
+		t.Cleanup(func() {
+			assert.NoError(t, n.Delete())
+			UnscopedDb().Delete(n)
+		})
+
+		newUserUID := n.UserUID
+		m.SetAuthID(uuid, issuer)
+		assert.Equal(t, uuid, m.AuthID)
+		assert.Equal(t, issuer, m.AuthIssuer)
+
+		n = FindUserByUID(newUserUID)
+		require.NotNil(t, n)
+
+		assert.Equal(t, "guest2", n.UserName)
+		assert.Equal(t, "", n.AuthID)
+		assert.Equal(t, authn.ProviderNone.String(), n.AuthProvider)
+	})
+}
+
+func TestUser_UpdateAuthID(t *testing.T) {
+	uuid := rnd.UUID()
+	issuer := "http://dummy-oidc:9998"
+	longnumber := "12345678901234567890"
+
+	t.Run("UUID", func(t *testing.T) {
+		m := UserFixtures.Get("friend")
+
+		m.SetAuthID("", issuer)
+		assert.Equal(t, "", m.AuthID)
+		assert.Equal(t, "", m.AuthIssuer)
+		m.SetAuthID(uuid, issuer)
+		assert.Equal(t, uuid, m.AuthID)
+		assert.Equal(t, issuer, m.AuthIssuer)
+		err := m.UpdateAuthID(uuid, "")
+		assert.NoError(t, err)
+		assert.Equal(t, uuid, m.AuthID)
+		assert.Equal(t, "", m.AuthIssuer)
+	})
+	t.Run("InvalidUUID", func(t *testing.T) {
+		m := User{UserUID: "123"}
+
+		assert.Equal(t, "", m.AuthIssuer)
+		m.SetAuthID(uuid, issuer)
+		assert.Equal(t, uuid, m.AuthID)
+		assert.Equal(t, issuer, m.AuthIssuer)
+		err := m.UpdateAuthID(uuid, "")
+		assert.Error(t, err)
+	})
+	t.Run("LongNumber", func(t *testing.T) {
+		m := UserFixtures.Get("friend")
+
+		m.SetAuthID("", issuer)
+		assert.Equal(t, "", m.AuthID)
+		assert.Equal(t, "", m.AuthIssuer)
+		m.SetAuthID(longnumber, issuer)
+		assert.Equal(t, longnumber, m.AuthID)
+		assert.Equal(t, issuer, m.AuthIssuer)
+		err := m.UpdateAuthID(longnumber, "")
+		assert.NoError(t, err)
+		assert.Equal(t, longnumber, m.AuthID)
+		assert.Equal(t, "", m.AuthIssuer)
+	})
+}
+
+func TestUser_AuthInfo(t *testing.T) {
+	t.Run("Alice", func(t *testing.T) {
+		m := UserFixtures.Get("alice")
+		assert.Equal(t, "Local", m.AuthInfo())
+	})
+	t.Run("Jane", func(t *testing.T) {
+		m := UserFixtures.Get("jane")
+		assert.Equal(t, "Local (2FA)", m.AuthInfo())
+	})
+	t.Run("Unauthorized", func(t *testing.T) {
+		m := UserFixtures.Get("unauthorized")
+		assert.Equal(t, "None", m.AuthInfo())
+	})
+}
+
+func TestUser_Passcode(t *testing.T) {
+	t.Run("Jane", func(t *testing.T) {
+		m := UserFixtures.Get("jane")
+		assert.IsType(t, &Passcode{}, m.Passcode("totp"))
 	})
 }
 
@@ -1021,6 +2582,202 @@ func TestUser_GetBasePath(t *testing.T) {
 	t.Run("Admin", func(t *testing.T) {
 		assert.Equal(t, "", Admin.GetBasePath())
 	})
+}
+
+func TestUser_DefaultBasePath(t *testing.T) {
+	t.Run("Handle", func(t *testing.T) {
+		assert.Equal(t, "users/jane_doe", (&User{UserName: "Jane_Doe"}).DefaultBasePath())
+		assert.Equal(t, "users/john.doe", (&User{UserName: "john doe"}).DefaultBasePath())
+		assert.Equal(t, "", (&User{UserName: "..."}).DefaultBasePath())
+		assert.Equal(t, "", (&User{UserName: ".gitignore"}).DefaultBasePath())
+	})
+	t.Run("UserUID", func(t *testing.T) {
+		for _, name := range []string{"", ".", "..", "...", "/", "./", ".gitignore", "@example.com", "..@example.com"} {
+			u := &User{UserUID: "urqdrfb72479n047", UserName: name}
+			assert.Equal(t, "users/+urqdrfb72479n047", u.DefaultBasePath(), name)
+		}
+
+		u := &User{UserUID: "urqdrfb72479n047", UserName: "."}
+		assert.False(t, fs.FileNameHidden(path.Base(u.DefaultBasePath())))
+		assert.Equal(t, "users/+urqdrfb72479n047", u.SetBasePath("~").GetBasePath())
+		assert.Equal(t, "users/+urqdrfb72479n047", u.SetUploadPath("~").GetUploadPath())
+	})
+	t.Run("NoUserUID", func(t *testing.T) {
+		assert.Equal(t, "", (&User{UserName: "."}).DefaultBasePath())
+	})
+}
+
+func TestUser_ValidHandle(t *testing.T) {
+	t.Run("Valid", func(t *testing.T) {
+		for _, name := range []string{"jane", "Jane Doe", "jane@example.com", "corp\\jane", "u123", "uqxc08w3d0ej2283", "utuesdayteam1234"} {
+			assert.True(t, (&User{UserName: name}).ValidHandle(), name)
+		}
+	})
+	t.Run("Invalid", func(t *testing.T) {
+		for _, name := range []string{"", ".", "..", "...", "/", "./", ".gitignore", ".bob@example.com", "@example.com"} {
+			assert.False(t, (&User{UserName: name}).ValidHandle(), name)
+		}
+	})
+}
+
+func TestUser_GetBasePath_ResolvedDefault(t *testing.T) {
+	t.Run("WithoutValidHandle", func(t *testing.T) {
+		for _, basePath := range []string{UsersPath, "."} {
+			u := &User{UserUID: "urqdrfb72479n047", UserName: ".", BasePath: basePath}
+			assert.Equal(t, "users/+urqdrfb72479n047", u.GetBasePath(), basePath)
+		}
+	})
+	t.Run("WithValidHandle", func(t *testing.T) {
+		u := &User{UserUID: "urqdrfb72479n047", UserName: "jane", BasePath: UsersPath}
+		assert.Equal(t, UsersPath, u.GetBasePath())
+	})
+	t.Run("UIDShapedHandle", func(t *testing.T) {
+		u := &User{UserUID: "urqdrfb72479n047", UserName: "uqxc08w3d0ej2283", BasePath: "users/uqxc08w3d0ej2283"}
+		assert.Equal(t, "users/uqxc08w3d0ej2283", u.GetBasePath())
+		assert.Equal(t, "users/uqxc08w3d0ej2283", (&User{UserUID: "urqdrfb72479n047", UserName: "uqxc08w3d0ej2283"}).DefaultBasePath())
+	})
+	t.Run("OtherPath", func(t *testing.T) {
+		u := &User{UserUID: "urqdrfb72479n047", UserName: ".", BasePath: "users/.bob"}
+		assert.Equal(t, "users/.bob", u.GetBasePath())
+	})
+}
+
+func TestUser_Create_ValidHandle(t *testing.T) {
+	t.Run("Refused", func(t *testing.T) {
+		for _, name := range []string{".", "...", ".bob", ".bob@example.com"} {
+			u := NewUser()
+			u.UserName = name
+			u.UserRole = acl.RoleAdmin.String()
+			assert.Error(t, u.Create(), name)
+			t.Cleanup(func() { _ = UnscopedDb().Where("user_uid = ?", u.UserUID).Delete(&User{}).Error })
+			assert.Nil(t, FindUserByName(name), name)
+		}
+	})
+	t.Run("InitialAdmin", func(t *testing.T) {
+		u := &User{ID: 1, UserName: ".admin", UserRole: acl.RoleAdmin.String()}
+		err := u.Create()
+		if err != nil {
+			assert.NotContains(t, err.Error(), "not supported")
+		}
+	})
+	t.Run("Created", func(t *testing.T) {
+		u := NewUser()
+		u.UserName = "valid-handle-" + rnd.Base36(6)
+		u.UserRole = acl.RoleAdmin.String()
+		require.NoError(t, u.Create())
+		t.Cleanup(func() { _ = UnscopedDb().Delete(u).Error })
+	})
+}
+
+func TestUser_Validate_StoredEmail(t *testing.T) {
+	m := FirstOrCreateUser(&User{
+		UserName:    "storedemail",
+		UserEmail:   "storedemail@example.com",
+		DisplayName: "Stored Email",
+		UserRole:    acl.RoleGuest.String(),
+	})
+	require.NotNil(t, m)
+	require.NoError(t, UnscopedDb().Model(m).Update("UserEmail", "not-an-email").Error)
+	t.Cleanup(func() { deleteTestUser(t, m) })
+
+	t.Run("UnchangedInvalid", func(t *testing.T) {
+		u := FindUserByUID(m.UserUID)
+		require.NotNil(t, u)
+		require.Equal(t, "not-an-email", u.UserEmail)
+		u.UserRole = acl.RoleAdmin.String()
+
+		assert.NoError(t, u.Validate())
+	})
+	t.Run("ChangedInvalid", func(t *testing.T) {
+		u := FindUserByUID(m.UserUID)
+		require.NotNil(t, u)
+		u.UserEmail = "still-not-an-email"
+
+		assert.Error(t, u.Validate())
+	})
+	t.Run("UnchangedInvalidDeleted", func(t *testing.T) {
+		require.NoError(t, UnscopedDb().Model(m).Update("DeletedAt", Now()).Error)
+		t.Cleanup(func() { UnscopedDb().Model(m).Update("DeletedAt", nil) })
+
+		u := FindUser(User{ID: m.ID})
+		require.NotNil(t, u)
+		require.True(t, u.IsDeleted())
+		u.UserRole = acl.RoleAdmin.String()
+
+		assert.NoError(t, u.Validate())
+	})
+	t.Run("ChangedValid", func(t *testing.T) {
+		u := FindUserByUID(m.UserUID)
+		require.NotNil(t, u)
+		u.UserEmail = "Stored Email <stored-email@example.com>"
+
+		assert.NoError(t, u.Validate())
+		assert.Equal(t, "stored-email@example.com", u.UserEmail)
+	})
+}
+
+func TestUser_SetEmail(t *testing.T) {
+	verified := TimeStamp()
+	t.Run("Changed", func(t *testing.T) {
+		m := &User{UserEmail: "old@example.com", VerifiedAt: verified, VerifyToken: "token"}
+		m.SetEmail("new@example.com")
+
+		assert.Equal(t, "new@example.com", m.UserEmail)
+		assert.Nil(t, m.VerifiedAt)
+		assert.NotEqual(t, "token", m.VerifyToken)
+		assert.NotEmpty(t, m.VerifyToken)
+	})
+	t.Run("Unchanged", func(t *testing.T) {
+		m := &User{UserEmail: "same@example.com", VerifiedAt: verified, VerifyToken: "token"}
+		m.SetEmail("same@example.com")
+
+		assert.Equal(t, verified, m.VerifiedAt)
+		assert.Equal(t, "token", m.VerifyToken)
+	})
+	t.Run("Cleared", func(t *testing.T) {
+		m := &User{UserEmail: "old@example.com", VerifiedAt: verified}
+		m.SetEmail("")
+
+		assert.Equal(t, "", m.UserEmail)
+		assert.Nil(t, m.VerifiedAt)
+	})
+}
+
+func TestUser_storedEmail(t *testing.T) {
+	t.Run("Saved", func(t *testing.T) {
+		alice := FindUserByName("alice")
+		require.NotNil(t, alice)
+		require.NotEmpty(t, alice.UserEmail)
+
+		assert.Equal(t, alice.UserEmail, (&User{ID: alice.ID, UserEmail: "changed@example.com"}).storedEmail())
+	})
+	t.Run("NotSaved", func(t *testing.T) {
+		assert.Equal(t, "", (&User{UserEmail: "new@example.com"}).storedEmail())
+		assert.Equal(t, "", (&User{ID: -1}).storedEmail())
+		assert.Equal(t, "", (&User{ID: 999999999}).storedEmail())
+	})
+}
+
+func TestUser_Validate_ExistingWithoutValidHandle(t *testing.T) {
+	u := &User{ID: 987654, UserUID: "urqdrfb72479n048", UserName: ".bob", UserRole: acl.RoleAdmin.String()}
+	assert.NoError(t, u.Validate())
+}
+
+func TestFindUser_OidcWithoutUsername(t *testing.T) {
+	u := NewUser()
+	u.UserName = "oidc-" + rnd.Base36(6)
+	u.UserRole = acl.RoleAdmin.String()
+	u.AuthProvider = authn.ProviderOIDC.String()
+	u.AuthIssuer = "https://idp.example.com"
+	u.AuthID = rnd.UUID()
+	require.NoError(t, u.Create())
+	t.Cleanup(func() { _ = UnscopedDb().Delete(u).Error })
+
+	found := FindUser(User{AuthProvider: u.AuthProvider, AuthIssuer: u.AuthIssuer, AuthID: u.AuthID})
+
+	if assert.NotNil(t, found) {
+		assert.Equal(t, u.UserUID, found.UserUID)
+	}
 }
 
 func TestUser_SetBasePath(t *testing.T) {
@@ -1037,6 +2794,7 @@ func TestUser_SetBasePath(t *testing.T) {
 			CanInvite:   false,
 		}
 
+		assert.Equal(t, "", u.SetBasePath("./").GetBasePath())
 		assert.Equal(t, "base", u.SetBasePath("base").GetBasePath())
 		assert.Equal(t, "users/test", u.SetBasePath("~").GetBasePath())
 		assert.Equal(t, "users/test", u.DefaultBasePath())
@@ -1053,6 +2811,20 @@ func TestUser_GetUploadPath(t *testing.T) {
 	})
 	t.Run("Admin", func(t *testing.T) {
 		assert.Equal(t, "", Admin.GetUploadPath())
+	})
+	t.Run("UseBasePath", func(t *testing.T) {
+		user := NewUser()
+		user.UserName = "test"
+		user.UploadPath = "./"
+		user.BasePath = "mybase"
+		assert.Equal(t, "mybase", user.GetUploadPath())
+	})
+	t.Run("UploadPathIncludesBasePath", func(t *testing.T) {
+		user := NewUser()
+		user.UserName = "test"
+		user.UploadPath = "mybase/upload"
+		user.BasePath = "mybase"
+		assert.Equal(t, "mybase/upload", user.GetUploadPath())
 	})
 }
 
@@ -1071,7 +2843,9 @@ func TestUser_SetUploadPath(t *testing.T) {
 		}
 
 		assert.Equal(t, "upload", u.SetUploadPath("upload").GetUploadPath())
-		assert.Equal(t, "base/upload", u.SetBasePath("base").GetUploadPath())
+		assert.Equal(t, "", u.SetUploadPath("./").GetUploadPath())
+		assert.Equal(t, "users/test", u.SetUploadPath("~").GetUploadPath())
+		assert.Equal(t, "base/users/test", u.SetBasePath("base").GetUploadPath())
 		assert.Equal(t, "base", u.SetUploadPath("~").GetUploadPath())
 		assert.Equal(t, "users/test", u.DefaultBasePath())
 		assert.Equal(t, "users/test", u.SetBasePath("~").GetUploadPath())
@@ -1137,6 +2911,26 @@ func TestUser_FullName(t *testing.T) {
 
 		assert.Equal(t, "Jane Doe", u.FullName())
 	})
+	t.Run("NameFromDetails", func(t *testing.T) {
+		u := User{
+			ID:          1234567,
+			UserUID:     "urqdrfb72479n047",
+			UserName:    "mr-happy@cat.com",
+			UserRole:    acl.RoleAdmin.String(),
+			DisplayName: "",
+			SuperAdmin:  false,
+			CanLogin:    true,
+			WebDAV:      true,
+			CanInvite:   false,
+			UserDetails: &UserDetails{
+				GivenName:  "John",
+				FamilyName: "Doe",
+			},
+		}
+
+		assert.Equal(t, "John Doe", u.FullName())
+
+	})
 	t.Run("Windows", func(t *testing.T) {
 		u := User{
 			ID:          1234567,
@@ -1153,5 +2947,1156 @@ func TestUser_FullName(t *testing.T) {
 		assert.Equal(t, "jens.mander", u.Handle())
 		assert.Equal(t, "domain\\jens mander", u.Username())
 		assert.Equal(t, "Jens Mander", u.FullName())
+	})
+}
+
+func TestUser_Settings(t *testing.T) {
+	t.Run("ReturnSettings", func(t *testing.T) {
+		u := User{
+			ID:       1234567,
+			UserUID:  "urqdrfb72479n047",
+			UserName: "test",
+			UserRole: "user",
+			UserSettings: &UserSettings{
+				UserUID:    "",
+				UITheme:    "vanta",
+				UILanguage: "de",
+				MapsStyle:  "street",
+				IndexPath:  "/photos",
+			},
+		}
+
+		assert.Equal(t, "de", u.Settings().UILanguage)
+		assert.Equal(t, "vanta", u.Settings().UITheme)
+	})
+	t.Run("EmptyUid", func(t *testing.T) {
+		u := User{
+			ID:       1234567,
+			UserUID:  "",
+			UserName: "test",
+			UserRole: "user",
+		}
+
+		assert.Equal(t, "", u.Settings().UILanguage)
+		assert.Equal(t, "", u.Settings().UITheme)
+	})
+}
+
+func TestUser_Details(t *testing.T) {
+	t.Run("ReturnDetails", func(t *testing.T) {
+		u := User{
+			ID:       1234567,
+			UserUID:  "urqdrfb72479n047",
+			UserName: "test",
+			UserRole: "user",
+			UserDetails: &UserDetails{
+				GivenName:  "John",
+				FamilyName: "Doe",
+			},
+		}
+
+		assert.Equal(t, "John", u.Details().GivenName)
+		assert.Equal(t, "Doe", u.Details().FamilyName)
+	})
+	t.Run("EmptyUid", func(t *testing.T) {
+		u := User{
+			ID:       1234567,
+			UserUID:  "",
+			UserName: "test",
+			UserRole: "user",
+		}
+
+		assert.Equal(t, "", u.Details().GivenName)
+		assert.Equal(t, "", u.Details().FamilyName)
+	})
+}
+
+func TestUser_Equal(t *testing.T) {
+	assert.True(t, Admin.Equal(&Admin))
+	assert.False(t, Admin.Equal(&Visitor))
+}
+
+func TestUser_RevokeDerivedSessions(t *testing.T) {
+	t.Run("EmptyUid", func(t *testing.T) {
+		u := User{
+			ID:       1234567,
+			UserUID:  "",
+			UserName: "test",
+			UserRole: "user",
+		}
+
+		assert.Equal(t, 0, u.RevokeDerivedSessions([]string{}))
+	})
+	t.Run("Alice", func(t *testing.T) {
+		m := FindLocalUser("alice")
+
+		assert.Equal(t, 0, m.RevokeDerivedSessions([]string{rnd.SessionID("69be27ac5ca305b394046a83f6fda18167ca3d3f2dbe7ac0")}))
+		assert.Equal(t, 1, m.RevokeDerivedSessions([]string{}))
+	})
+}
+
+// revokeTestSession creates a persisted session of the given type for a synthetic user.
+func revokeTestSession(t *testing.T, uid string, provider authn.ProviderType, method authn.MethodType, authID string) *Session {
+	s := NewSession(86400, 0)
+	s.UserUID = uid
+	s.UserName = "revoke-test"
+	s.SetProvider(provider)
+	s.SetMethod(method)
+	if authID != "" {
+		s.SetAuthID(authID, uid)
+	}
+	require.NoError(t, s.Create())
+	return s
+}
+
+// countUserSessions returns the number of sessions stored for the given user uid.
+func countUserSessions(t *testing.T, uid string) int {
+	var sess Sessions
+	require.NoError(t, Db().Where("user_uid = ?", uid).Find(&sess).Error)
+	return len(sess)
+}
+
+// newRevokeTestUser creates a synthetic user with one regular login, a parent app
+// password, a derived child app session, and a client access token.
+func newRevokeTestUser(t *testing.T) *User {
+	uid := rnd.GenerateUID(UserUID)
+	revokeTestSession(t, uid, authn.ProviderLocal, authn.MethodDefault, "")
+	parent := revokeTestSession(t, uid, authn.ProviderApplication, authn.MethodDefault, "")
+	revokeTestSession(t, uid, authn.ProviderApplication, authn.MethodSession, parent.ID)
+	revokeTestSession(t, uid, authn.ProviderClient, authn.MethodOAuth2, "")
+	return &User{ID: 100, UserUID: uid, UserName: "revoke-test", UserRole: "admin", AuthProvider: authn.ProviderLocal.String(), RefID: "usrevoke0001"}
+}
+
+func TestUser_RevokeSessions(t *testing.T) {
+	t.Run("EmptyUid", func(t *testing.T) {
+		u := &User{ID: 1234567, UserUID: "", UserName: "test", UserRole: "admin"}
+		assert.Equal(t, 0, u.RevokeSessions(nil, authn.RevokeAllSessions))
+	})
+	t.Run("LoginSessions", func(t *testing.T) {
+		u := newRevokeTestUser(t)
+		assert.Equal(t, 4, countUserSessions(t, u.UserUID))
+		assert.Equal(t, 1, u.RevokeSessions(nil, authn.RevokeLoginSessions))
+		assert.Equal(t, 3, countUserSessions(t, u.UserUID))
+	})
+	t.Run("DerivedSessions", func(t *testing.T) {
+		u := newRevokeTestUser(t)
+		assert.Equal(t, 2, u.RevokeSessions(nil, authn.RevokeDerivedSessions))
+		assert.Equal(t, 2, countUserSessions(t, u.UserUID))
+	})
+	t.Run("AllSessions", func(t *testing.T) {
+		u := newRevokeTestUser(t)
+		assert.Equal(t, 4, u.RevokeSessions(nil, authn.RevokeAllSessions))
+		assert.Equal(t, 0, countUserSessions(t, u.UserUID))
+	})
+	t.Run("OmitKeepsSession", func(t *testing.T) {
+		u := newRevokeTestUser(t)
+		var login Sessions
+		require.NoError(t, Db().Where("user_uid = ? AND auth_provider = ?", u.UserUID, authn.ProviderLocal.String()).Find(&login).Error)
+		require.Len(t, login, 1)
+		assert.Equal(t, 0, u.RevokeSessions([]string{login[0].ID}, authn.RevokeLoginSessions))
+		assert.Equal(t, 4, countUserSessions(t, u.UserUID))
+	})
+	t.Run("CrossUserIsolation", func(t *testing.T) {
+		// The `auth_method = 'session'` clause must stay scoped to the target user, so
+		// revoking one user's derived sessions must never touch another user's sessions.
+		uidA := rnd.GenerateUID(UserUID)
+		uidB := rnd.GenerateUID(UserUID)
+		parentA := revokeTestSession(t, uidA, authn.ProviderApplication, authn.MethodDefault, "")
+		revokeTestSession(t, uidA, authn.ProviderApplication, authn.MethodSession, parentA.ID)
+		parentB := revokeTestSession(t, uidB, authn.ProviderApplication, authn.MethodDefault, "")
+		derivedB := revokeTestSession(t, uidB, authn.ProviderApplication, authn.MethodSession, parentB.ID)
+
+		uA := &User{ID: 101, UserUID: uidA, UserName: "iso-a", RefID: "usiso0000a01"}
+		assert.Equal(t, 1, uA.RevokeDerivedSessions(nil))
+		assert.Equal(t, 1, countUserSessions(t, uidA)) // parent A kept
+		assert.Equal(t, 2, countUserSessions(t, uidB)) // user B untouched
+
+		sB, err := FindSession(derivedB.ID)
+		require.NoError(t, err)
+		require.NotNil(t, sB)
+	})
+}
+
+func TestUser_DenyLogIn(t *testing.T) {
+	t.Run("Active", func(t *testing.T) {
+		assert.False(t, UserFixtures.Pointer("alice").DenyLogIn())
+	})
+	t.Run("ProviderNone", func(t *testing.T) {
+		u := UserFixtures.Get("bob")
+		u.SetProvider(authn.ProviderNone)
+		assert.True(t, u.DenyLogIn())
+	})
+	t.Run("WebLoginDisabled", func(t *testing.T) {
+		u := UserFixtures.Get("bob")
+		u.CanLogin = false
+		assert.True(t, u.DenyLogIn())
+	})
+	t.Run("Nil", func(t *testing.T) {
+		var u *User
+		assert.True(t, u.DenyLogIn())
+	})
+}
+
+func TestUser_VerifyPassword(t *testing.T) {
+	assert.True(t, Admin.VerifyPassword("photoprism"))
+	assert.False(t, Admin.VerifyPassword("wrong"))
+}
+
+func TestUser_InvalidPasscode(t *testing.T) {
+	m := UserFixtures.Get("jane")
+	passcode := m.Passcode("totp")
+
+	assert.True(t, m.InvalidPasscode("xxxxxx"))
+	assert.False(t, m.InvalidPasscode(passcode.RecoveryCode))
+}
+
+func TestUser_Passcodes(t *testing.T) {
+	t.Run("Alice", func(t *testing.T) {
+		m := UserFixtures.Get("alice")
+		assert.Equal(t, "default", m.AuthMethod)
+
+		passcode, err := m.ActivatePasscode()
+
+		assert.Error(t, err)
+
+		assert.Equal(t, "default", m.AuthMethod)
+
+		code, err := passcode.GenerateCode()
+
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		_, _, errInvalid := m.VerifyPasscode("xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx")
+		assert.Error(t, errInvalid)
+		assert.Equal(t, authn.ErrInvalidPasscode, errInvalid)
+
+		v, _, err := m.VerifyPasscode(code)
+
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		assert.True(t, v)
+
+		_, errActivate := m.ActivatePasscode()
+
+		if errActivate != nil {
+			t.Fatal(errActivate)
+		}
+
+		assert.Equal(t, "2fa", m.AuthMethod)
+
+		_, errDeactivate := m.DeactivatePasscode()
+
+		if errDeactivate != nil {
+			t.Fatal(errDeactivate)
+		}
+
+		assert.Equal(t, "default", m.AuthMethod)
+
+	})
+	t.Run("PassCodeNotSetup", func(t *testing.T) {
+		m := UserFixtures.Get("bob")
+		assert.Equal(t, "default", m.AuthMethod)
+
+		passcode, err := m.ActivatePasscode()
+
+		assert.Error(t, err)
+		assert.Equal(t, authn.ErrPasscodeNotSetUp, err)
+
+		code, err := passcode.GenerateCode()
+
+		assert.Error(t, err)
+
+		v, _, err := m.VerifyPasscode(code)
+		assert.False(t, v)
+		assert.Error(t, err)
+		assert.Equal(t, authn.ErrPasscodeNotSetUp, err)
+
+		assert.Equal(t, "default", m.AuthMethod)
+
+		code2, err := m.DeactivatePasscode()
+
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		assert.Nil(t, code2)
+
+	})
+	t.Run("PassCodeNotSupported", func(t *testing.T) {
+		m := UserFixtures.Get("unauthorized")
+		_, err := m.ActivatePasscode()
+
+		assert.Error(t, err)
+		assert.Equal(t, authn.ErrPasscodeNotSupported, err)
+
+	})
+}
+
+func TestUser_RegenerateTokens(t *testing.T) {
+	t.Run("Visitor", func(t *testing.T) {
+		assert.Nil(t, Visitor.RegenerateTokens())
+	})
+	t.Run("Admin", func(t *testing.T) {
+		preview := Admin.PreviewToken
+
+		// Register the current tokens in the lookup cache.
+		PreviewToken.Set("user-regen-session", preview)
+
+		err := Admin.RegenerateTokens()
+
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		assert.NotEqual(t, preview, Admin.PreviewToken)
+		// The replaced tokens are dropped from the lookup cache.
+		assert.True(t, PreviewToken.MissingValue(preview))
+	})
+}
+
+func TestUser_RegenerateTokens_ReleaseSurvivesReCache(t *testing.T) {
+	// Regression guard for #5733: StringMap.Set does not retract a key from a replaced
+	// value's reverse-lookup list, so RegenerateTokens must explicitly release the old
+	// token. Otherwise re-caching a session (which reassigns the same session key to the
+	// new token without retracting the old value) leaves the old preview/download token
+	// resolvable via HasValue. The prior coverage used a bare map insert that was never
+	// re-cached and could not catch this.
+	sessID := rnd.SessionID("44be27ac5ca305b394046a83f6fda18167ca3d3f2dbe7ac1")
+
+	oldPreview := Admin.PreviewToken
+
+	// Cache a session that currently holds the user's tokens, registering them for lookup.
+	sess := &Session{ID: sessID, PreviewToken: oldPreview}
+	CacheSession(sess, time.Hour)
+	require.False(t, InvalidPreviewToken(oldPreview))
+
+	// Regenerate the user's tokens; the previous values must be released from the cache.
+	require.NoError(t, Admin.RegenerateTokens())
+	require.NotEqual(t, oldPreview, Admin.PreviewToken)
+
+	// Refresh the session to the user's current tokens and re-cache it.
+	sess.SetUser(&Admin)
+	CacheSession(sess, time.Hour)
+
+	// The regenerated tokens resolve; the released old tokens do not resurface.
+	assert.False(t, InvalidPreviewToken(Admin.PreviewToken))
+	assert.True(t, InvalidPreviewToken(oldPreview))
+}
+
+func TestUser_RegenerateTokens_StaleReloadDoesNotResurrect(t *testing.T) {
+	// Regression guard for #5733: an app password survives a password change with its
+	// preview/download token stored in its sessions row. RegenerateTokens must rewrite
+	// that row, otherwise a reload from the database (after the 15-minute cache expiry or
+	// a restart) re-registers the revoked token via CacheSession, resurrecting it.
+	u := &User{
+		UserUID:      rnd.GenerateUID(UserUID),
+		UserName:     "regen-stale-reload",
+		UserRole:     acl.RoleAdmin.String(),
+		CanLogin:     true,
+		PreviewToken: GenerateToken(),
+	}
+	require.NoError(t, u.Save())
+
+	oldPreview := u.PreviewToken
+
+	// Mint and persist an app-password session that inherits the user's tokens.
+	appPw := NewClientSession("regen-stale-client", unix.Day, "*", authn.GrantPassword, u)
+	require.NoError(t, appPw.Save())
+	require.Equal(t, oldPreview, appPw.PreviewToken)
+
+	// Change the account password, which regenerates the user's tokens.
+	require.NoError(t, u.RegenerateTokens())
+	require.NotEqual(t, oldPreview, u.PreviewToken)
+
+	// The app-password session row must now carry the new token, not the revoked one.
+	reloaded := &Session{}
+	require.NoError(t, UnscopedDb().First(reloaded, "id = ?", appPw.ID).Error)
+	assert.Equal(t, u.PreviewToken, reloaded.PreviewToken)
+
+	// Simulate a fresh reload after cache eviction: caching the row must not resurrect
+	// the revoked token, and the current token resolves.
+	DeleteFromSessionCache(appPw.ID)
+	CacheSession(reloaded, time.Hour)
+	assert.True(t, InvalidPreviewToken(oldPreview))
+	assert.False(t, InvalidPreviewToken(u.PreviewToken))
+
+	// Cleanup.
+	require.NoError(t, reloaded.Delete())
+}
+
+func TestUser_RegenerateTokens_FlushesCachedSessions(t *testing.T) {
+	u := NewUser()
+	u.UserName = "regen-flush-cache"
+	u.UserRole = acl.RoleAdmin.String()
+	u.CanLogin = true
+	require.NoError(t, u.Create())
+	t.Cleanup(func() { deleteTestUser(t, u) })
+
+	appPw, err := AddClientSession("regen-flush-client", unix.Day, "*", authn.GrantPassword, u)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = appPw.Delete() })
+
+	cached, err := FindSession(appPw.ID)
+	require.NoError(t, err)
+
+	const webDAVKey = "regen-flush-webdav"
+	CacheWebDAVUser(webDAVKey, u, CurrentAuthCacheGeneration())
+	require.NotNil(t, CachedWebDAVUser(webDAVKey))
+
+	oldPreview := u.PreviewToken
+	require.NoError(t, u.RegenerateTokens())
+
+	// The next lookup reads the stored row instead of the object cached before the change.
+	found, err := FindSession(appPw.ID)
+	require.NoError(t, err)
+	assert.NotSame(t, cached, found)
+	assert.Equal(t, u.PreviewToken, found.PreviewToken)
+	assert.False(t, InvalidPreviewToken(u.PreviewToken))
+	assert.True(t, InvalidPreviewToken(oldPreview))
+	assert.Nil(t, CachedWebDAVUser(webDAVKey))
+
+	// An object loaded before the change is not cached again.
+	CacheSession(cached, time.Hour)
+	assert.True(t, InvalidPreviewToken(oldPreview))
+}
+
+func TestUser_HasShares(t *testing.T) {
+	t.Run("Visitor", func(t *testing.T) {
+		assert.False(t, Visitor.HasShares())
+	})
+	t.Run("Alice", func(t *testing.T) {
+		m := FindLocalUser("alice")
+		assert.True(t, m.HasShares())
+	})
+}
+
+func TestUser_HasShare(t *testing.T) {
+	m := FindLocalUser("alice")
+	m.RefreshShares()
+	assert.True(t, m.HasShare("as6sg6bxpogaaba9"))
+	assert.False(t, m.HasShare("as6sg6bxpogaaba8"))
+	assert.False(t, Visitor.HasShare("as6sg6bxpogaaba8"))
+}
+
+func TestUser_RedeemToken(t *testing.T) {
+	t.Run("Visitor", func(t *testing.T) {
+		assert.Equal(t, 0, Visitor.RedeemToken("1234"))
+	})
+	t.Run("Alice", func(t *testing.T) {
+		m := FindLocalUser("alice")
+		m.RefreshShares()
+		assert.Equal(t, "as6sg6bxpogaaba9", m.UserShares[0].ShareUID)
+		assert.Equal(t, 0, m.RedeemToken("1234"))
+		m.RefreshShares()
+		assert.Equal(t, "as6sg6bxpogaaba9", m.UserShares[0].ShareUID)
+		assert.Equal(t, 1, m.RedeemToken("4jxf3jfn2k"))
+		m.RefreshShares()
+		assert.Equal(t, "as6sg6bxpogaaba7", m.UserShares[0].ShareUID)
+		assert.Equal(t, "as6sg6bxpogaaba9", m.UserShares[1].ShareUID)
+	})
+}
+
+func TestUser_ScopeHelpers(t *testing.T) {
+	t.Run("Default", func(t *testing.T) {
+		u := &User{}
+		assert.Equal(t, "*", u.Scope())
+		assert.False(t, u.HasScope())
+		assert.True(t, u.NoScope())
+	})
+	t.Run("AnyScope", func(t *testing.T) {
+		u := &User{UserScope: list.Any}
+		assert.Equal(t, "*", u.Scope())
+		assert.False(t, u.HasScope())
+		assert.True(t, u.NoScope())
+	})
+	t.Run("RestrictedScope", func(t *testing.T) {
+		u := &User{UserScope: "Photos:View"}
+		assert.Equal(t, "photos:view", u.Scope())
+		assert.True(t, u.HasScope())
+		assert.False(t, u.NoScope())
+	})
+}
+
+func TestUser_UpdateScope(t *testing.T) {
+	user := createScopedTestUser(t)
+
+	err := user.UpdateScope(" photos:view  LOGS:* ")
+	assert.NoError(t, err)
+	assert.Equal(t, "logs:* photos:view", user.UserScope)
+	assert.Equal(t, "logs:* photos:view", user.Scope())
+	assert.True(t, user.HasScope())
+}
+
+func TestUser_UpdateAttr(t *testing.T) {
+	user := createScopedTestUser(t)
+
+	err := user.UpdateAttr(" photos:view logs:false ")
+	assert.NoError(t, err)
+	assert.Equal(t, "logs:false photos:view", user.UserAttr)
+}
+
+func TestUser_SetFormValuesScope(t *testing.T) {
+	formValues := form.User{
+		UserName:  "scopeuser",
+		UserEmail: "scope@example.com",
+		UserRole:  acl.RoleAdmin.String(),
+		UserScope: "photos:view logs:*",
+	}
+
+	user := NewUser()
+	user.SetFormValues(formValues)
+
+	assert.Equal(t, "logs:* photos:view", user.UserScope)
+
+	formValues.UserScope = ""
+	user.UserScope = "*"
+	user.SetFormValues(formValues)
+
+	assert.Equal(t, "*", user.UserScope)
+}
+
+func TestUser_SetValuesFromCliScope(t *testing.T) {
+	user := FindLocalUser("alice")
+	require.NotNil(t, user)
+
+	original := user.UserScope
+	t.Cleanup(func() {
+		user.UserScope = original
+	})
+
+	app := cli.NewApp()
+	set := flag.NewFlagSet("users mod", flag.ContinueOnError)
+	_ = set.String("scope", "", "")
+	require.NoError(t, set.Parse([]string{"--scope", "videos:view"}))
+
+	ctx := cli.NewContext(app, set, nil)
+	require.NoError(t, user.SetValuesFromCli(ctx))
+	assert.Equal(t, "videos:view", user.UserScope)
+}
+
+func TestUser_SetValuesFromCliAuthID(t *testing.T) {
+	const authId = "usersmod-subject-7c2e"
+
+	t.Cleanup(func() {
+		deleteTestUser(t, FindUserByName("usersmod-holder"))
+		deleteTestUser(t, FindUserByName("usersmod-editor"))
+	})
+
+	for _, name := range []string{"usersmod-holder", "usersmod-editor"} {
+		require.NoError(t, AddUser(form.User{UserName: name, UserRole: acl.RoleAdmin.String(),
+			AuthProvider: authn.ProviderOIDC.String(), AuthID: name + "-subject", Password: "usersmod-password"}))
+	}
+
+	holder := func() *User {
+		u := FindUserByName("usersmod-holder")
+		require.NotNil(t, u)
+		return u
+	}
+
+	require.NoError(t, holder().UpdateAuthID(authId, ""))
+
+	modContext := func(args ...string) *cli.Context {
+		set := flag.NewFlagSet("users mod", flag.ContinueOnError)
+		_ = set.String("auth-id", "", "")
+		_ = set.String("email", "", "")
+		require.NoError(t, set.Parse(args))
+		return cli.NewContext(cli.NewApp(), set, nil)
+	}
+
+	editor := FindUserByName("usersmod-editor")
+	require.NotNil(t, editor)
+
+	// A refused change leaves the account that holds the auth ID unchanged.
+	require.Error(t, editor.SetValuesFromCli(modContext("--auth-id", authId, "--email", "usersmod@localhost")))
+	assert.Equal(t, authId, holder().AuthID)
+	assert.Equal(t, authn.ProviderOIDC.String(), holder().AuthProvider)
+
+	// An accepted change takes the auth ID over.
+	editor = FindUserByName("usersmod-editor")
+	require.NotNil(t, editor)
+	require.NoError(t, editor.SetValuesFromCli(modContext("--auth-id", authId)))
+	assert.Equal(t, authId, editor.AuthID)
+	assert.Equal(t, "", holder().AuthID)
+	assert.Equal(t, authn.ProviderNone.String(), holder().AuthProvider)
+}
+
+func TestUser_AuthIDSQLite(t *testing.T) {
+	user := FindLocalUser("alice")
+	require.NotNil(t, user)
+
+	original := user.AuthID
+	t.Cleanup(func() {
+		user.AuthID = original
+		assert.NoError(t, user.Save())
+	})
+
+	expected := "012345678901234567890123456789"
+	user.AuthID = expected
+	assert.NoError(t, user.Save())
+
+	user2 := FindLocalUser("alice")
+	require.NotNil(t, user2)
+
+	assert.Equal(t, expected, user2.AuthID)
+}
+
+func TestUser_LegacyUsername(t *testing.T) {
+	// A name stored before the sanitizer was widened is no longer its own sanitized form, and
+	// the account is unreachable by name, so renaming it is the only repair available.
+	legacy := "le" + string(rune(0x00AD)) + "gacy"
+
+	t.Run("ValidateNormalizes", func(t *testing.T) {
+		m := &User{ID: 12345, UserUID: "us1e3g6gxbeu9ptk", UserName: legacy, DisplayName: "Legacy", UserRole: "admin"}
+
+		require.NoError(t, m.Validate())
+		assert.Equal(t, "legacy", m.UserName)
+	})
+	t.Run("ValidateRefusesANewRecord", func(t *testing.T) {
+		// A record that was never saved is refused, so the caller sees what was rejected.
+		m := &User{UserName: legacy, DisplayName: "Legacy", UserRole: "admin"}
+
+		// Asserted on the message, so a failure on an unrelated field cannot satisfy the case.
+		require.ErrorContains(t, m.Validate(), "username")
+	})
+	t.Run("SetUsernameRenames", func(t *testing.T) {
+		m := &User{ID: 12345, UserUID: "us1e3g6gxbeu9ptk", UserName: legacy, DisplayName: "Legacy", UserRole: "admin"}
+
+		require.NoError(t, m.SetUsername("repaired"))
+		assert.Equal(t, "repaired", m.UserName)
+	})
+	t.Run("SetUsernameStillRefusesAValidName", func(t *testing.T) {
+		m := &User{ID: 12345, UserUID: "us1e3g6gxbeu9ptk", UserName: "settled", DisplayName: "Settled", UserRole: "admin"}
+
+		require.Error(t, m.SetUsername("renamed"))
+		assert.Equal(t, "settled", m.UserName)
+	})
+}
+
+func TestUser_DenyClientAccess(t *testing.T) {
+	t.Run("Nil", func(t *testing.T) {
+		var m *User
+		assert.True(t, m.DenyClientAccess())
+	})
+	t.Run("Active", func(t *testing.T) {
+		m := *UserFixtures.Pointer("alice")
+		assert.False(t, m.DenyClientAccess())
+	})
+	t.Run("WebLoginDisabled", func(t *testing.T) {
+		m := *UserFixtures.Pointer("alice")
+		m.CanLogin = false
+		m.SuperAdmin = false
+		assert.True(t, m.DenyLogIn())
+		assert.False(t, m.DenyClientAccess())
+	})
+	t.Run("ProviderNone", func(t *testing.T) {
+		m := *UserFixtures.Pointer("alice")
+		m.AuthProvider = authn.ProviderNone.String()
+		assert.True(t, m.DenyClientAccess())
+	})
+	t.Run("RoleNone", func(t *testing.T) {
+		m := *UserFixtures.Pointer("bob")
+		m.UserRole = acl.RoleNone.String()
+		assert.True(t, m.DenyClientAccess())
+	})
+	t.Run("Deleted", func(t *testing.T) {
+		assert.True(t, UserFixtures.Pointer("deleted").DenyClientAccess())
+	})
+	t.Run("Visitor", func(t *testing.T) {
+		assert.True(t, Visitor.DenyClientAccess())
+	})
+}
+
+// registerContributorRole registers the contributor role, which only some editions provide, until
+// the test ends.
+func registerContributorRole(t *testing.T) {
+	t.Helper()
+
+	key := acl.RoleContributor.String()
+
+	if _, had := acl.UserRoles[key]; !had {
+		acl.UserRoles[key] = acl.RoleContributor
+		t.Cleanup(func() { delete(acl.UserRoles, key) })
+	}
+}
+
+func TestUser_RequiresBasePath(t *testing.T) {
+	registerContributorRole(t)
+
+	t.Run("Contributor", func(t *testing.T) {
+		assert.True(t, (&User{UserName: "jane", UserRole: acl.RoleContributor.String()}).RequiresBasePath())
+	})
+	t.Run("OtherRoles", func(t *testing.T) {
+		for _, role := range []acl.Role{acl.RoleAdmin, acl.RoleUser, acl.RoleGuest, acl.RoleNone} {
+			assert.False(t, (&User{UserName: "jane", UserRole: role.String()}).RequiresBasePath(), role.String())
+		}
+	})
+	t.Run("UploaderAlias", func(t *testing.T) {
+		if _, had := acl.UserRoles["uploader"]; !had {
+			acl.UserRoles["uploader"] = acl.RoleContributor
+			t.Cleanup(func() { delete(acl.UserRoles, "uploader") })
+		}
+
+		assert.True(t, (&User{UserName: "jane", UserRole: "uploader"}).RequiresBasePath())
+	})
+	t.Run("SuperAdmin", func(t *testing.T) {
+		assert.False(t, (&User{UserName: "jane", UserRole: acl.RoleContributor.String(), SuperAdmin: true}).RequiresBasePath())
+	})
+	t.Run("DefaultBasePath", func(t *testing.T) {
+		u := &User{UserUID: "urqdrfb72479n047", UserName: "jane", UserRole: acl.RoleContributor.String()}
+		assert.Equal(t, "users/jane", u.GetBasePath())
+	})
+}
+
+func TestValidatePasswordLength(t *testing.T) {
+	prev := PasswordLength
+	PasswordLength = PasswordLengthDefault
+	t.Cleanup(func() { PasswordLength = prev })
+
+	t.Run("Success", func(t *testing.T) {
+		assert.NoError(t, ValidatePasswordLength(strings.Repeat("a", PasswordLength)))
+	})
+	t.Run("TooShort", func(t *testing.T) {
+		assert.ErrorContains(t, ValidatePasswordLength(strings.Repeat("a", PasswordLength-1)), "at least")
+	})
+	t.Run("TooLong", func(t *testing.T) {
+		assert.ErrorContains(t, ValidatePasswordLength(strings.Repeat("a", txt.ClipPassword+1)), "less than")
+	})
+}
+
+func TestUser_UsernameASCIIError(t *testing.T) {
+	m := &User{ID: 999903, UserUID: rnd.GenerateUID(UserUID), UserName: "ascii-error"}
+
+	t.Run("Suggestion", func(t *testing.T) {
+		err := m.usernameASCIIError("Zoë")
+		require.ErrorIs(t, err, authn.ErrNotASCII)
+		assert.EqualError(t, err, "username may only contain ASCII characters, e.g. 'zoe'")
+	})
+	t.Run("SuggestionHeld", func(t *testing.T) {
+		assert.EqualError(t, m.usernameASCIIError("alicé"), "username may only contain ASCII characters")
+	})
+	t.Run("SuggestionTooShort", func(t *testing.T) {
+		orig := UsernameLength
+		UsernameLength = 4
+		t.Cleanup(func() { UsernameLength = orig })
+
+		assert.EqualError(t, m.usernameASCIIError("zoë"), "username may only contain ASCII characters")
+	})
+	t.Run("SuggestionWithoutHandle", func(t *testing.T) {
+		assert.EqualError(t, m.usernameASCIIError(".zoë"), "username may only contain ASCII characters")
+	})
+	t.Run("NoSuggestion", func(t *testing.T) {
+		assert.EqualError(t, m.usernameASCIIError("\u0301"), "username may only contain ASCII characters")
+	})
+	t.Run("SuggestionHeldDeleted", func(t *testing.T) {
+		holder := newRenameTestUser(t, "ascii-error-deleted", acl.RoleGuest)
+		require.NoError(t, Db().Delete(holder).Error)
+
+		assert.EqualError(t, m.usernameASCIIError("ascii-error-delëted"), "username may only contain ASCII characters")
+	})
+	t.Run("NameHeld", func(t *testing.T) {
+		newExistingTestUser(t, "ascii-error-josé", acl.RoleGuest)
+
+		err := m.usernameASCIIError("Ascii-Error-José")
+		require.NotErrorIs(t, err, authn.ErrNotASCII)
+		assert.EqualError(t, err, "user 'ascii-error-josé' already exists")
+	})
+}
+
+func TestUser_create(t *testing.T) {
+	t.Run("NotASCII", func(t *testing.T) {
+		m := NewUser()
+		m.UserName = "create-keep-josé"
+		m.UserRole = acl.RoleGuest.String()
+
+		require.ErrorIs(t, m.create(false), authn.ErrNotASCII)
+		assert.Nil(t, FindUserByName("create-keep-josé"))
+	})
+	t.Run("KeepName", func(t *testing.T) {
+		m := NewUser()
+		m.UserName = "create-keep-zoë"
+		m.UserRole = acl.RoleGuest.String()
+
+		require.NoError(t, m.create(true))
+		t.Cleanup(func() { deleteTestUser(t, m) })
+		assert.Equal(t, "create-keep-zoë", storedUser(t, m.UserUID).UserName)
+	})
+	t.Run("NotPortable", func(t *testing.T) {
+		for _, name := range []string{"create-50%off", "__create", "_.create"} {
+			m := NewUser()
+			m.UserName = name
+			m.UserRole = acl.RoleGuest.String()
+
+			assert.EqualError(t, m.create(false), "username '"+name+"' is not supported", name)
+			assert.Nil(t, FindUserByName(name), name)
+		}
+	})
+	t.Run("KeepNotPortable", func(t *testing.T) {
+		m := NewUser()
+		m.UserName = "__create-keep"
+		m.UserRole = acl.RoleGuest.String()
+
+		require.NoError(t, m.create(true))
+		t.Cleanup(func() { deleteTestUser(t, m) })
+		assert.Equal(t, "__create-keep", storedUser(t, m.UserUID).UserName)
+	})
+}
+
+func TestUser_SetUsernameNotPortable(t *testing.T) {
+	t.Run("Refused", func(t *testing.T) {
+		for _, name := range []string{"set-50%off", "__set", "_.set"} {
+			m := NewUser()
+			m.ID = 0
+			assert.EqualError(t, m.SetUsername(name), "username '"+name+"' is not supported", name)
+			assert.Equal(t, "", m.UserName, name)
+		}
+	})
+	t.Run("Accepted", func(t *testing.T) {
+		m := NewUser()
+		require.NoError(t, m.SetUsername("set_portable"))
+		assert.Equal(t, "set_portable", m.UserName)
+	})
+}
+
+func TestFindRestorableUser(t *testing.T) {
+	t.Run("Empty", func(t *testing.T) {
+		m, held := FindRestorableUser("")
+		assert.Nil(t, m)
+		assert.False(t, held)
+	})
+	t.Run("NotFound", func(t *testing.T) {
+		m, held := FindRestorableUser("restorable-missing")
+		assert.Nil(t, m)
+		assert.False(t, held)
+	})
+	t.Run("Active", func(t *testing.T) {
+		m, held := FindRestorableUser("Alice")
+		assert.Nil(t, m)
+		assert.True(t, held)
+	})
+	t.Run("Deleted", func(t *testing.T) {
+		deleted := newRenameTestUser(t, "restorable-deleted", acl.RoleGuest)
+		require.NoError(t, Db().Delete(deleted).Error)
+
+		m, held := FindRestorableUser("Restorable-Deleted")
+		require.NotNil(t, m)
+		assert.True(t, held)
+		assert.Equal(t, deleted.UserUID, m.UserUID)
+	})
+	t.Run("DeletedOtherName", func(t *testing.T) {
+		deleted := newExistingTestUser(t, "restorable-josé", acl.RoleGuest)
+		require.NoError(t, Db().Delete(deleted).Error)
+
+		m, held := FindRestorableUser("restorable-jose")
+		assert.Nil(t, m)
+
+		// MariaDB compares names that differ only by accents as equal.
+		assert.Equal(t, IsDialect(dsn.DriverMySQL), held)
+	})
+	t.Run("DeletedBesideOtherName", func(t *testing.T) {
+		other := newExistingTestUser(t, "restorable-twin-josé", acl.RoleGuest)
+		require.NoError(t, Db().Delete(other).Error)
+		deleted := newRenameTestUser(t, "restorable-twin-jose", acl.RoleGuest)
+		require.NoError(t, Db().Delete(deleted).Error)
+
+		m, held := FindRestorableUser("restorable-twin-jose")
+		require.NotNil(t, m)
+		assert.True(t, held)
+		assert.Equal(t, deleted.UserUID, m.UserUID)
+	})
+	t.Run("DeletedBesideActiveSameName", func(t *testing.T) {
+		deleted := newRenameTestUser(t, "restorable-active-same", acl.RoleGuest)
+		require.NoError(t, Db().Delete(deleted).Error)
+		newRenameTestUser(t, "restorable-active-same", acl.RoleGuest)
+
+		m, held := FindRestorableUser("restorable-active-same")
+		assert.Nil(t, m)
+		assert.True(t, held)
+	})
+	t.Run("DeletedBesideActiveOtherName", func(t *testing.T) {
+		deleted := newRenameTestUser(t, "restorable-active-jose", acl.RoleGuest)
+		require.NoError(t, Db().Delete(deleted).Error)
+		newExistingTestUser(t, "restorable-active-josé", acl.RoleGuest)
+
+		m, held := FindRestorableUser("restorable-active-jose")
+		assert.True(t, held)
+
+		// MariaDB compares names that differ only by accents as equal.
+		if IsDialect(dsn.DriverMySQL) {
+			assert.Nil(t, m)
+		} else {
+			require.NotNil(t, m)
+			assert.Equal(t, deleted.UserUID, m.UserUID)
+		}
+	})
+}
+
+func TestUser_CheckRestore(t *testing.T) {
+	t.Run("NotHeld", func(t *testing.T) {
+		deleted := newRenameTestUser(t, "check-restore-free", acl.RoleGuest)
+		require.NoError(t, Db().Delete(deleted).Error)
+
+		assert.NoError(t, deleted.CheckRestore())
+	})
+	t.Run("HeldSameName", func(t *testing.T) {
+		deleted := newRenameTestUser(t, "check-restore-same", acl.RoleGuest)
+		require.NoError(t, Db().Delete(deleted).Error)
+		newRenameTestUser(t, "check-restore-same", acl.RoleGuest)
+
+		assert.EqualError(t, deleted.CheckRestore(), "user 'check-restore-same' already exists")
+	})
+	t.Run("HeldDeleted", func(t *testing.T) {
+		deleted := newRenameTestUser(t, "check-restore-twice", acl.RoleGuest)
+		require.NoError(t, Db().Delete(deleted).Error)
+		other := newRenameTestUser(t, "check-restore-twice", acl.RoleGuest)
+		require.NoError(t, Db().Delete(other).Error)
+
+		assert.NoError(t, deleted.CheckRestore())
+	})
+	t.Run("HeldNormalized", func(t *testing.T) {
+		deleted := newExistingTestUser(t, "Check-Restore-Upper", acl.RoleGuest)
+		require.NoError(t, Db().Delete(deleted).Error)
+		newRenameTestUser(t, "check-restore-upper", acl.RoleGuest)
+
+		assert.EqualError(t, deleted.CheckRestore(), "user 'Check-Restore-Upper' already exists")
+	})
+	t.Run("SanitizedEmpty", func(t *testing.T) {
+		deleted := newExistingTestUser(t, "***", acl.RoleGuest)
+		require.NoError(t, Db().Delete(deleted).Error)
+
+		assert.NoError(t, deleted.CheckRestore())
+	})
+	t.Run("HeldOtherName", func(t *testing.T) {
+		deleted := newRenameTestUser(t, "check-restore-jose", acl.RoleGuest)
+		require.NoError(t, Db().Delete(deleted).Error)
+		newExistingTestUser(t, "check-restore-josé", acl.RoleGuest)
+
+		// MariaDB compares names that differ only by accents as equal.
+		if IsDialect(dsn.DriverMySQL) {
+			assert.Error(t, deleted.CheckRestore())
+		} else {
+			assert.NoError(t, deleted.CheckRestore())
+		}
+	})
+}
+
+func TestFindUserByExactName(t *testing.T) {
+	t.Run("Empty", func(t *testing.T) {
+		assert.Nil(t, FindUserByExactName(""))
+	})
+	t.Run("Active", func(t *testing.T) {
+		m := FindUserByExactName("Alice")
+		require.NotNil(t, m)
+		assert.Equal(t, "alice", m.UserName)
+	})
+	t.Run("ActiveBesideDeletedLowerID", func(t *testing.T) {
+		deleted := newRenameTestUser(t, "exact-entity-dup", acl.RoleGuest)
+		require.NoError(t, Db().Delete(deleted).Error)
+		active := newRenameTestUser(t, "exact-entity-dup", acl.RoleGuest)
+
+		m := FindUserByExactName("exact-entity-dup")
+		require.NotNil(t, m)
+		assert.Equal(t, active.UserUID, m.UserUID)
+	})
+	t.Run("DeletedOnly", func(t *testing.T) {
+		deleted := newRenameTestUser(t, "exact-entity-deleted", acl.RoleGuest)
+		require.NoError(t, Db().Delete(deleted).Error)
+
+		m := FindUserByExactName("exact-entity-deleted")
+		require.NotNil(t, m)
+		assert.Equal(t, deleted.UserUID, m.UserUID)
+	})
+	t.Run("OtherName", func(t *testing.T) {
+		newExistingTestUser(t, "exact-entity-josé", acl.RoleGuest)
+
+		assert.Nil(t, FindUserByExactName("exact-entity-jose"))
+	})
+	t.Run("OtherNameBeside", func(t *testing.T) {
+		newExistingTestUser(t, "exact-entity-twin-josé", acl.RoleGuest)
+		m := newRenameTestUser(t, "exact-entity-twin-jose", acl.RoleGuest)
+
+		found := FindUserByExactName("exact-entity-twin-jose")
+		require.NotNil(t, found)
+		assert.Equal(t, m.UserUID, found.UserUID)
+	})
+	t.Run("DeletedTwice", func(t *testing.T) {
+		first := newRenameTestUser(t, "exact-entity-twice", acl.RoleGuest)
+		require.NoError(t, Db().Delete(first).Error)
+		second := newRenameTestUser(t, "exact-entity-twice", acl.RoleGuest)
+		require.NoError(t, Db().Delete(second).Error)
+
+		m := FindUserByExactName("exact-entity-twice")
+		require.NotNil(t, m)
+		assert.Equal(t, first.UserUID, m.UserUID)
+	})
+	t.Run("IdenticalBeforeLegacy", func(t *testing.T) {
+		newExistingTestUser(t, "Exact-Entity-Rank", acl.RoleGuest)
+		m := newExistingTestUser(t, "exact-entity-rank", acl.RoleGuest)
+
+		found := FindUserByExactName("exact-entity-rank")
+		require.NotNil(t, found)
+		assert.Equal(t, m.UserUID, found.UserUID)
+	})
+	t.Run("LegacyName", func(t *testing.T) {
+		m := newExistingTestUser(t, "Exact-Entity-Legacy", acl.RoleGuest)
+
+		// Only MariaDB finds the stored name by its sanitized form.
+		if found := FindUserByExactName("exact-entity-legacy"); IsDialect(dsn.DriverMySQL) {
+			require.NotNil(t, found)
+			assert.Equal(t, m.UserUID, found.UserUID)
+		} else {
+			assert.Nil(t, found)
+		}
+	})
+}
+
+func TestUser_ExactUsernameHolder(t *testing.T) {
+	m := &User{ID: 999904, UserUID: rnd.GenerateUID(UserUID), UserName: "exact-holder"}
+
+	t.Run("Active", func(t *testing.T) {
+		assert.True(t, m.exactUsernameHolder("alice"))
+	})
+	t.Run("Deleted", func(t *testing.T) {
+		holder := newRenameTestUser(t, "exact-holder-deleted", acl.RoleGuest)
+		require.NoError(t, Db().Delete(holder).Error)
+		assert.True(t, m.exactUsernameHolder("exact-holder-deleted"))
+	})
+	t.Run("OtherName", func(t *testing.T) {
+		newExistingTestUser(t, "exact-holder-josé", acl.RoleGuest)
+		assert.False(t, m.exactUsernameHolder("exact-holder-jose"))
+	})
+	t.Run("Own", func(t *testing.T) {
+		own := newRenameTestUser(t, "exact-holder-own", acl.RoleGuest)
+		assert.False(t, own.exactUsernameHolder("exact-holder-own"))
+	})
+	t.Run("None", func(t *testing.T) {
+		assert.False(t, m.exactUsernameHolder("exact-holder-none"))
+	})
+}
+
+func TestCountNonASCIIUsernames(t *testing.T) {
+	base := CountNonASCIIUsernames()
+
+	newExistingTestUser(t, "count-josé", acl.RoleGuest)
+	assert.Equal(t, base+1, CountNonASCIIUsernames())
+
+	deleted := newExistingTestUser(t, "count-zoë", acl.RoleGuest)
+	require.NoError(t, Db().Delete(deleted).Error)
+	assert.Equal(t, base+1, CountNonASCIIUsernames())
+
+	newRenameTestUser(t, "count-ascii", acl.RoleGuest)
+	assert.Equal(t, base+1, CountNonASCIIUsernames())
+}
+
+func TestUser_SaveRelated(t *testing.T) {
+	t.Run("Success", func(t *testing.T) {
+		m := &User{UserUID: rnd.GenerateUID(UserUID)}
+		m.Settings().UILanguage = "de"
+		m.Details().GivenName = "Jane"
+		m.SaveRelated()
+		t.Cleanup(func() {
+			_ = UnscopedDb().Delete(m.UserSettings).Error
+			_ = UnscopedDb().Delete(m.UserDetails).Error
+		})
+		assert.Equal(t, int64(1), countUserSettings(t, m.UserUID))
+		assert.Equal(t, int64(1), countUserDetails(t, m.UserUID))
+
+		settings, details := UserSettings{}, UserDetails{}
+		require.NoError(t, UnscopedDb().Where("user_uid = ?", m.UserUID).First(&settings).Error)
+		require.NoError(t, UnscopedDb().Where("user_uid = ?", m.UserUID).First(&details).Error)
+		assert.Equal(t, "de", settings.UILanguage)
+		assert.Equal(t, "Jane", details.GivenName)
+	})
+	t.Run("NoUid", func(t *testing.T) {
+		settings, details := countUserSettings(t, ""), countUserDetails(t, "")
+		m := &User{UserName: "related-without-uid"}
+		m.Settings().UILanguage = "de"
+		m.Details().GivenName = "Jane"
+		m.SaveRelated()
+		assert.Equal(t, settings, countUserSettings(t, ""))
+		assert.Equal(t, details, countUserDetails(t, ""))
+	})
+}
+
+// failUserDetailsWrites makes every write to the user details table fail until the test ends.
+func failUserDetailsWrites(t *testing.T) {
+	t.Helper()
+
+	name := "test:fail_" + strings.ReplaceAll(t.Name(), "/", "_")
+	fail := func(db *gorm.DB) {
+		if db.Statement.Table == (UserDetails{}).TableName() {
+			_ = db.AddError(errors.New("details write failed"))
+		}
+	}
+
+	require.NoError(t, Db().Callback().Create().Before("gorm:create").Register(name, fail))
+	require.NoError(t, Db().Callback().Update().Before("gorm:update").Register(name, fail))
+	t.Cleanup(func() {
+		_ = Db().Callback().Create().Remove(name)
+		_ = Db().Callback().Update().Remove(name)
+	})
+}
+
+func TestUser_SaveForm_RelatedError(t *testing.T) {
+	m := FirstOrCreateUser(&User{
+		UserName:    "saveformrelated",
+		DisplayName: "Save Form Related",
+		UserRole:    acl.RoleGuest.String(),
+	})
+	require.NotNil(t, m)
+	t.Cleanup(func() { deleteTestUser(t, m) })
+
+	t.Run("Success", func(t *testing.T) {
+		frm, err := m.Form()
+		require.NoError(t, err)
+		frm.UserDetails.UserLocation = "Berlin"
+		require.NoError(t, m.SaveForm(frm, UserFixtures.Pointer("alice"), true, false))
+		assert.Equal(t, "Berlin", FindUserByUID(m.UserUID).Details().UserLocation)
+	})
+	t.Run("DetailsFailed", func(t *testing.T) {
+		failUserDetailsWrites(t)
+
+		frm, err := m.Form()
+		require.NoError(t, err)
+		frm.UserDetails.UserLocation = "Hamburg"
+		frm.UserRole = acl.RoleAdmin.String()
+		frm.CanLogin = !m.CanLogin
+		assert.Error(t, m.SaveForm(frm, UserFixtures.Pointer("alice"), true, false))
+
+		stored := FindUserByUID(m.UserUID)
+		require.NotNil(t, stored)
+		assert.Equal(t, acl.RoleGuest.String(), stored.UserRole)
+		assert.Equal(t, !frm.CanLogin, stored.CanLogin)
+		assert.Equal(t, "Berlin", stored.Details().UserLocation)
+	})
+	t.Run("SaveIgnoresDetails", func(t *testing.T) {
+		failUserDetailsWrites(t)
+
+		assert.NoError(t, m.Save())
+	})
+}
+
+func TestUser_saveRelated(t *testing.T) {
+	m := FirstOrCreateUser(&User{
+		UserName:    "saverelatedhelper",
+		DisplayName: "Save Related Helper",
+		UserRole:    acl.RoleGuest.String(),
+	})
+	require.NotNil(t, m)
+	t.Cleanup(func() { deleteTestUser(t, m) })
+
+	t.Run("Success", func(t *testing.T) {
+		m.Details().UserLocation = "Paris"
+		require.NoError(t, m.saveRelated())
+		assert.Equal(t, "Paris", FindUserByUID(m.UserUID).Details().UserLocation)
+	})
+	t.Run("DetailsFailed", func(t *testing.T) {
+		failUserDetailsWrites(t)
+
+		m.Details().UserLocation = "Rome"
+		assert.Error(t, m.saveRelated())
+		assert.Same(t, m, m.SaveRelated())
 	})
 }

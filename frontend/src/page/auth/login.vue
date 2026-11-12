@@ -1,118 +1,307 @@
 <template>
-  <v-container id="auth-login" fluid fill-height class="auth-login wallpaper background-welcome pa-4" :style="wallpaper()">
-    <v-layout id="auth-layout" class="auth-layout">
-      <v-flex xs12 sm9 md6 lg4 xl3 xxl2>
-        <v-form ref="form" dense class="auth-login-form" accept-charset="UTF-8" @submit.prevent="login">
-          <v-card id="auth-login-box" class="elevation-12 auth-login-box blur-7">
-            <v-card-text class="pa-4">
-              <p-auth-header></p-auth-header>
-              <v-spacer></v-spacer>
-              <v-layout wrap align-top>
-                <v-flex xs12 class="px-2 py-1">
-                  <v-text-field
-                      id="auth-username"
-                      v-model="username"
-                      hide-details required solo flat light autofocus
-                      type="text"
-                      :disabled="loading"
-                      name="username"
-                      autocorrect="off"
-                      autocapitalize="none"
-                      :label="$gettext('Name')"
-                      background-color="grey lighten-5"
-                      class="input-username text-selectable"
-                      color="primary"
-                      prepend-inner-icon="person"
-                      @keyup.enter.native="login"
-                  ></v-text-field>
-                </v-flex>
-                <v-flex xs12 class="pa-2">
-                  <v-text-field
-                      id="auth-password"
-                      v-model="password"
-                      hide-details required solo flat light
-                      :type="showPassword ? 'text' : 'password'"
-                      :disabled="loading"
-                      name="password"
-                      autocorrect="off"
-                      autocapitalize="none"
-                      :label="$gettext('Password')"
-                      background-color="grey lighten-5"
-                      class="input-password text-selectable"
-                      :append-icon="showPassword ? 'visibility' : 'visibility_off'"
-                      prepend-inner-icon="lock"
-                      color="primary"
-                      @click:append="showPassword = !showPassword"
-                      @keyup.enter.native="login"
-                  ></v-text-field>
-                </v-flex>
-                <v-flex xs12 class="px-2 py-1 auth-actions">
-                  <div class="action-buttons auth-buttons text-xs-center">
-                    <v-btn v-if="registerUri" :color="colors.secondary" outline :block="$vuetify.breakpoint.xsOnly"
-                           :style="`color: ${colors.link}!important`" class="action-register ra-6 px-3 py-2 opacity-80"
-                           @click.stop.prevent="register">
-                      <translate>Create Account</translate>
-                    </v-btn>
-                    <v-btn :color="colors.primary" depressed :disabled="loginDisabled"
-                           :block="$vuetify.breakpoint.xsOnly"
-                           class="white--text action-confirm ra-6 py-2 px-3" @click.stop.prevent="login">
-                      <translate>Sign in</translate>
-                      <v-icon v-if="rtl" left dark>navigate_before</v-icon>
-                      <v-icon v-else right dark>navigate_next</v-icon>
-                    </v-btn>
-                  </div>
-                  <div v-if="passwordResetUri" class="auth-links text-xs-center opacity-80">
-                    <a :href="passwordResetUri" class="text-link link--text">
-                      <translate>Forgot password?</translate>
-                    </a>
-                  </div>
-                </v-flex>
-              </v-layout>
-            </v-card-text>
-          </v-card>
-        </v-form>
-      </v-flex>
-    </v-layout>
-    <p-auth-footer :colors="colors"></p-auth-footer>
+  <v-container id="auth-login" theme="login" fluid fill-height class="auth-login wallpaper background-welcome pa-6" :style="wallpaper()">
+    <v-theme-provider theme="login">
+      <div class="auth-language">
+        <v-select
+          v-model="settings.ui.language"
+          prepend-inner-icon="mdi-web"
+          :items="options.Languages()"
+          item-title="text"
+          item-value="value"
+          rounded="pill"
+          density="compact"
+          :menu-props="{ maxHeight: 346 }"
+          flat
+          hide-details
+          variant="outlined"
+          class="input-language"
+          @update:model-value="onChangeLanguage"
+        ></v-select>
+      </div>
+      <v-row id="auth-layout" class="auth-layout">
+        <v-col cols="12" sm="9" md="6" lg="5" xl="3">
+          <v-form ref="form" class="auth-login-form" accept-charset="UTF-8" @submit.prevent="onLogin">
+            <v-card id="auth-login-box" class="elevation-12 auth-login-box pa-1 blur-7">
+              <v-card-text>
+                <p-auth-header></p-auth-header>
+                <v-spacer></v-spacer>
+                <v-row class="align-start" density="compact">
+                  <template v-if="enterCode">
+                    <v-col cols="12" class="text-body-2 text-center pb-1">
+                      {{ $gettext(`Enter the code generated by your authenticator app:`) }}
+                    </v-col>
+                    <v-col cols="12" class="pb-0 d-flex justify-center">
+                      <v-text-field
+                        v-if="useRecoveryCode"
+                        id="one-time-code"
+                        ref="code"
+                        v-model="code"
+                        :disabled="loading"
+                        :placeholder="$gettext('Recovery Code')"
+                        :autofocus="enterCode && useRecoveryCode"
+                        name="code"
+                        variant="solo"
+                        density="comfortable"
+                        type="text"
+                        inputmode="text"
+                        hide-details
+                        autocorrect="off"
+                        autocapitalize="none"
+                        autocomplete="none"
+                        prepend-inner-icon="mdi-shield-check"
+                        class="input-code text-selectable ma-4"
+                        @keyup.enter="onLogin"
+                      ></v-text-field>
+                      <v-otp-input
+                        v-else
+                        ref="otp"
+                        v-model="code"
+                        :disabled="loading"
+                        :length="6"
+                        :max-width="320"
+                        :label="$gettext('Verification Code')"
+                        :autofocus="enterCode && !useRecoveryCode"
+                        variant="solo-filled"
+                        base-color="surface"
+                        name="one-time-code"
+                        type="number"
+                        class="input-code"
+                        @keyup.enter="onLogin"
+                      >
+                      </v-otp-input>
+                    </v-col>
+                  </template>
+                  <template v-else>
+                    <v-col cols="12" class="pb-1">
+                      <v-text-field
+                        id="auth-username"
+                        v-model="username"
+                        :disabled="loading || enterCode"
+                        :placeholder="$gettext('Name')"
+                        :autofocus="!enterCode"
+                        name="username"
+                        variant="solo"
+                        density="comfortable"
+                        type="text"
+                        hide-details
+                        autocorrect="off"
+                        autocapitalize="none"
+                        :autocomplete="usernameAutocomplete"
+                        class="input-username text-selectable"
+                        prepend-inner-icon="mdi-account"
+                        @keyup.enter="onLogin"
+                      ></v-text-field>
+                    </v-col>
+                    <v-col cols="12" class="pb-1">
+                      <v-text-field
+                        id="auth-password"
+                        v-model="password"
+                        :disabled="loading"
+                        :type="showPassword ? 'text' : 'password'"
+                        :placeholder="$gettext('Password')"
+                        name="password"
+                        variant="solo"
+                        density="comfortable"
+                        hide-details
+                        autocorrect="off"
+                        autocapitalize="none"
+                        :autocomplete="passwordAutocomplete"
+                        class="input-password text-selectable"
+                        prepend-inner-icon="mdi-lock"
+                        @keyup.enter="onLogin"
+                      >
+                        <template #append-inner>
+                          <p-input-action
+                            :icon="showPassword ? 'mdi-eye-off' : 'mdi-eye'"
+                            :label="showPassword ? $gettext('Hide Password') : $gettext('Show Password')"
+                            @click="showPassword = !showPassword"
+                          ></p-input-action>
+                        </template>
+                      </v-text-field>
+                    </v-col>
+                  </template>
+                  <v-col cols="12" class="auth-actions">
+                    <div class="action-buttons auth-buttons pb-2 mb-0 d-flex ga-3 align-center justify-center">
+                      <v-btn
+                        v-if="enterCode"
+                        :block="$vuetify.display.xs"
+                        color="highlight"
+                        variant="outlined"
+                        class="action-cancel opacity-80"
+                        @click.stop.prevent="onCancel"
+                      >
+                        {{ $gettext(`Cancel`) }}
+                      </v-btn>
+                      <v-btn
+                        v-else-if="registerUri"
+                        :block="$vuetify.display.xs"
+                        color="highlight"
+                        variant="outlined"
+                        class="action-register opacity-80"
+                        @click.stop.prevent="onRegister"
+                      >
+                        {{ $gettext(`Create Account`) }}
+                      </v-btn>
+                      <v-btn
+                        :disabled="loginDisabled"
+                        :block="$vuetify.display.xs || !(registerUri || enterCode)"
+                        color="highlight"
+                        variant="flat"
+                        class="action-confirm"
+                        @click.stop.prevent="onLogin"
+                      >
+                        {{ $gettext(`Sign in`) }}
+                        <v-icon :icon="$config.isRtl() ? 'mdi-chevron-left' : 'mdi-chevron-right'" end></v-icon>
+                      </v-btn>
+                    </div>
+                    <div class="auth-actions__options">
+                      <v-checkbox
+                        v-model="staySignedIn"
+                        :disabled="loading"
+                        color="highlight"
+                        hide-details
+                        class="ma-0 pa-0 input-stay-signed-in text-secondary"
+                        :label="$gettext('Stay signed in on this device')"
+                      ></v-checkbox>
+                    </div>
+                    <div
+                      v-if="enterCode"
+                      class="auth-links text-center opacity-90"
+                      :class="{ clickable: !useRecoveryCode }"
+                      @click.stop.prevent="onUseRecoveryCode"
+                    >
+                      {{ $gettext(`Can't access your authenticator app or device?`) }}
+                      {{ $gettext(`Use your recovery code or contact an administrator for help.`) }}
+                    </div>
+                    <div v-else-if="passwordResetUri" class="auth-links text-center opacity-90">
+                      <a :href="passwordResetUri" class="text-secondary">
+                        {{ $gettext(`Forgot password?`) }}
+                      </a>
+                    </div>
+                  </v-col>
+                  <template v-if="config.ext.oidc.enabled && !enterCode">
+                    <v-col cols="12" class="oidc-actions">
+                      <v-divider />
+                      <div class="text-center oidc-buttons mt-6">
+                        <v-btn :disabled="loading" color="highlight" variant="flat" block class="action-oidc-login" @click.stop.prevent="onOidcLogin">
+                          <img alt="" class="oidc-icon v-icon--start mx-1" :src="config.ext.oidc.icon" />
+                          <span>{{ $gettext(`Continue with %{s}`, { s: config.ext.oidc.provider }) }}</span>
+                        </v-btn>
+                      </div>
+                    </v-col>
+                  </template>
+                </v-row>
+              </v-card-text>
+            </v-card>
+          </v-form>
+        </v-col>
+      </v-row>
+      <p-auth-footer></p-auth-footer>
+    </v-theme-provider>
   </v-container>
 </template>
 
 <script>
+import PAuthHeader from "component/auth/header.vue";
+import PAuthFooter from "component/auth/footer.vue";
+import { getAppStorage } from "common/storage";
+import Settings from "model/settings";
+import * as options from "options/options";
 
 export default {
   name: "PPageLogin",
+  components: {
+    PAuthHeader,
+    PAuthFooter,
+  },
   data() {
     return {
-      colors: {
-        accent: "#05dde1",
-        primary: "#00a6a9",
-        secondary: "#505050",
-        link: "#c8e3e7",
-      },
       loading: false,
-      showPassword: false,
       username: "",
       password: "",
+      showPassword: false,
+      staySignedIn: true,
+      useRecoveryCode: false,
+      code: "",
+      enterCode: false,
       sponsor: this.$config.isSponsor(),
       config: this.$config.values,
       siteDescription: this.$config.getSiteDescription(),
-      nextUrl: this.$route.params.nextUrl ? this.$route.params.nextUrl : "/",
       wallpaperUri: this.$config.values.wallpaperUri,
       registerUri: this.$config.values.registerUri,
       passwordResetUri: this.$config.values.passwordResetUri,
-      rtl: this.$rtl,
+      settings: new Settings(this.$config.getSettings()),
+      options,
+      rtl: this.$config.isRtl(),
     };
   },
   computed: {
+    autocompleteSection() {
+      const storageNamespace = this.config?.storageNamespace;
+
+      if (typeof storageNamespace === "string" && storageNamespace.trim() !== "") {
+        const section = storageNamespace
+          .toLowerCase()
+          .replace(/[^a-z0-9-]/g, "-")
+          .replace(/-+/g, "-")
+          .replace(/^-+|-+$/g, "");
+
+        if (section !== "") {
+          return `section-${section}`;
+        }
+      }
+
+      return "section-photoprism";
+    },
+    usernameAutocomplete() {
+      return `${this.autocompleteSection} username`;
+    },
+    passwordAutocomplete() {
+      return `${this.autocompleteSection} current-password`;
+    },
     loginDisabled() {
-      return this.loading || this.username.trim() === "" || this.password.trim() === "";
-    }
+      if (this.loading) {
+        return true;
+      } else if (this.enterCode) {
+        const len = this.code.trim().length;
+        return len !== 6 && len !== 12;
+      }
+
+      return this.username.trim() === "" || this.password.trim() === "";
+    },
   },
   created() {
-    this.$scrollbar.hide(this.$isMobile);
+    this.staySignedIn = this.currentStaySignedInState();
   },
-  destroyed() {
-    this.$scrollbar.show();
+  mounted() {
+    this.$view.enter(this, this.$refs?.form, 'input[value=""], button.action-confirm');
+
+    // Surface an OIDC sign-in failure (e.g. "no access to this instance")
+    // stashed by the auth bridge before its full-page redirect. In mounted() so
+    // the notification component has already subscribed (its created() runs
+    // before any mounted()).
+    const messageId = getAppStorage().getItem("session.messageId");
+    const authError = getAppStorage().getItem("session.error");
+    if (messageId || authError) {
+      let messageParams = [];
+      const rawParams = getAppStorage().getItem("session.messageParams");
+      if (rawParams) {
+        try {
+          messageParams = JSON.parse(rawParams);
+        } catch {
+          messageParams = [];
+        }
+      }
+      getAppStorage().removeItem("session.error");
+      getAppStorage().removeItem("session.messageId");
+      getAppStorage().removeItem("session.messageParams");
+      // Render in the current UI locale via the message key (notify.vue applies
+      // Tp); the server-rendered string stays as the fallback.
+      this.$notify.error(authError, messageId, messageParams);
+    }
+  },
+  unmounted() {
+    this.$view.leave(this);
   },
   methods: {
     wallpaper() {
@@ -123,34 +312,105 @@ export default {
       return "";
     },
     load() {
-      this.$notify.blockUI();
-
-      let route = this.$router.resolve({
-        name: this.$session.getHome(),
+      let homeRoute = this.$router.resolve({
+        name: this.$session.getDefaultRoute(),
       });
 
-      setTimeout(() => {
-        window.location = route.href;
-      }, 100);
+      this.$session.followLoginRedirectUrl(homeRoute.href);
     },
-    register() {
-      window.location = this.registerUri;
+    reset() {
+      this.username = "";
+      this.password = "";
+      this.showPassword = false;
+      this.useRecoveryCode = false;
+      this.code = "";
+      this.enterCode = false;
     },
-    login() {
+    onChangeLanguage() {
+      // Return if no language is set or the language has not been changed.
+      if (!this.settings?.ui?.language || !this.settings.changed("ui", "language")) {
+        return;
+      }
+
+      // Reload login page with locale query parameter to change UI language.
+      const route = { name: "login", query: { locale: this.settings.ui.language } };
+      window.window.location = this.$router.resolve(route).href;
+    },
+    onCancel() {
+      if (this.loading) {
+        return;
+      }
+      this.reset();
+    },
+    onRegister() {
+      this.$view.redirect(this.registerUri);
+    },
+    onUseRecoveryCode() {
+      if (!this.useRecoveryCode) {
+        this.useRecoveryCode = true;
+        this.$nextTick(() => {
+          this.$view.focus(this.$refs?.code);
+        });
+      }
+    },
+    currentStaySignedInState() {
+      if (typeof this.$session?.usesSessionStorage === "function") {
+        return !this.$session.usesSessionStorage();
+      }
+
+      return getAppStorage().getItem("session") !== "true";
+    },
+    applySessionPersistence() {
+      if (this.staySignedIn) {
+        this.$session.useLocalStorage();
+      } else {
+        this.$session.useSessionStorage();
+      }
+    },
+    onLogin() {
       const username = this.username.trim();
       const password = this.password.trim();
+      const code = this.code.trim();
 
       if (username === "" || password === "") {
         return;
       }
 
+      this.applySessionPersistence();
       this.loading = true;
-      this.$session.login(username, password).then(
-        () => {
+      this.$session
+        .login(username, password, code)
+        .then(() => {
           this.load();
-        }
-      ).catch(() => this.loading = false);
+        })
+        .catch((e) => {
+          if (e.response?.data?.code === 32) {
+            this.enterCode = true;
+            this.$nextTick(() => {
+              this.$view.focus(this.$refs?.otp);
+            });
+          }
+          this.loading = false;
+        });
     },
-  }
+    onOidcLogin() {
+      if (this.loading) {
+        return;
+      }
+
+      if (this.config.ext?.oidc?.loginUri) {
+        this.applySessionPersistence();
+        this.loading = true;
+        // Arm the per-tab OIDC attempt guard (not the post-login redirect loop
+        // guard): a failed or abandoned roundtrip then falls back to the form via
+        // consumeOidcAttempt instead of auto-redirecting again, while a stored deep
+        // link or Portal return_to survives for the authenticated return trip.
+        this.$session.markOidcAttempt();
+        this.$session.followRedirect(this.config.ext.oidc.loginUri);
+      } else {
+        this.$notify.warn(this.$gettext("Missing or invalid configuration"));
+      }
+    },
+  },
 };
 </script>

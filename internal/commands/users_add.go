@@ -1,24 +1,26 @@
 package commands
 
 import (
-	"errors"
 	"fmt"
+	"strings"
 
 	"github.com/manifoldco/promptui"
-	"github.com/urfave/cli"
+	"github.com/urfave/cli/v2"
 
 	"github.com/photoprism/photoprism/internal/config"
 	"github.com/photoprism/photoprism/internal/entity"
 	"github.com/photoprism/photoprism/internal/form"
+	"github.com/photoprism/photoprism/pkg/authn"
 	"github.com/photoprism/photoprism/pkg/clean"
+	"github.com/photoprism/photoprism/pkg/txt"
 )
 
 // UsersAddCommand configures the command name, flags, and action.
-var UsersAddCommand = cli.Command{
+var UsersAddCommand = &cli.Command{
 	Name:      "add",
-	Usage:     "Adds a new user account",
+	Usage:     "Creates a new user account",
 	ArgsUsage: "[username]",
-	Flags:     UserFlags,
+	Flags:     append(UserFlags, UserRestoreFlag()),
 	Action:    usersAddAction,
 }
 
@@ -26,6 +28,12 @@ var UsersAddCommand = cli.Command{
 func usersAddAction(ctx *cli.Context) error {
 	return CallWithDependencies(ctx, func(conf *config.Config) error {
 		conf.MigrateDb(false, nil)
+
+		// Reject flags placed after the username; the stdlib flag parser
+		// would silently drop them and create the account with the defaults.
+		if err := RejectTrailingFlags(ctx); err != nil {
+			return err
+		}
 
 		frm := form.NewUserFromCli(ctx)
 
@@ -47,24 +55,19 @@ func usersAddAction(ctx *cli.Context) error {
 				return err
 			}
 
-			frm.UserName = clean.Username(res)
+			frm.UserName = strings.TrimSpace(res)
 		}
 
 		// Check if account exists but is deleted.
 		if frm.UserName == "" {
-			return fmt.Errorf("username is required")
-		} else if m := entity.FindUserByName(frm.UserName); m != nil {
-			if !m.Deleted() {
-				return fmt.Errorf("user already exists")
-			}
-
-			prompt := promptui.Prompt{
-				Label:     fmt.Sprintf("Restore user %s?", m.String()),
-				IsConfirm: true,
-			}
-
-			if _, err := prompt.Run(); err != nil {
-				return fmt.Errorf("user already exists")
+			return authn.ErrUsernameRequired
+		} else if m, held := entity.FindRestorableUser(frm.UserName); held && m == nil {
+			return authn.ErrUserAlreadyExists
+		} else if m != nil {
+			if restore, err := ConfirmRestore(ctx.Bool("restore"), fmt.Sprintf("Restore user %s", m.String()), "--restore"); err != nil {
+				return err
+			} else if !restore {
+				return authn.ErrUserAlreadyExists
 			}
 
 			if err := m.RestoreFromCli(ctx, frm.Password); err != nil {
@@ -72,11 +75,13 @@ func usersAddAction(ctx *cli.Context) error {
 			}
 
 			log.Infof("user %s has been restored", m.String())
+			AuditSharedEmail(m, true)
 
 			return nil
 		}
 
-		if interactive && frm.UserEmail == "" {
+		// Enter account email.
+		if interactive && frm.UserEmail == "" && frm.Provider().SupportsPasswordAuthentication() {
 			prompt := promptui.Prompt{
 				Label: "Email",
 			}
@@ -90,10 +95,14 @@ func usersAddAction(ctx *cli.Context) error {
 			frm.UserEmail = clean.Email(res)
 		}
 
-		if interactive && len(ctx.String("password")) < entity.PasswordLength {
+		// Enter account password.
+		if interactive && (frm.Provider().RequiresLocalPassword() || frm.Password != "") &&
+			len([]rune(ctx.String("password"))) < entity.PasswordLength {
 			validate := func(input string) error {
-				if len(input) < entity.PasswordLength {
+				if len([]rune(input)) < entity.PasswordLength {
 					return fmt.Errorf("password must have at least %d characters", entity.PasswordLength)
+				} else if len(input) > txt.ClipPassword {
+					return authn.ErrPasswordTooLong
 				}
 				return nil
 			}
@@ -108,7 +117,7 @@ func usersAddAction(ctx *cli.Context) error {
 			}
 			validateRetype := func(input string) error {
 				if input != resPasswd {
-					return errors.New("passwords do not match")
+					return authn.ErrPasswordsDoNotMatch
 				}
 				return nil
 			}
@@ -122,7 +131,7 @@ func usersAddAction(ctx *cli.Context) error {
 				return err
 			}
 			if resConfirm != resPasswd {
-				return errors.New("password is invalid, please try again")
+				return authn.ErrInvalidPassword
 			} else {
 				frm.Password = resPasswd
 			}
@@ -131,6 +140,8 @@ func usersAddAction(ctx *cli.Context) error {
 		if err := entity.AddUser(frm); err != nil {
 			return err
 		}
+
+		AuditSharedEmail(entity.FindUserByExactName(frm.UserName), true)
 
 		return nil
 	})

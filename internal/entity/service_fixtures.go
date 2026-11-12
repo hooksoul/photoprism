@@ -27,14 +27,13 @@ var ServiceFixtures = ServiceMap{
 		SyncPath:      "/Photos",
 		SyncStatus:    "refresh",
 		SyncInterval:  3600,
-		SyncDate:      sql.NullTime{Time: TimeStamp()},
+		SyncDate:      sql.NullTime{Time: Now()},
 		SyncUpload:    true,
 		SyncDownload:  true,
 		SyncFilenames: true,
 		SyncRaw:       true,
-		CreatedAt:     TimeStamp(),
-		UpdatedAt:     TimeStamp(),
-		DeletedAt:     nil,
+		CreatedAt:     Now(),
+		UpdatedAt:     Now(),
 	},
 	"dummy-webdav2": {
 		ID:            1000001,
@@ -56,14 +55,13 @@ var ServiceFixtures = ServiceMap{
 		SyncPath:      "/Photos",
 		SyncStatus:    "refresh",
 		SyncInterval:  3600,
-		SyncDate:      sql.NullTime{Time: TimeStamp()},
+		SyncDate:      sql.NullTime{Time: Now()},
 		SyncUpload:    true,
 		SyncDownload:  true,
 		SyncFilenames: true,
 		SyncRaw:       true,
-		CreatedAt:     TimeStamp(),
-		UpdatedAt:     TimeStamp(),
-		DeletedAt:     nil,
+		CreatedAt:     Now(),
+		UpdatedAt:     Now(),
 	},
 }
 
@@ -73,6 +71,6 @@ var ServiceFixtureWebdavDummy2 = ServiceFixtures["dummy-webdav2"]
 // CreateServiceFixtures inserts known entities into the database for testing.
 func CreateServiceFixtures() {
 	for _, entity := range ServiceFixtures {
-		Db().Create(&entity)
+		createFixture(&entity)
 	}
 }

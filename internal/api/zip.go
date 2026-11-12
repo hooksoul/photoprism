@@ -2,31 +2,56 @@ package api
 
 import (
 	"archive/zip"
+	"errors"
 	"fmt"
-	"io"
 	"net/http"
 	"os"
-	"path"
 	"path/filepath"
 	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
 
-	"github.com/photoprism/photoprism/internal/acl"
+	"github.com/photoprism/photoprism/internal/auth/acl"
+	"github.com/photoprism/photoprism/internal/config/customize"
+	"github.com/photoprism/photoprism/internal/entity"
+	"github.com/photoprism/photoprism/internal/entity/query"
+	"github.com/photoprism/photoprism/internal/event"
 	"github.com/photoprism/photoprism/internal/form"
-	"github.com/photoprism/photoprism/internal/get"
-	"github.com/photoprism/photoprism/internal/i18n"
+	"github.com/photoprism/photoprism/internal/mutex"
 	"github.com/photoprism/photoprism/internal/photoprism"
-	"github.com/photoprism/photoprism/internal/query"
+	"github.com/photoprism/photoprism/internal/photoprism/get"
+	"github.com/photoprism/photoprism/internal/server/limiter"
+	"github.com/photoprism/photoprism/internal/workers"
 	"github.com/photoprism/photoprism/pkg/clean"
 	"github.com/photoprism/photoprism/pkg/fs"
+	"github.com/photoprism/photoprism/pkg/i18n"
+	"github.com/photoprism/photoprism/pkg/log/status"
 	"github.com/photoprism/photoprism/pkg/rnd"
 )
 
+// auditArchiveAccess records archive activity in the admin-only audit trail, with the session reference
+// when the request resolved to one and the file name redacted.
+func auditArchiveAccess(c *gin.Context, sess *entity.Session, action, outcome, baseName string) {
+	name := clean.Log(clean.FileNameRedacted(baseName))
+
+	if sess != nil {
+		event.AuditInfo([]string{ClientIP(c), "session %s", string(acl.ResourcePhotos), action, outcome}, sess.RefID, name)
+		return
+	}
+
+	event.AuditInfo([]string{ClientIP(c), string(acl.ResourcePhotos), action, outcome}, name)
+}
+
 // ZipCreate creates a zip file archive for download.
 //
-// POST /api/v1/zip
+//	@Summary	creates a zip file archive for download
+//	@Id			ZipCreate
+//	@Tags		Download
+//	@Produce	json
+//	@Failure	400,403,404,413	{object}	i18n.Response
+//	@Success	200				{file}		application/zip
+//	@Router		/api/v1/zip [post]
 func ZipCreate(router *gin.RouterGroup) {
 	router.POST("/zip", func(c *gin.Context) {
 		s := Auth(c, acl.ResourcePhotos, acl.ActionDownload)
@@ -42,30 +67,39 @@ func ZipCreate(router *gin.RouterGroup) {
 			return
 		}
 
-		var f form.Selection
+		var frm form.Selection
 		start := time.Now()
 
-		if err := c.BindJSON(&f); err != nil {
-			AbortBadRequest(c)
+		// Assign and validate request form values.
+		LimitRequestBodyBytes(c, MaxSelectionRequestBytes)
+
+		if err := c.BindJSON(&frm); err != nil {
+			if IsRequestBodyTooLarge(err) {
+				AbortRequestTooLarge(c, i18n.ErrBadRequest)
+				return
+			}
+
+			AbortBadRequest(c, err)
 			return
 		}
 
-		if f.Empty() {
+		if frm.Empty() {
 			Abort(c, http.StatusBadRequest, i18n.ErrNoItemsSelected)
 			return
 		}
 
 		// Configure file selection based on user settings.
 		var selection query.FileSelection
-		if dl := conf.Settings().Download; dl.Disabled {
+		if settings := conf.Settings().Download; settings.Disabled {
 			AbortFeatureDisabled(c)
 			return
 		} else {
-			selection = query.DownloadSelection(dl.MediaRaw, dl.MediaSidecar, dl.Originals)
+			selection = query.DownloadSelection(settings.MediaRaw, settings.MediaSidecar, settings.Originals)
 		}
 
-		// Find files to download.
-		files, err := query.SelectedFiles(f, selection)
+		// Find files to download within the session's shared scope, consistent with how photo
+		// search filters results.
+		files, err := query.SelectedFilesForSession(frm, selection, s)
 
 		if err != nil {
 			Error(c, http.StatusBadRequest, err, i18n.ErrZipFailed)
@@ -75,12 +109,19 @@ func ZipCreate(router *gin.RouterGroup) {
 			return
 		}
 
+		// Refuse to assemble a new download zip if storage is over quota or critically low.
+		if conf.InsufficientStorage() {
+			Abort(c, http.StatusInsufficientStorage, i18n.ErrInsufficientStorage)
+			return
+		}
+
 		// Configure file names.
 		dlName := DownloadName(c)
-		zipPath := path.Join(conf.TempPath(), "zip")
-		zipToken := rnd.GenerateToken(8)
+		// Build filesystem paths using filepath for OS compatibility.
+		zipPath := filepath.Join(conf.TempPath(), fs.ZipDir)
+		zipToken := rnd.Base36(8)
 		zipBaseName := fmt.Sprintf("photoprism-download-%s-%s.zip", time.Now().Format("20060102-150405"), zipToken)
-		zipFileName := path.Join(zipPath, zipBaseName)
+		zipFileName := filepath.Join(zipPath, zipBaseName)
 
 		// Create temp directory.
 		if err = os.MkdirAll(zipPath, 0700); err != nil {
@@ -88,127 +129,171 @@ func ZipCreate(router *gin.RouterGroup) {
 			return
 		}
 
+		// Remove expired archives before adding another one.
+		workers.RunPurgeArchives(conf)
+
 		// Create new zip file.
 		var newZipFile *os.File
+		// #nosec G304 zip name derived from request
 		if newZipFile, err = os.Create(zipFileName); err != nil {
 			Error(c, http.StatusInternalServerError, err, i18n.ErrZipFailed)
 			return
-		} else {
-			defer newZipFile.Close()
 		}
+
+		// Arm the periodic sweep.
+		mutex.TempArchives.Store(true)
+
+		// An archive that is not completed is closed and removed on every way out.
+		completed := false
+
+		defer func() {
+			if !completed {
+				_ = newZipFile.Close()
+				_ = os.Remove(zipFileName)
+			}
+		}()
 
 		// Create zip writer.
 		zipWriter := zip.NewWriter(newZipFile)
-		defer func(w *zip.Writer) {
-			logError("zip", w.Close())
-		}(zipWriter)
 
-		var aliases = make(map[string]int)
+		aliases := newZipAliases()
 
 		// Add files to zip.
 		for _, file := range files {
-			fileName := photoprism.FileName(file.FileRoot, file.FileName)
-			alias := file.DownloadName(dlName, 0)
-			key := strings.ToLower(alias)
-
-			if seq := aliases[key]; seq > 0 {
-				alias = file.DownloadName(dlName, seq)
+			if file.FileName == "" {
+				log.Warnf("download: %s cannot be downloaded (empty file name)", clean.Log(file.FileUID))
+				continue
+			} else if file.FileHash == "" {
+				log.Warnf("download: %s cannot be downloaded (empty file hash)", clean.Log(file.FileName))
+				continue
 			}
 
-			aliases[key] += 1
+			fileName := photoprism.FileName(file.FileRoot, file.FileName)
+			alias := aliases.Name(&file, dlName)
 
 			if fs.FileExists(fileName) {
-				if err := addFileToZip(zipWriter, fileName, alias); err != nil {
-					log.Errorf("zip: failed adding %s to zip (%s)", clean.Log(file.FileName), err)
+				if zipErr := fs.ZipFile(zipWriter, fileName, alias, false); zipErr != nil {
+					log.Errorf("download: failed to add %s (%s)", clean.Log(file.FileName), clean.Error(zipErr))
 					Abort(c, http.StatusInternalServerError, i18n.ErrZipFailed)
 					return
 				}
 
-				log.Infof("zip: added %s as %s", clean.Log(file.FileName), clean.Log(alias))
+				log.Infof("download: added %s as %s", clean.Log(file.FileName), clean.Log(alias))
 			} else {
-				log.Warnf("zip: media file %s is missing", clean.Log(file.FileName))
-				logError("zip", file.Update("FileMissing", true))
+				log.Warnf("download: %s not found", clean.Log(file.FileName))
+				logErr("download", file.Update("FileMissing", true))
 			}
 		}
 
+		// Ensure all data is flushed to disk before responding to the client
+		// to avoid rare races where the follow-up GET happens before the
+		// zip writer/file have been fully closed.
+		if cerr := zipWriter.Close(); cerr != nil {
+			Error(c, http.StatusInternalServerError, cerr, i18n.ErrZipFailed)
+			return
+		}
+		if ferr := newZipFile.Close(); ferr != nil {
+			Error(c, http.StatusInternalServerError, ferr, i18n.ErrZipFailed)
+			return
+		}
+
+		completed = true
+
 		elapsed := int(time.Since(start).Seconds())
 
-		log.Infof("zip: created %s [%s]", clean.Log(zipBaseName), time.Since(start))
+		auditArchiveAccess(c, s, "create archive %s", status.Succeeded, zipBaseName)
 
-		c.JSON(http.StatusOK, gin.H{"code": http.StatusOK, "message": i18n.Msg(i18n.MsgZipCreatedIn, elapsed), "filename": zipBaseName})
+		resp := i18n.NewResponse(http.StatusOK, i18n.MsgZipCreatedIn, elapsed)
+
+		c.JSON(http.StatusOK, gin.H{"code": resp.Code, "message": resp.Message, "messageId": resp.MessageID, "messageParams": resp.MessageParams, "filename": zipBaseName})
 	})
 }
 
-// ZipDownload downloads a zip file archive.
+// ZipDownload returns a zip file archive after it has been created.
 //
-// GET /api/v1/zip/:filename
+//	@Summary	returns a zip file archive after it has been created
+//	@Id			ZipDownload
+//	@Tags		Download
+//	@Produce	application/zip
+//	@Failure	403,404,429,500	{object}	i18n.Response
+//	@Success	200				{file}		application/zip
+//	@Param		filename		path		string	true	"zip archive filename returned by the POST /api/v1/zip endpoint"
+//	@Router		/api/v1/zip/{filename} [get]
 func ZipDownload(router *gin.RouterGroup) {
 	router.GET("/zip/:filename", func(c *gin.Context) {
-		if InvalidDownloadToken(c) {
-			log.Errorf("zip: %s", c.AbortWithError(http.StatusForbidden, fmt.Errorf("invalid download token")))
+		sess, valid := AuthDownload(c, acl.Resources{acl.ResourcePhotos})
+
+		if !valid && DownloadRateLimited(c) {
+			limiter.AbortJSON(c)
+			return
+		} else if !valid {
+			AbortForbidden(c)
 			return
 		}
 
 		conf := get.Config()
 		zipBaseName := clean.FileName(filepath.Base(c.Param("filename")))
-		zipPath := path.Join(conf.TempPath(), "zip")
-		zipFileName := path.Join(zipPath, zipBaseName)
+		zipPath := filepath.Join(conf.TempPath(), fs.ZipDir)
+		zipFileName := filepath.Join(zipPath, zipBaseName)
 
 		if !fs.FileExists(zipFileName) {
-			log.Errorf("zip: %s", c.AbortWithError(http.StatusNotFound, fmt.Errorf("%s not found", clean.Log(zipFileName))))
+			auditArchiveAccess(c, sess, "download %s", status.NotFound, zipBaseName)
+			AbortEntityNotFound(c)
 			return
 		}
 
 		defer func(fileName, baseName string) {
-			log.Debugf("zip: %s has been downloaded", clean.Log(baseName))
-
 			// Wait a moment before deleting the zip file, just to be sure:
 			// https://github.com/photoprism/photoprism/issues/2532
 			time.Sleep(time.Second)
 
 			// Remove the zip file to free up disk space.
 			if err := os.Remove(fileName); err != nil {
-				log.Warnf("zip: failed deleting %s (%s)", clean.Log(fileName), err)
+				// Report the reason without the *os.PathError wrapper, which would name the server path.
+				var pathErr *os.PathError
+
+				if errors.As(err, &pathErr) {
+					err = pathErr.Err
+				}
+
+				log.Warnf("download: failed to delete %s (%s)", clean.Log(clean.FileNameRedacted(baseName)), clean.Error(err))
 			} else {
-				log.Debugf("zip: deleted %s", clean.Log(baseName))
+				log.Debugf("download: deleted %s", clean.Log(clean.FileNameRedacted(baseName)))
 			}
 		}(zipFileName, zipBaseName)
 
-		log.Debugf("zip: submitting %s", clean.Log(zipBaseName))
-
 		c.FileAttachment(zipFileName, zipBaseName)
+
+		auditArchiveAccess(c, sess, "download %s", status.Succeeded, zipBaseName)
 	})
 }
 
-// addFileToZip adds a file to a zip archive.
-func addFileToZip(zipWriter *zip.Writer, fileName, fileAlias string) error {
-	fileToZip, err := os.Open(fileName)
-	if err != nil {
-		return err
+// zipEntrySeqMax limits the number of sequence numbers tried for a free ZIP entry name.
+const zipEntrySeqMax = 10000
+
+// zipAliases records the ZIP entry names assigned so far, ignoring case, and the next sequence number per name.
+type zipAliases struct {
+	used map[string]bool
+	next map[string]int
+}
+
+// newZipAliases returns an empty set of ZIP entry names.
+func newZipAliases() *zipAliases {
+	return &zipAliases{used: make(map[string]bool), next: make(map[string]int)}
+}
+
+// Name returns the download name of a file, numbered so that no earlier entry has it.
+func (n *zipAliases) Name(file *entity.File, dlName customize.DownloadName) string {
+	alias := file.DownloadName(dlName, 0)
+	key := strings.ToLower(alias)
+
+	for seq := n.next[key]; n.used[strings.ToLower(alias)] && seq < zipEntrySeqMax; {
+		seq++
+		n.next[key] = seq
+		alias = file.DownloadName(dlName, seq)
 	}
-	defer fileToZip.Close()
 
-	// Get the file information
-	info, err := fileToZip.Stat()
-	if err != nil {
-		return err
-	}
+	n.used[strings.ToLower(alias)] = true
 
-	header, err := zip.FileInfoHeader(info)
-	if err != nil {
-		return err
-	}
-
-	header.Name = fileAlias
-
-	// Change to deflate to gain better compression
-	// see http://golang.org/pkg/archive/zip/#pkg-constants
-	header.Method = zip.Deflate
-
-	writer, err := zipWriter.CreateHeader(header)
-	if err != nil {
-		return err
-	}
-	_, err = io.Copy(writer, fileToZip)
-	return err
+	return alias
 }

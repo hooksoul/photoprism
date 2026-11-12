@@ -1,271 +1,318 @@
 <template>
-  <div v-infinite-scroll="loadMore" :class="$config.aclClasses('albums')" class="p-page p-page-albums" style="user-select: none"
-       :infinite-scroll-disabled="scrollDisabled" :infinite-scroll-distance="scrollDistance"
-       :infinite-scroll-listen-for-event="'scrollRefresh'">
+  <div ref="page" tabindex="-1" class="p-page p-page-albums not-selectable" :class="$config.aclClasses('albums')">
+    <v-form ref="form" validate-on="invalid-input" class="p-albums-search p-page__navigation" @submit.prevent="updateQuery()">
+      <v-toolbar flat :density="$vuetify.display.smAndDown ? 'compact' : 'default'" color="secondary" class="page-toolbar">
+        <v-text-field
+          :model-value="filter.q"
+          :density="density"
+          hide-details
+          clearable
+          overflow
+          single-line
+          rounded="pill"
+          variant="solo-filled"
+          color="surface-variant"
+          validate-on="invalid-input"
+          autocomplete="off"
+          autocorrect="off"
+          autocapitalize="none"
+          :placeholder="$gettext('Search')"
+          class="input-search background-inherit elevation-0"
+          :class="{ 'input-search--expanded': expanded, 'input-search--focus': !canExpand }"
+          @update:model-value="
+            (v) => {
+              updateFilter({ q: v });
+            }
+          "
+          @keyup.enter="() => updateQuery()"
+          @keyup.esc.exact="() => hideExpansionPanel()"
+          @click:clear="
+            () => {
+              updateQuery({ q: '' });
+            }
+          "
+        >
+          <template #prepend-inner>
+            <p-input-action
+              v-if="canExpand"
+              icon="mdi-tune"
+              :label="$gettext('Search Filters')"
+              :aria-expanded="expanded ? 'true' : 'false'"
+              @click.stop="toggleExpansionPanel"
+            ></p-input-action>
+            <v-icon v-else icon="mdi-magnify"></v-icon>
+          </template>
+        </v-text-field>
 
-    <v-form ref="form" class="p-albums-search" lazy-validation dense @submit.prevent="updateQuery()">
-      <v-toolbar flat :dense="$vuetify.breakpoint.smAndDown" class="page-toolbar" color="secondary">
-        <v-text-field :value="filter.q"
-                      solo hide-details clearable overflow single-line validate-on-blur
-                      class="input-search background-inherit elevation-0"
-                      :label="$gettext('Search')"
-                      browser-autocomplete="off"
-                      autocorrect="off"
-                      autocapitalize="none"
-                      prepend-inner-icon="search"
-                      color="secondary-dark"
-                      @change="(v) => {updateFilter({'q': v})}"
-                      @keyup.enter.native="(e) => updateQuery({'q': e.target.value})"
-                      @click:clear="() => {updateQuery({'q': ''})}"
-        ></v-text-field>
+        <v-btn
+          v-if="canManage && staticFilter.type === 'album'"
+          :title="$gettext('Add Album')"
+          icon="mdi-plus"
+          class="action-add ms-1"
+          @click.prevent="create()"
+        ></v-btn>
 
-        <v-btn icon class="action-reload" :title="$gettext('Reload')" @click.stop="refresh()">
-          <v-icon>refresh</v-icon>
-        </v-btn>
-
-        <v-btn v-if="canUpload" icon class="hidden-sm-and-down action-upload"
-               :title="$gettext('Upload')" @click.stop="showUpload()">
-          <v-icon>cloud_upload</v-icon>
-        </v-btn>
-
-        <v-btn v-if="canManage && staticFilter.type === 'album'" icon class="action-add" :title="$gettext('Add Album')"
-               @click.prevent="create()">
-          <v-icon>add</v-icon>
-        </v-btn>
-
-        <v-btn v-if="canManage && !staticFilter['order']" icon class="p-expand-search" :title="$gettext('Expand Search')"
-               @click.stop="searchExpanded = !searchExpanded">
-          <v-icon>{{ searchExpanded ? 'keyboard_arrow_up' : 'keyboard_arrow_down' }}</v-icon>
-        </v-btn>
+        <p-action-menu v-if="$vuetify.display.mdAndUp" :items="menuActions" button-class="ms-1"></p-action-menu>
       </v-toolbar>
-      <v-card v-show="searchExpanded"
-              class="pt-1 page-toolbar-expanded"
-              flat
-              color="secondary-light">
-        <v-card-text>
-          <v-layout row wrap>
-            <v-flex xs12 sm4 pa-2 class="p-year-select">
-              <v-select :value="filter.year"
-                        :label="$gettext('Year')"
-                        :disabled="context === 'state'"
-                        :menu-props="{'maxHeight':346}"
-                        flat solo hide-details
-                        color="secondary-dark"
-                        background-color="secondary"
-                        item-value="value"
-                        item-text="text"
-                        :items="yearOptions()"
-                        @change="(v) => {updateQuery({'year': v})}">
-              </v-select>
-            </v-flex>
-            <v-flex xs12 sm4 pa-2 class="p-category-select">
-              <v-select :value="filter.category"
-                        :label="$gettext('Category')"
-                        :menu-props="{'maxHeight':346}"
-                        flat solo hide-details
-                        color="secondary-dark"
-                        background-color="secondary"
-                        :items="categories"
-                        @change="(v) => {updateQuery({'category': v})}">
-              </v-select>
-            </v-flex>
-            <v-flex xs12 sm4 pa-2 class="p-sort-select">
-              <v-select :value="filter.order"
-                        :label="$gettext('Sort Order')"
-                        :menu-props="{'maxHeight':400}"
-                        flat solo hide-details
-                        color="secondary-dark"
-                        background-color="secondary"
-                        :items="options.sorting"
-                        @change="(v) => {updateQuery({'order': v})}">
-              </v-select>
-            </v-flex>
-          </v-layout>
-        </v-card-text>
-      </v-card>
+
+      <div class="toolbar-expansion-panel">
+        <v-expand-transition>
+          <v-card v-show="expanded" flat color="secondary">
+            <v-card-text class="dense">
+              <v-row density="compact">
+                <v-col cols="12" sm="4" class="p-year-select">
+                  <v-select
+                    :model-value="filter.year"
+                    :label="$gettext('Year')"
+                    :disabled="context === contexts.State"
+                    :menu-props="{ maxHeight: 346 }"
+                    single-line
+                    hide-details
+                    variant="solo-filled"
+                    :density="density"
+                    :items="yearOptions()"
+                    item-title="text"
+                    item-value="value"
+                    @update:model-value="
+                      (v) => {
+                        updateQuery({ year: v });
+                      }
+                    "
+                  >
+                  </v-select>
+                </v-col>
+                <v-col cols="12" sm="4" class="p-category-select">
+                  <v-select
+                    :model-value="filter.category"
+                    :label="$gettext('Category')"
+                    :menu-props="{ maxHeight: 346 }"
+                    single-line
+                    hide-details
+                    variant="solo-filled"
+                    :density="density"
+                    :items="categories"
+                    item-title="text"
+                    item-value="value"
+                    @update:model-value="
+                      (v) => {
+                        updateQuery({ category: v });
+                      }
+                    "
+                  >
+                  </v-select>
+                </v-col>
+                <v-col cols="12" sm="4" class="p-sort-select">
+                  <v-select
+                    :model-value="filter.order"
+                    :label="$gettext('Sort Order')"
+                    :menu-props="{ maxHeight: 400 }"
+                    single-line
+                    hide-details
+                    variant="solo-filled"
+                    :density="density"
+                    :items="context === contexts.Album ? options.sorting : options.sorting.filter((item) => item.value !== 'edited')"
+                    item-title="text"
+                    item-value="value"
+                    @update:model-value="
+                      (v) => {
+                        updateQuery({ order: v });
+                      }
+                    "
+                  >
+                  </v-select>
+                </v-col>
+              </v-row>
+            </v-card-text>
+          </v-card>
+        </v-expand-transition>
+      </div>
     </v-form>
 
-    <v-container v-if="loading" fluid class="pa-4">
-      <v-progress-linear color="secondary-dark" :indeterminate="true"></v-progress-linear>
-    </v-container>
-    <v-container v-else fluid class="pa-0">
-      <p-scroll-top></p-scroll-top>
+    <div v-if="loading" class="p-page__loading">
+      <p-loading></p-loading>
+    </div>
+    <div v-else class="p-page__content">
+      <p-scroll :hide-panel="hideExpansionPanel" :load-more="loadMore" :load-disabled="scrollDisabled" :load-distance="scrollDistance" :loading="loading">
+      </p-scroll>
 
-      <p-album-clipboard :refresh="refresh" :selection="selection" :share="share" :edit="edit"
-                         :clear-selection="clearSelection" :context="context"></p-album-clipboard>
+      <p-album-clipboard
+        :refresh="refresh"
+        :selection="selection"
+        :share="share"
+        :edit="edit"
+        :clear-selection="clearSelection"
+        :context="context"
+      ></p-album-clipboard>
 
-      <v-container grid-list-xs fluid class="pa-2">
-        <v-alert
-            :value="results.length === 0"
-            color="secondary-dark" icon="lightbulb_outline" class="no-results ma-2 opacity-70" outline
-        >
-          <h3 class="body-2 ma-0 pa-0">
-            <translate>No albums found</translate>
-          </h3>
-          <p class="body-1 mt-2 mb-0 pa-0">
-            <translate>Try again using other filters or keywords.</translate>
+      <div v-if="results.length === 0" class="pa-3">
+        <v-alert color="surface-variant" icon="mdi-lightbulb-outline" class="no-results" variant="outlined">
+          <div class="font-weight-bold">
+            {{ $gettext(`No albums found`) }}
+          </div>
+          <div class="mt-2">
+            {{ $gettext(`Try again using other filters or keywords.`) }}
             <template v-if="staticFilter.type === 'album'">
-              <translate>After selecting pictures from search results, you can add them to an album using the context menu.</translate>
+              {{ $gettext(`After selecting pictures from search results, you can add them to an album using the context menu.`) }}
             </template>
             <template v-else>
-              <translate>Your library is continuously analyzed to automatically create albums of special moments, trips, and places.</translate>
+              {{ $gettext(`Your library is continuously analyzed to automatically create albums of special moments, trips, and places.`) }}
             </template>
-          </p>
+          </div>
         </v-alert>
 
-        <v-layout row wrap class="search-results album-results cards-view" :class="{'select-results': selection.length > 0}">
-          <v-flex
-              v-for="(album, index) in results"
-              :key="album.UID"
-              xs6 sm4 md3 xlg2 xxl1 d-flex
-          >
-            <v-card tile
-                    :data-uid="album.UID"
-                    style="user-select: none"
-                    class="result card"
-                    :class="album.classes(selection.includes(album.UID))"
-                    :to="album.route(view)"
-                    @contextmenu.stop="onContextMenu($event, index)"
-            >
-              <div class="card-background card" style="user-select: none"></div>
-              <v-img
-                  :src="album.thumbnailUrl('tile_500')"
-                  :alt="album.Title"
-                  :transition="false"
-                  aspect-ratio="1"
-                  style="user-select: none"
-                  class="card darken-1 clickable"
-                  @touchstart.passive="input.touchStart($event, index)"
-                  @touchend.stop.prevent="onClick($event, index)"
-                  @mousedown.stop.prevent="input.mouseDown($event, index)"
-                  @click.stop.prevent="onClick($event, index)"
-              >
-                <v-btn v-if="canShare && album.LinkCount > 0" :ripple="false"
-                       icon flat absolute
-                       class="action-share"
-                       @touchstart.stop.prevent="input.touchStart($event, index)"
-                       @touchend.stop.prevent="onShare($event, index)"
-                       @touchmove.stop.prevent
-                       @click.stop.prevent="onShare($event, index)">
-                  <v-icon color="white">share</v-icon>
-                </v-btn>
-
-                <v-btn :ripple="false"
-                       icon flat absolute
-                       class="input-select"
-                       @touchstart.stop.prevent="input.touchStart($event, index)"
-                       @touchend.stop.prevent="onSelect($event, index)"
-                       @touchmove.stop.prevent
-                       @click.stop.prevent="onSelect($event, index)">
-                  <v-icon color="white" class="select-on">check_circle</v-icon>
-                  <v-icon color="white" class="select-off">radio_button_off</v-icon>
-                </v-btn>
-
-                <v-btn :ripple="false"
-                       icon flat absolute
-                       class="input-favorite"
-                       @touchstart.stop.prevent="input.touchStart($event, index)"
-                       @touchend.stop.prevent="toggleLike($event, index)"
-                       @touchmove.stop.prevent
-                       @click.stop.prevent="toggleLike($event, index)">
-                  <v-icon color="#FFD600" class="select-on">star</v-icon>
-                  <v-icon color="white" class="select-off">star_border</v-icon>
-                </v-btn>
-
-                <v-btn v-if="canManage && featExperimental && featPrivate && album.Private"
-                       :ripple="false"
-                       icon flat absolute
-                       class="input-private"
-                       @touchstart.stop.prevent="input.touchStart($event, index)"
-                       @touchend.stop.prevent="onEdit($event, index)"
-                       @touchmove.stop.prevent
-                       @click.stop.prevent="onEdit($event, index)">
-                  <v-icon color="white" class="select-on">lock</v-icon>
-                </v-btn>
-              </v-img>
-
-              <v-card-title primary-title class="pl-3 pt-3 pr-3 pb-2 card-details" style="user-select: none;">
-                <div>
-                  <h3 class="body-2 mb-0">
-                    <button v-if="album.Type !== 'month'" class="action-title-edit" :data-uid="album.UID"
-                            @click.stop.prevent="edit(album)">
-                      {{ album.Title | truncate(80) }}
-                    </button>
-                    <button v-else class="action-title-edit" :data-uid="album.UID"
-                    @click.stop.prevent="edit(album)">
-                      {{ album.getDateString() | capitalize }}
-                    </button>
-                  </h3>
-                </div>
-              </v-card-title>
-
-              <v-card-text primary-title class="pb-2 pt-0 card-details" style="user-select: none;"
-                           @click.stop.prevent="">
-                <div v-if="album.Description" class="caption mb-2" :title="$gettext('Description')">
-                  <button @click.exact="edit(album)">
-                    {{ album.Description | truncate(100) }}
-                  </button>
-                </div>
-
-                <div v-else-if="album.Type === 'album'" class="caption mb-2">
-                  <button v-if="album.PhotoCount === 1" @click.exact="edit(album)">
-                    <translate>Contains one picture.</translate>
-                  </button>
-                  <button v-else-if="album.PhotoCount > 0">
-                    <translate :translate-params="{n: album.PhotoCount}">Contains %{n} pictures.</translate>
-                  </button>
-                  <button v-else @click.stop.prevent="$router.push({name: 'browse'})">
-                    <translate>Add pictures from search results by selecting them.</translate>
-                  </button>
-                </div>
-                <div v-else-if="album.Type === 'folder'" class="caption mb-2">
-                  <button @click.exact="edit(album)">
-                    /{{ album.Path | truncate(100) }}
-                  </button>
-                </div>
-                <div v-if="album.Category !== ''" class="caption mb-2 d-inline-block">
-                  <button @click.exact="edit(album)">
-                    <v-icon size="14">local_offer</v-icon>
-                    {{ album.Category }}
-                  </button>
-                </div>
-                <div v-if="album.getLocation() !== ''" class="caption mb-2 d-inline-block">
-                  <button @click.exact="edit(album)">
-                    <v-icon size="14">location_on</v-icon>
-                    {{ album.getLocation() }}
-                  </button>
-                </div>
-              </v-card-text>
-            </v-card>
-          </v-flex>
-        </v-layout>
-        <div v-if="canManage && staticFilter.type === 'album' && config.count.albums === 0" class="text-xs-center my-2">
-          <v-btn class="action-add" color="secondary" round @click.prevent="create">
-            <translate>Add Album</translate>
+        <div v-if="canManage && staticFilter.type === 'album' && config.count.albums === 0" class="d-flex justify-center mt-8 mb-4">
+          <v-btn color="button" rounded variant="flat" class="action-add" @click.prevent="create">
+            {{ $gettext(`Add Album`) }}
           </v-btn>
         </div>
-      </v-container>
-    </v-container>
-    <p-share-dialog :show="dialog.share" :model="model" @upload="webdavUpload"
-                    @close="dialog.share = false"></p-share-dialog>
-    <p-share-upload-dialog :show="dialog.upload" :items="{albums: selection}" :model="model" @cancel="dialog.upload = false"
-                           @confirm="dialog.upload = false"></p-share-upload-dialog>
-    <p-album-edit-dialog :show="dialog.edit" :album="model" @close="dialog.edit = false"></p-album-edit-dialog>
+      </div>
+      <div v-else class="v-row search-results album-results cards-view" :class="{ 'select-results': selection.length > 0 }">
+        <div v-for="(album, index) in results" :key="album.UID" ref="items" class="v-col-6 v-col-sm-4 v-col-md-3 v-col-xl-2">
+          <div
+            :data-uid="album.UID"
+            class="result not-selectable"
+            :class="album.classes(selection.includes(album.UID))"
+            @contextmenu.stop="onContextMenu($event, index)"
+          >
+            <div
+              :key="album.UID"
+              :title="album.Title"
+              :style="`background-image: url(${album.thumbnailUrl('tile_500')})`"
+              class="preview"
+              @touchstart.passive="input.touchStart($event, index)"
+              @touchend.stop="onClick($event, index)"
+              @mousedown.stop.prevent="input.mouseDown($event, index)"
+              @click.stop.prevent="onClick($event, index)"
+            >
+              <div class="preview__overlay"></div>
+              <button
+                v-if="canShare && album.LinkCount > 0"
+                class="action-share"
+                @touchstart.stop="input.touchStart($event, index)"
+                @touchend.stop="onShare($event, index)"
+                @touchmove.stop.prevent
+                @click.stop.prevent="onShare($event, index)"
+              >
+                <i class="mdi mdi-share-variant" />
+              </button>
+              <button
+                class="input-select"
+                @touchstart.stop="input.touchStart($event, index)"
+                @touchend.stop="onSelect($event, index)"
+                @touchmove.stop.prevent
+                @click.stop.prevent="onSelect($event, index)"
+              >
+                <i class="mdi mdi-check-circle select-on" />
+                <i class="mdi mdi-circle-outline select-off" />
+              </button>
+              <button
+                class="input-favorite"
+                @touchstart.stop="input.touchStart($event, index)"
+                @touchend.stop="toggleLike($event, index)"
+                @touchmove.stop.prevent
+                @click.stop.prevent="toggleLike($event, index)"
+              >
+                <i v-if="album.Favorite" class="mdi mdi-star text-favorite select-on" />
+                <i v-else class="mdi mdi-star-outline select-off" />
+              </button>
+              <button
+                v-if="canManage && experimental && featPrivate && album.Private"
+                class="input-private"
+                @touchstart.stop="input.touchStart($event, index)"
+                @touchend.stop="onEdit($event, index)"
+                @touchmove.stop.prevent
+                @click.stop.prevent="onEdit($event, index)"
+              >
+                <i class="mdi mdi-lock" />
+              </button>
+            </div>
+
+            <div class="meta">
+              <button
+                v-if="album.Type === 'month'"
+                :title="album.Title"
+                class="action-title-edit meta-title text-capitalize"
+                :data-uid="album.UID"
+                @click.stop.prevent="edit(album)"
+              >
+                {{ album.getDateString() }}
+              </button>
+              <button v-else-if="album.Title" :title="album.Title" class="action-title-edit meta-title" :data-uid="album.UID" @click.stop.prevent="edit(album)">
+                <bdi>{{ $util.balanceBidi(album.Title) }}</bdi>
+              </button>
+
+              <button v-if="album.Description" :title="$gettext('Description')" class="meta-description" @click.exact="edit(album)">
+                {{ album.Description }}
+              </button>
+              <button v-else-if="album.Type === 'album' && !album.PhotoCount" class="meta-description" @click.stop.prevent="$router.push({ name: 'browse' })">
+                {{ $gettext(`Add pictures from search results by selecting them.`) }}
+              </button>
+
+              <div v-if="album.PhotoCount === 1" class="meta-count" @click.stop.prevent="">
+                {{ $gettext(`Contains one picture.`) }}
+              </div>
+              <div v-else-if="album.PhotoCount > 0" class="meta-count" @click.stop.prevent="">
+                {{ $gettext(`Contains %{n} pictures.`, { n: album.PhotoCount }) }}
+              </div>
+
+              <div class="meta-details">
+                <button v-if="album.Type === 'folder'" :title="'/' + $util.stripBidiControls(album.Path)" class="meta-path" @click.exact="edit(album)">
+                  <i class="mdi mdi-folder" />
+                  <bdi dir="ltr">/{{ $util.stripBidiControls(album.Path) }}</bdi>
+                </button>
+                <button v-if="album.Category !== ''" :title="album.Category" class="meta-category" @click.exact="edit(album)">
+                  <i class="mdi mdi-tag" />
+                  {{ album.Category }}
+                </button>
+                <button v-if="album.getLocation() !== ''" class="meta-location text-truncate" @click.exact="edit(album)">
+                  <i class="mdi mdi-map-marker" />
+                  {{ album.getLocation() }}
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+    <p-share-dialog :visible="dialog.share" :model="model" @upload="webdavUpload" @close="dialog.share = false"></p-share-dialog>
+    <p-service-upload
+      :visible="dialog.upload"
+      :items="{ albums: selection }"
+      :model="model"
+      @close="dialog.upload = false"
+      @confirm="dialog.upload = false"
+    ></p-service-upload>
+    <p-album-edit-dialog :visible="dialog.edit" :album="model" @close="dialog.edit = false"></p-album-edit-dialog>
   </div>
 </template>
 
 <script>
 import Album from "model/album";
-import {DateTime} from "luxon";
-import Event from "pubsub-js";
+import { DateTime } from "luxon";
 import RestModel from "model/rest";
-import {MaxItems} from "common/clipboard";
-import Notify from "common/notify";
-import {Input, InputInvalid, ClickShort, ClickLong} from "common/input";
+import { MaxItems } from "common/clipboard";
+import $notify from "common/notify";
+import { Input, InputInvalid, ClickShort, ClickLong } from "common/input";
+import { getAppStorage } from "common/storage";
+import { ACTION_CREATED, ACTION_UPDATED, ACTION_DELETED } from "common/event";
 import * as options from "options/options";
+import * as contexts from "options/contexts";
+
+import PLoading from "component/loading.vue";
+import PActionMenu from "component/action/menu.vue";
+
+const appStorage = getAppStorage();
+
+// Maximum number of affected entities reloaded in place per event;
+// larger batches set the dirty flag and are refetched lazily instead.
+const maxLiveRefetch = 50;
 
 export default {
-  name: 'PPageAlbums',
+  name: "PPageAlbums",
+  components: {
+    PLoading,
+    PActionMenu,
+  },
   props: {
     staticFilter: {
       type: Object,
@@ -280,35 +327,42 @@ export default {
       default: "",
     },
   },
+  expose: ["onShortCut"],
   data() {
     const query = this.$route.query;
     const routeName = this.$route.name;
     const order = this.sortOrder();
+    const reverse = this.sortReverse();
     const q = query["q"] ? query["q"] : "";
     const category = query["category"] ? query["category"] : "";
-    const year = query['year'] ? parseInt(query['year']) : "";
-    const filter = {q, category, order, year};
+    const year = query["year"] ? parseInt(query["year"]) : "";
+    const filter = { q, category, order, reverse, year };
     const settings = {};
-    const features = this.$config.settings().features;
+    const features = this.$config.getSettings().features;
 
-    let categories = [{"value": "", "text": this.$gettext("All Categories")}];
+    let categories = [{ value: "", text: this.$gettext("All Categories") }];
 
     if (this.$config.albumCategories().length > 0) {
-      categories = categories.concat(this.$config.albumCategories().map(cat => {
-        return {"value": cat, "text": cat};
-      }));
+      categories = categories.concat(
+        this.$config.albumCategories().map((cat) => {
+          return { value: cat, text: cat };
+        })
+      );
     }
 
     return {
-      searchExpanded: false,
+      contexts,
+      expanded: false,
+      experimental: this.$config.get("experimental") && !this.$config.ce(),
       canUpload: this.$config.allow("files", "upload") && features.upload,
       canShare: this.$config.allow("albums", "share") && features.share,
       canManage: this.$config.allow("albums", "manage"),
       canEdit: this.$config.allow("albums", "update"),
       config: this.$config.values,
-      featExperimental: this.$config.get("experimental") && !this.$config.ce(),
+      isSuperAdmin: this.$session.isSuperAdmin(),
       featShare: features.share,
       featPrivate: features.private,
+      featSettings: features.settings,
       categories: categories,
       subscriptions: [],
       listen: false,
@@ -316,7 +370,7 @@ export default {
       results: [],
       loading: true,
       scrollDisabled: true,
-      scrollDistance: window.innerHeight*2,
+      scrollDistance: window.innerHeight * 2,
       batchSize: Album.batchSize(),
       offset: 0,
       page: 0,
@@ -326,7 +380,6 @@ export default {
       filter: filter,
       lastFilter: {},
       routeName: routeName,
-      titleRule: v => v.length <= this.$config.get('clip') || this.$gettext("Title too long"),
       input: new Input(),
       lastId: "",
       dialog: {
@@ -335,37 +388,54 @@ export default {
         edit: false,
       },
       model: new Album(false),
+      restoreKey: "",
+      restoreConsumed: false,
+      restoreTargetCount: 0,
+      restorePending: 0,
+      restoring: false,
       all: {
-        years: [{value: "", text: this.$gettext("All Years")}],
+        years: [{ value: "", text: this.$gettext("All Years") }],
       },
       options: {
-        'sorting': [
-          {value: 'favorites', text: this.$gettext('Favorites')},
-          {value: 'name', text: this.$gettext('Name')},
-          {value: 'place', text: this.$gettext('Location')},
-          {value: 'newest', text: this.$gettext('Newest First')},
-          {value: 'oldest', text: this.$gettext('Oldest First')},
-          {value: 'added', text: this.$gettext('Recently Added')},
-          {value: 'edited', text: this.$gettext('Recently Edited')},
+        sorting: [
+          { value: "favorites", text: this.$gettext("Favorites") },
+          { value: "name", text: this.$gettext("Name") },
+          { value: "place", text: this.$gettext("Location") },
+          { value: "newest", text: this.$gettext("Newest First") },
+          { value: "oldest", text: this.$gettext("Oldest First") },
+          { value: "added", text: this.$gettext("Recently Added") },
+          { value: "edited", text: this.$gettext("Recently Edited") },
         ],
       },
     };
   },
   computed: {
+    density() {
+      return this.$vuetify.display.smAndDown ? "compact" : "comfortable";
+    },
     context: function () {
       if (!this.staticFilter) {
-        return "album";
+        return contexts.Album;
       }
 
       if (this.staticFilter.type) {
         return this.staticFilter.type;
       }
 
-      return "";
-    }
+      return contexts.Default;
+    },
+    canExpand: function () {
+      return this.canManage && !this.staticFilter["order"];
+    },
   },
   watch: {
-    '$route'() {
+    $route() {
+      if (!this.$view.isActive(this)) {
+        return;
+      }
+
+      this.$view.focus(this.$refs?.page);
+
       const query = this.$route.query;
 
       this.routeName = this.$route.name;
@@ -373,26 +443,108 @@ export default {
       this.q = query["q"] ? query["q"] : "";
       this.filter.q = this.q;
       this.filter.category = query["category"] ? query["category"] : "";
-      this.filter.year = query['year'] ? parseInt(query['year']) : "";
+      this.filter.year = query["year"] ? parseInt(query["year"]) : "";
       this.filter.order = this.sortOrder();
+      this.filter.reverse = this.sortReverse();
 
+      this.initRestoreState();
       this.search();
-    }
+    },
   },
   created() {
+    this.initRestoreState();
     this.search();
 
-    this.subscriptions.push(Event.subscribe("albums", (ev, data) => this.onUpdate(ev, data)));
-    this.subscriptions.push(Event.subscribe("touchmove.top", () => this.refresh()));
-    this.subscriptions.push(Event.subscribe("touchmove.bottom", () => this.loadMore()));
-    this.subscriptions.push(Event.subscribe("config.updated", (ev, data) => this.onConfigUpdated(data)));
+    this.subscriptions.push(this.$event.subscribe("albums", (ev, data) => this.onUpdate(ev, data)));
+    this.subscriptions.push(this.$event.subscribe("touchmove.top", () => this.refresh()));
+    this.subscriptions.push(this.$event.subscribe("touchmove.bottom", () => this.loadMore()));
+    this.subscriptions.push(this.$event.subscribe("config.updated", (ev, data) => this.onConfigUpdated(data)));
   },
-  destroyed() {
-    for (let i = 0; i < this.subscriptions.length; i++) {
-      Event.unsubscribe(this.subscriptions[i]);
+  mounted() {
+    this.$view.enter(this, this.$refs?.page);
+  },
+  activated() {
+    this.initRestoreState();
+
+    if (this.restoring && this.restorePending > 0) {
+      this.ensureRestoreTarget();
     }
   },
+  beforeUnmount() {
+    this.persistRestoreState();
+    for (let i = 0; i < this.subscriptions.length; i++) {
+      this.$event.unsubscribe(this.subscriptions[i]);
+    }
+  },
+  unmounted() {
+    this.$view.leave(this);
+  },
   methods: {
+    menuActions() {
+      return [
+        {
+          name: "refresh",
+          icon: "mdi-refresh",
+          text: this.$gettext("Refresh"),
+          shortcut: "Ctrl-R",
+          visible: true,
+          click: () => {
+            this.refresh();
+          },
+        },
+        {
+          name: "upload",
+          icon: "mdi-cloud-upload",
+          text: this.$gettext("Upload") + "…",
+          shortcut: "Ctrl-U",
+          visible: this.canUpload,
+          click: () => {
+            this.showUpload();
+          },
+        },
+      ];
+    },
+    onShortCut(ev) {
+      switch (ev.code) {
+        case "Escape":
+          if (document.activeElement instanceof HTMLInputElement) {
+            document.activeElement.blur();
+          }
+          this.hideExpansionPanel();
+          return true;
+        case "KeyR":
+          this.refresh();
+          return true;
+        case "KeyF":
+          if (ev.shiftKey) {
+            this.showExpansionPanel();
+          }
+          this.$view.focus(this.$refs?.form, ".input-search input", true);
+          return true;
+        case "KeyU":
+          if (this.$config.allow("files", "upload") && this.$config.feature("upload")) {
+            this.$event.publish("dialog.upload");
+          }
+          return true;
+      }
+    },
+    toggleExpansionPanel() {
+      if (!this.canExpand) {
+        return;
+      }
+
+      this.expanded = !this.expanded;
+    },
+    showExpansionPanel() {
+      if (!this.expanded) {
+        this.expanded = true;
+      }
+    },
+    hideExpansionPanel() {
+      if (this.expanded) {
+        this.expanded = false;
+      }
+    },
     onConfigUpdated(data) {
       if (!data || !data.config?.albumCategories) {
         return;
@@ -400,12 +552,14 @@ export default {
 
       const c = data.config.albumCategories;
 
-      this.categories = [{"value": "", "text": this.$gettext("All Categories")}];
+      this.categories = [{ value: "", text: this.$gettext("All Categories") }];
 
       if (c.length > 0) {
-        this.categories = this.categories.concat(c.map(cat => {
-          return {"value": cat, "text": cat};
-        }));
+        this.categories = this.categories.concat(
+          c.map((cat) => {
+            return { value: cat, text: cat };
+          })
+        );
       }
     },
     yearOptions() {
@@ -413,31 +567,160 @@ export default {
     },
     sortOrder() {
       const typeName = this.staticFilter?.type;
-      const keyName = "albums_order_"+typeName;
+      const keyName = "albums.order." + typeName;
       const queryParam = this.$route.query["order"];
-      const storedType = window.localStorage.getItem(keyName);
+      const storeOrder = appStorage.getItem(keyName);
 
       if (queryParam) {
-        window.localStorage.setItem(keyName, queryParam);
+        appStorage.setItem(keyName, queryParam);
         return queryParam;
-      } else if (storedType) {
-        return storedType;
+      } else if (storeOrder) {
+        return storeOrder;
       }
 
       return this.defaultOrder;
     },
+    sortReverse() {
+      return !!this.$route?.query["reverse"] && this.$route.query["reverse"] === "true";
+    },
     searchCount() {
-      const offset = parseInt(window.localStorage.getItem("albums_offset"));
+      if (this.restoring && this.restoreTargetCount > 0) {
+        const cap = Album.restoreCap(this.batchSize);
+        const desired = Math.max(this.batchSize, this.restoreTargetCount);
+        const buffered = desired + this.batchSize;
 
-      if(this.offset > 0 || !offset) {
+        if (cap > 0) {
+          return Math.min(cap, buffered);
+        }
+
+        return buffered;
+      }
+
+      const storedOffset = parseInt(appStorage.getItem("albums.offset"));
+
+      if (this.offset > 0 || !Number.isFinite(storedOffset) || storedOffset <= 0) {
         return this.batchSize;
       }
 
-      return offset + this.batchSize;
+      const cap = Album.restoreCap(this.batchSize);
+      const total = storedOffset + this.batchSize;
+
+      if (cap > 0) {
+        return Math.min(cap, total);
+      }
+
+      return total;
     },
     setOffset(offset) {
-      this.offset = offset;
-      window.localStorage.setItem("albums_offset", offset);
+      const value = Number.isFinite(Number(offset)) ? Number(offset) : 0;
+      this.offset = value;
+      appStorage.setItem("albums.offset", value);
+    },
+    buildRestoreKey() {
+      const staticFilter = JSON.stringify(this.staticFilter) || "";
+      const filter = JSON.stringify(this.filter) || "";
+      const parts = [this.$route?.name || "", this.view || "", staticFilter, filter];
+
+      return parts.join("|");
+    },
+    initRestoreState() {
+      this.restoreKey = this.buildRestoreKey();
+
+      if (!this.$view.wasBackwardNavigation()) {
+        this.restoreConsumed = false;
+        this.resetRestoreState();
+        return;
+      }
+
+      if (this.restoreConsumed) {
+        this.restoring = this.restorePending > 0;
+        return;
+      }
+
+      const state = this.$view.consumeRestoreState(this.restoreKey);
+      this.restoreConsumed = true;
+
+      if (!state || typeof state !== "object") {
+        this.resetRestoreState();
+        return;
+      }
+
+      const cap = Album.restoreCap(this.batchSize);
+      const count = Number(state.count);
+      const offset = Number(state.offset);
+
+      this.restoreTargetCount = Math.max(0, Number.isFinite(count) ? count : 0);
+
+      if (cap > 0 && this.restoreTargetCount > 0) {
+        this.restoreTargetCount = Math.min(cap, this.restoreTargetCount);
+      }
+
+      this.restorePending = this.restoreTargetCount;
+      this.restoring = this.restorePending > 0;
+
+      if (Number.isFinite(offset) && offset >= 0) {
+        this.setOffset(offset);
+      }
+    },
+    resetRestoreState() {
+      this.restoreTargetCount = 0;
+      this.restorePending = 0;
+      this.restoring = false;
+    },
+    finishRestore() {
+      if (this.restorePending > 0) {
+        return;
+      }
+
+      this.restorePending = 0;
+      this.restoring = false;
+
+      window.setTimeout(() => {
+        if (!this.$view.wasBackwardNavigation()) {
+          this.restoreConsumed = false;
+        }
+      }, 0);
+    },
+    ensureRestoreTarget() {
+      if (this.restorePending <= 0) {
+        this.finishRestore();
+        return;
+      }
+
+      if (this.scrollDisabled || this.$view.isHidden(this)) {
+        this.finishRestore();
+        return;
+      }
+
+      this.$nextTick(() => {
+        if (this.restorePending > 0) {
+          this.loadMore(true);
+        }
+      });
+    },
+    persistRestoreState() {
+      const key = this.buildRestoreKey();
+
+      if (!key) {
+        return false;
+      }
+
+      const hasResults = Array.isArray(this.results) && this.results.length > 0;
+
+      if (!hasResults) {
+        this.$view.clearRestoreState(key);
+        return false;
+      }
+
+      const scrollTop = window.scrollY ?? window.pageYOffset ?? 0;
+      const offset = Number.isFinite(this.offset) && this.offset > 0 ? this.offset : this.results.length;
+
+      return this.$view.saveRestoreState(key, {
+        filterKey: key,
+        count: this.results.length,
+        offset: offset,
+        scrollTop: Math.max(0, Math.round(scrollTop)),
+      });
     },
     share(album) {
       if (!album || !this.canShare) {
@@ -471,7 +754,15 @@ export default {
         return;
       }
 
-      Event.publish("dialog.upload");
+      // Pre-select manually managed album in upload dialog.
+      if (this.context === contexts.Album && this.selection && this.selection.length === 1) {
+        return this.model
+          .find(this.selection[0])
+          .then((m) => this.$event.publish("dialog.upload", { albums: [m] }))
+          .catch(() => this.$event.publish("dialog.upload", { albums: [] }));
+      } else {
+        this.$event.publish("dialog.upload", { albums: [] });
+      }
     },
     toggleLike(ev, index) {
       if (!this.canManage) {
@@ -515,7 +806,7 @@ export default {
         this.addSelection(models[i].getId());
       }
 
-      return (rangeEnd - rangeStart) + 1;
+      return rangeEnd - rangeStart + 1;
     },
     onEdit(ev, index) {
       if (!this.canManage) {
@@ -584,14 +875,40 @@ export default {
         }
       }
     },
-    loadMore() {
-      if (this.scrollDisabled) return;
+    loadMore(force = false) {
+      const restoring = this.restorePending > 0;
+
+      if (!force && (this.scrollDisabled || this.$view.isHidden(this))) {
+        return;
+      }
 
       this.scrollDisabled = true;
       this.listen = false;
 
-      const count = this.dirty ? (this.page + 2) * this.batchSize : this.batchSize;
-      const offset = this.dirty ? 0 : this.offset;
+      let count;
+      let offset;
+
+      if (this.dirty) {
+        count = (this.page + 2) * this.batchSize;
+        offset = 0;
+        this.resetRestoreState();
+      } else if (restoring) {
+        const cap = Album.restoreCap(this.batchSize);
+        const buffer = Math.min(this.batchSize, this.restorePending);
+        count = Math.min(cap, this.restorePending + buffer);
+        offset = this.results.length;
+      } else {
+        count = this.batchSize;
+        offset = this.offset;
+      }
+
+      if (!Number.isFinite(count) || count <= 0) {
+        count = this.batchSize;
+      }
+
+      if (!Number.isFinite(offset) || offset < 0) {
+        offset = 0;
+      }
 
       const params = {
         count: count,
@@ -604,34 +921,61 @@ export default {
         Object.assign(params, this.staticFilter);
       }
 
-      Album.search(params).then(resp => {
-        this.results = this.dirty ? resp.models : this.results.concat(resp.models);
+      if (offset === 0 && this.dirty) {
+        this.results = [];
+      }
 
-        this.scrollDisabled = (resp.count < resp.limit);
+      let shouldEnsureRestore = false;
 
-        if (this.scrollDisabled) {
-          this.setOffset(resp.offset);
+      Album.search(params)
+        .then((resp) => {
+          this.results = this.dirty || offset === 0 ? resp.models : this.results.concat(resp.models);
 
-          if (this.results.length > 1) {
-            this.$notify.info(this.$gettextInterpolate(this.$gettext("All %{n} albums loaded"), {n: this.results.length}));
-          }
-        } else {
-          this.setOffset(resp.offset + resp.limit);
-          this.page++;
+          this.scrollDisabled = resp.count < resp.limit;
 
-          this.$nextTick(() => {
-            if (this.$root.$el.clientHeight <= window.document.documentElement.clientHeight + 300) {
-              this.$emit("scrollRefresh");
+          const nextOffset = resp.offset + resp.limit;
+          this.setOffset(Number.isFinite(nextOffset) ? nextOffset : this.results.length);
+
+          if (this.scrollDisabled) {
+            if (this.results.length > 1) {
+              this.$notify.info(this.$gettext("All %{n} albums loaded", { n: this.results.length }));
             }
-          });
-        }
-      }).catch(() => {
-        this.scrollDisabled = false;
-      }).finally(() => {
-        this.dirty = false;
-        this.loading = false;
-        this.listen = true;
-      });
+          } else {
+            this.page++;
+
+            this.$nextTick(() => {
+              if (this.$root.$el.clientHeight <= window.document.documentElement.clientHeight + 300) {
+                this.loadMore();
+              }
+            });
+          }
+
+          if (restoring) {
+            this.restorePending = Math.max(0, this.restoreTargetCount - this.results.length);
+            this.restoring = this.restorePending > 0;
+            shouldEnsureRestore = this.restoring && !this.scrollDisabled;
+
+            if (!this.restoring) {
+              this.finishRestore();
+            }
+          }
+
+          this.$nextTick(() => this.persistRestoreState());
+        })
+        .catch(() => {
+          this.scrollDisabled = false;
+        })
+        .finally(() => {
+          this.dirty = false;
+          this.loading = false;
+          this.listen = true;
+
+          if (shouldEnsureRestore) {
+            this.ensureRestoreTarget();
+          } else if (!this.restoring) {
+            this.finishRestore();
+          }
+        });
     },
     updateSettings(props) {
       if (!props || typeof props !== "object" || props.target) {
@@ -650,7 +994,7 @@ export default {
             this.settings[key] = value;
         }
 
-        window.localStorage.setItem("albums_"+key, this.settings[key]);
+        appStorage.setItem("albums." + key, this.settings[key]);
       }
     },
     updateFilter(props) {
@@ -674,10 +1018,12 @@ export default {
     updateQuery(props) {
       this.updateFilter(props);
 
-      if (this.loading) return;
+      if (this.loading) {
+        return false;
+      }
 
       const query = {
-        view: this.settings.view
+        view: this.settings.view,
       };
 
       Object.assign(query, this.filter);
@@ -689,10 +1035,12 @@ export default {
       }
 
       if (JSON.stringify(this.$route.query) === JSON.stringify(query)) {
-        return;
+        return false;
       }
 
-      this.$router.replace({query: query});
+      this.$router.replace({ query: query });
+
+      return true;
     },
     searchParams() {
       const params = {
@@ -708,21 +1056,29 @@ export default {
 
       return params;
     },
+    reset() {
+      this.results = [];
+      this.resetRestoreState();
+      this.$view.clearRestoreState(this.buildRestoreKey());
+    },
     search() {
       /**
        * re-creating the last scroll-position should only ever happen when using
        * back-navigation. We therefore reset the remembered scroll-position
        * in any other scenario
        */
-      if (!window.backwardsNavigationDetected) {
+      const restoring = this.restoring && this.restoreTargetCount > 0;
+
+      if (!restoring && !this.$view.wasBackwardNavigation()) {
         this.setOffset(0);
+        this.resetRestoreState();
       }
 
       this.scrollDisabled = true;
 
       // Don't query the same data more than once
-      if (JSON.stringify(this.lastFilter) === JSON.stringify(this.filter)) {
-        this.$nextTick(() => this.$emit("scrollRefresh"));
+      if (!restoring && JSON.stringify(this.lastFilter) === JSON.stringify(this.filter)) {
+        // this.$nextTick(() => this.$emit("scrollRefresh"));
         return;
       }
 
@@ -735,44 +1091,89 @@ export default {
 
       const params = this.searchParams();
 
-      Album.search(params).then(resp => {
-        this.offset = resp.limit;
-        this.results = resp.models;
+      let shouldEnsureRestore = false;
 
-        this.scrollDisabled = (resp.count < resp.limit);
-
-        if (this.scrollDisabled) {
-          if (!this.results.length) {
-            this.$notify.warn(this.$gettext("No albums found"));
-          } else if (this.results.length === 1) {
-            this.$notify.info(this.$gettext("One album found"));
-          } else {
-            this.$notify.info(this.$gettextInterpolate(this.$gettext("%{n} albums found"), {n: this.results.length}));
+      Album.search(params)
+        .then((resp) => {
+          // Hide search toolbar expansion panel when matching albums were found.
+          if (this.offset === 0 && resp.count > 0) {
+            this.hideExpansionPanel();
           }
-        } else {
-          this.$notify.info(this.$gettext('More than 20 albums found'));
 
-          this.$nextTick(() => {
-            if (this.$root.$el.clientHeight <= window.document.documentElement.clientHeight + 300) {
-              this.$emit("scrollRefresh");
+          this.results = resp.models;
+
+          this.scrollDisabled = resp.count < resp.limit;
+
+          const nextOffset = resp.offset + resp.limit;
+          this.setOffset(Number.isFinite(nextOffset) ? nextOffset : this.results.length);
+
+          if (this.scrollDisabled) {
+            if (!this.results.length) {
+              this.$notify.warn(this.$gettext("No albums found"));
+            } else if (this.results.length === 1) {
+              this.$notify.info(this.$gettext("One album found"));
+            } else {
+              this.$notify.info(this.$gettext("%{n} albums found", { n: this.results.length }));
             }
-          });
-        }
-      }).finally(() => {
-        this.dirty = false;
-        this.loading = false;
-        this.listen = true;
-      });
+          } else {
+            this.$nextTick(() => {
+              if (this.$root.$el.clientHeight <= window.document.documentElement.clientHeight + 300) {
+                this.loadMore();
+              }
+            });
+          }
+
+          if (restoring) {
+            this.restorePending = Math.max(0, this.restoreTargetCount - this.results.length);
+            this.restoring = this.restorePending > 0;
+            shouldEnsureRestore = this.restoring && !this.scrollDisabled;
+
+            if (!this.restoring) {
+              this.finishRestore();
+            }
+          } else {
+            this.finishRestore();
+          }
+
+          this.$nextTick(() => this.persistRestoreState());
+        })
+        .catch(() => {
+          this.reset();
+        })
+        .finally(() => {
+          this.dirty = false;
+          this.loading = false;
+          this.listen = true;
+
+          if (shouldEnsureRestore) {
+            this.ensureRestoreTarget();
+          }
+        });
     },
     refresh(props) {
       this.updateSettings(props);
 
-      if (this.loading) return;
+      // Do not refresh results if the view is already loading
+      // or should not be listening for events.
+      if (this.loading || !this.listen) {
+        return;
+      }
 
-      this.loading = true;
-      this.page = 0;
+      this.resetRestoreState();
+
+      // Make sure enough results are loaded to maintain the scroll position.
+      if (this.page > 2) {
+        this.page = this.page - 1;
+      } else {
+        this.page = 1;
+      }
+
+      // Flag results as dirty to force a refresh.
       this.dirty = true;
+
+      // Enable infinite scrolling if it was disabled.
       this.scrollDisabled = false;
+
       this.loadMore();
     },
     create() {
@@ -780,10 +1181,10 @@ export default {
       let title = DateTime.local().toFormat("LLLL yyyy");
 
       // Add suffix if the album title already exists.
-      if (this.results.findIndex(a => a.Title.startsWith(title)) !== -1) {
-        const re = new RegExp(`${title} \\((\\d?)\\)`, 'i');
+      if (this.results.findIndex((a) => a.Title.startsWith(title)) !== -1) {
+        const re = new RegExp(`${title} \\((\\d?)\\)`, "i");
         let i = 1;
-        this.results.forEach(a => {
+        this.results.forEach((a) => {
           const found = a.Title.match(re);
           if (found && found.length > 0 && found[1]) {
             const n = parseInt(found[1]);
@@ -796,7 +1197,7 @@ export default {
         title = `${title} (${i + 1})`;
       }
 
-      const album = new Album({"Title": title, "Favorite": false});
+      const album = new Album({ Title: title, Favorite: false });
 
       album.save().then(() => this.$notify.success(this.$gettext("Album created")));
     },
@@ -808,7 +1209,7 @@ export default {
 
       if (pos === -1) {
         if (this.selection.length >= MaxItems) {
-          Notify.warn(this.$gettext("Can't select more items"));
+          $notify.warn(this.$gettext("Can't select more items"));
           return;
         }
 
@@ -824,7 +1225,7 @@ export default {
         this.lastId = "";
       } else {
         if (this.selection.length >= MaxItems) {
-          Notify.warn(this.$gettext("Can't select more items"));
+          $notify.warn(this.$gettext("Can't select more items"));
           return;
         }
 
@@ -844,6 +1245,76 @@ export default {
       this.selection.splice(0, this.selection.length);
       this.lastId = "";
     },
+    // refetchResults reloads the affected albums through the scoped
+    // search API and patches the loaded results in place, so a single
+    // edit costs one uid-filtered query instead of re-running the full
+    // album query. Larger batches fall back to the dirty flag and are
+    // refetched lazily on the next return-to-view.
+    refetchResults(uids) {
+      const affected = uids.filter((uid) => this.results.some((m) => m.UID === uid));
+
+      if (affected.length === 0) {
+        return;
+      }
+
+      if (affected.length > maxLiveRefetch) {
+        this.dirty = true;
+        return;
+      }
+
+      Album.search({ uid: affected.join("|"), count: affected.length })
+        .then((resp) => {
+          const found = new Set();
+
+          resp.models.forEach((values) => {
+            found.add(values.UID);
+
+            const model = this.results.find((m) => m.UID === values.UID);
+
+            if (model) {
+              for (let key in values) {
+                if (key !== "UID" && values.hasOwnProperty(key) && values[key] != null && typeof values[key] !== "object") {
+                  model[key] = values[key];
+                }
+              }
+            }
+          });
+
+          // Rows the scoped search no longer returns are not visible to
+          // this session anymore — drop them like a full refresh would.
+          affected
+            .filter((uid) => !found.has(uid))
+            .forEach((uid) => {
+              const index = this.results.findIndex((m) => m.UID === uid);
+
+              if (index >= 0) {
+                this.results.splice(index, 1);
+              }
+
+              this.removeSelection(uid);
+            });
+        })
+        .catch(() => {
+          this.dirty = true;
+        });
+    },
+    // insertCreated fetches newly created albums with a uid-filtered
+    // query and prepends those that match the current view type.
+    insertCreated(uids) {
+      if (uids.length === 0 || uids.length > maxLiveRefetch) {
+        return;
+      }
+
+      Album.search({ uid: uids.join("|"), count: uids.length, type: this.staticFilter.type })
+        .then((resp) => {
+          resp.models.forEach((m) => {
+            if (!this.results.some((existing) => existing.UID === m.UID)) {
+              this.results.unshift(m);
+            }
+          });
+        })
+        .catch(() => {});
+    },
     onUpdate(ev, data) {
       if (!this.listen) {
         console.log("albums.onUpdate currently not listening", ev, data);
@@ -853,35 +1324,17 @@ export default {
         return;
       }
 
-      const type = ev.split('.')[1];
+      const type = ev.split(".")[1];
 
       switch (type) {
-        case 'updated':
-          for (let i = 0; i < data.entities.length; i++) {
-            const values = data.entities[i];
-            const model = this.results.find((m) => m.UID === values.UID);
-
-            if (model) {
-              for (let key in values) {
-                if (values.hasOwnProperty(key) && values[key] != null && typeof values[key] !== "object") {
-                  model[key] = values[key];
-                }
-              }
-            }
-          }
-
-          let categories = [{"value": "", "text": this.$gettext("All Categories")}];
-
-          if (this.$config.albumCategories().length > 0) {
-            categories = categories.concat(this.$config.albumCategories().map(cat => {
-              return {"value": cat, "text": cat};
-            }));
-          }
-
-          this.categories = categories;
+        case ACTION_UPDATED:
+          // albums.updated is a lightweight UID-only signal that carries
+          // no entity fields; affected albums are reloaded through the
+          // scoped search API and patched in place.
+          this.refetchResults(data.entities);
 
           break;
-        case 'deleted':
+        case ACTION_DELETED:
           this.dirty = true;
 
           for (let i = 0; i < data.entities.length; i++) {
@@ -896,22 +1349,19 @@ export default {
           }
 
           break;
-        case 'created':
+        case ACTION_CREATED:
+          // albums.created carries only UIDs; fetch the new albums with a
+          // uid-filtered query and insert those matching the current view,
+          // so creation costs one small request instead of re-running the
+          // full album query.
           this.dirty = true;
+          this.insertCreated(data.entities);
 
-          for (let i = 0; i < data.entities.length; i++) {
-            const values = data.entities[i];
-            const index = this.results.findIndex((m) => m.UID === values.UID);
-
-            if (index === -1 && this.staticFilter.type === values.Type) {
-              this.results.unshift(new Album(values));
-            }
-          }
           break;
         default:
           console.warn("unexpected event type", ev);
       }
-    }
+    },
   },
 };
 </script>

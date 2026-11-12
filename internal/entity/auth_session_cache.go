@@ -1,57 +1,137 @@
 package entity
 
 import (
+	"errors"
 	"fmt"
 	"time"
 
 	gc "github.com/patrickmn/go-cache"
+	"gorm.io/gorm"
 
 	"github.com/photoprism/photoprism/internal/event"
 	"github.com/photoprism/photoprism/pkg/clean"
+	"github.com/photoprism/photoprism/pkg/log/status"
 	"github.com/photoprism/photoprism/pkg/rnd"
 )
 
-// Create a new session cache with an expiration time of 15 minutes.
-var sessionCacheExpiration = 15 * time.Minute
-var sessionCache = gc.New(sessionCacheExpiration, 5*time.Minute)
+// SessionNotFound reports whether err means that no active session matches the id, as opposed to a
+// failed database query.
+func SessionNotFound(err error) bool {
+	return errors.Is(err, ErrSessionIdInvalid) || errors.Is(err, ErrSessionNotFound) || errors.Is(err, ErrSessionExpired)
+}
 
-// FindSession returns an existing session or nil if not found.
+// SessionCacheDuration specifies how long sessions are cached.
+var SessionCacheDuration = 15 * time.Minute
+var sessionCache = gc.New(SessionCacheDuration, time.Minute)
+
+// FindSessionByAuthToken finds a session based on the auth token string or returns nil if it does not exist.
+func FindSessionByAuthToken(token string) (*Session, error) {
+	return FindSession(rnd.SessionID(token))
+}
+
+// FindSession finds a session based on the id string or returns an error if it does not exist. Sessions
+// issued for a specific audience, such as app access tokens, are only returned by FindAudienceSession.
 func FindSession(id string) (*Session, error) {
+	sess, err := FindAnySession(id)
+
+	if err == nil && sess.HasAudience() {
+		return &Session{}, ErrSessionNotFound
+	}
+
+	return sess, err
+}
+
+// FindAudienceSession finds a session that has no audience or was issued for the specified audience.
+func FindAudienceSession(id, audience string) (*Session, error) {
+	sess, err := FindAnySession(id)
+
+	if err == nil && sess.HasAudience() && sess.AuthAudience != audience {
+		return &Session{}, ErrSessionNotFound
+	}
+
+	return sess, err
+}
+
+// FindAnySession finds a session based on the id string regardless of its audience, e.g. to revoke it.
+func FindAnySession(id string) (*Session, error) {
+	generation := CurrentAuthCacheGeneration()
 	found := &Session{}
 
-	// Valid id?
 	if !rnd.IsSessionID(id) {
-		return found, fmt.Errorf("id %s is invalid", clean.LogQuote(id))
+		return found, ErrSessionIdInvalid
 	}
 
 	// Find the session in the cache with a fallback to the database.
 	if cacheData, ok := sessionCache.Get(id); ok && cacheData != nil {
 		if cached := cacheData.(*Session); !cached.Expired() {
-			cached.LastActive = UnixTime()
+			// Set session activity timestamp, also update the last_active column in the sessions table if it is new.
+			cached.UpdateLastActive(cached.LastActive <= 0)
 			return cached, nil
 		} else if err := cached.Delete(); err != nil {
-			event.AuditErr([]string{cached.IP(), "session %s", "failed to delete after expiration", "%s"}, cached.RefID, err)
+			event.AuditErr([]string{cached.IP(), "session %s", "failed to delete after expiration", status.Error(err)}, cached.RefID)
 		}
-	} else if res := Db().First(&found, "id = ?", id); res.RecordNotFound() {
-		return found, fmt.Errorf("not found")
+	} else if res := Db().First(&found, "id = ?", id); errors.Is(res.Error, gorm.ErrRecordNotFound) {
+		return found, ErrSessionNotFound
 	} else if res.Error != nil {
 		return found, res.Error
 	} else if !rnd.IsSessionID(found.ID) {
-		return found, fmt.Errorf("has invalid id %s", clean.LogQuote(found.ID))
+		return found, fmt.Errorf("%w %s", ErrSessionIdInvalid, clean.LogQuote(found.ID))
 	} else if !found.Expired() {
-		found.UpdateLastActive()
-		CacheSession(found, sessionCacheExpiration)
+		found.cacheGeneration = &generation
+		found.stored = true
+		// Set session activity timestamp and update the last_active column in the sessions table.
+		found.UpdateLastActive(true)
+
+		// Cache the session only with its client and owner resolved, or with a client that no longer exists.
+		if err := found.resolveClient(); err == nil || errors.Is(err, ErrClientNotFound) {
+			CacheSession(found, SessionCacheDuration)
+		}
+
 		return found, nil
 	} else if err := found.Delete(); err != nil {
-		event.AuditErr([]string{found.IP(), "session %s", "failed to delete after expiration", "%s"}, found.RefID, err)
+		event.AuditErr([]string{found.IP(), "session %s", "failed to delete after expiration", status.Error(err)}, found.RefID)
 	}
 
-	return found, fmt.Errorf("expired")
+	return found, ErrSessionExpired
 }
 
-// FlushSessionCache resets the session cache.
+// FlushSessionCache resets session and WebDAV authentication caches.
 func FlushSessionCache() {
+	authCacheState.Lock()
+	defer authCacheState.Unlock()
+
+	authCacheState.version++
+	authCacheState.flushed = authCacheState.version
+	clear(authCacheState.users)
+	clear(authCacheState.deleted)
 	sessionCache.Flush()
+	webDAVUserCache.Flush()
+}
+
+// FlushUserSessionCache evicts cached sessions and WebDAV credentials for one user.
+// Persisted credentials and other users' cache entries are left unchanged.
+func FlushUserSessionCache(userUID string) {
+	if userUID == "" {
+		return
+	}
+
+	authCacheState.Lock()
+	defer authCacheState.Unlock()
+
+	authCacheState.version++
+	authCacheState.users[userUID] = authCacheState.version
+
+	for key, item := range sessionCache.Items() {
+		if sess, ok := item.Object.(*Session); ok && sess != nil && sess.UserUID == userUID {
+			sessionCache.Delete(key)
+		}
+	}
+
+	for key, item := range webDAVUserCache.Items() {
+		if user, ok := item.Object.(*User); ok && user != nil && user.UserUID == userUID {
+			webDAVUserCache.Delete(key)
+		}
+	}
 }
 
 // CacheSession adds a session to the cache if its ID is valid.
@@ -62,47 +142,27 @@ func CacheSession(s *Session, d time.Duration) {
 		return
 	}
 
-	if d == 0 {
-		d = sessionCacheExpiration
+	authCacheState.Lock()
+	defer authCacheState.Unlock()
+
+	if s.cacheGeneration == nil {
+		// Unbound database records may be cached before their user is resolved.
+		if s.user != nil {
+			return
+		}
+		s.cacheGeneration = &AuthCacheGeneration{version: authCacheState.version, at: time.Now()}
 	}
-
-	if s.PreviewToken != "" {
-		PreviewToken.Set(s.PreviewToken, s.ID)
-	}
-
-	if s.DownloadToken != "" {
-		DownloadToken.Set(s.DownloadToken, s.ID)
-	}
-
-	sessionCache.Set(s.ID, s, d)
-}
-
-// DeleteSession permanently deletes a session.
-func DeleteSession(s *Session) error {
-	if s == nil {
-		return nil
-	} else if !rnd.IsSessionID(s.ID) {
-		return fmt.Errorf("invalid session id")
-	}
-
-	DeleteFromSessionCache(s.ID)
-
-	if s.PreviewToken != "" {
-		PreviewToken.Set(s.PreviewToken, s.ID)
-	}
-
-	if s.DownloadToken != "" {
-		DownloadToken.Set(s.DownloadToken, s.ID)
-	}
-
-	return UnscopedDb().Delete(s).Error
-}
-
-// DeleteFromSessionCache deletes a session from the cache.
-func DeleteFromSessionCache(id string) {
-	if id == "" {
+	if !s.cacheGeneration.valid(s.UserUID) || s.cacheGeneration.sessionDeleted(s.ID) {
 		return
 	}
 
-	sessionCache.Delete(id)
+	if d == 0 {
+		d = SessionCacheDuration
+	}
+
+	if s.PreviewToken != "" {
+		PreviewToken.Set(s.ID, s.PreviewToken)
+	}
+
+	sessionCache.Set(s.ID, s, d)
 }

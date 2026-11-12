@@ -2,9 +2,11 @@ package thumb
 
 import (
 	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
 	"github.com/photoprism/photoprism/pkg/fs"
 )
@@ -15,7 +17,7 @@ func TestPng(t *testing.T) {
 	for _, ext := range formats {
 		t.Run(ext, func(t *testing.T) {
 			src := "testdata/example." + ext
-			dst := "testdata/example." + ext + fs.ExtPNG
+			dst := "testdata/example." + ext + fs.ExtPng
 
 			assert.NoFileExists(t, dst)
 
@@ -37,7 +39,7 @@ func TestPng(t *testing.T) {
 		})
 		t.Run("OrientationFlipH", func(t *testing.T) {
 			src := "testdata/example." + ext
-			dst := "testdata/example." + ext + fs.ExtPNG
+			dst := "testdata/example." + ext + fs.ExtPng
 
 			assert.NoFileExists(t, dst)
 
@@ -59,7 +61,7 @@ func TestPng(t *testing.T) {
 		})
 		t.Run("OrientationFlipV", func(t *testing.T) {
 			src := "testdata/example." + ext
-			dst := "testdata/example." + ext + fs.ExtPNG
+			dst := "testdata/example." + ext + fs.ExtPng
 
 			assert.NoFileExists(t, dst)
 
@@ -81,7 +83,7 @@ func TestPng(t *testing.T) {
 		})
 		t.Run("OrientationRotate90", func(t *testing.T) {
 			src := "testdata/example." + ext
-			dst := "testdata/example." + ext + fs.ExtPNG
+			dst := "testdata/example." + ext + fs.ExtPng
 
 			assert.NoFileExists(t, dst)
 
@@ -103,7 +105,7 @@ func TestPng(t *testing.T) {
 		})
 		t.Run("OrientationRotate180", func(t *testing.T) {
 			src := "testdata/example." + ext
-			dst := "testdata/example." + ext + fs.ExtPNG
+			dst := "testdata/example." + ext + fs.ExtPng
 
 			assert.NoFileExists(t, dst)
 
@@ -125,7 +127,7 @@ func TestPng(t *testing.T) {
 		})
 		t.Run("OrientationTranspose", func(t *testing.T) {
 			src := "testdata/example." + ext
-			dst := "testdata/example." + ext + fs.ExtPNG
+			dst := "testdata/example." + ext + fs.ExtPng
 
 			assert.NoFileExists(t, dst)
 
@@ -147,7 +149,7 @@ func TestPng(t *testing.T) {
 		})
 		t.Run("OrientationTransverse", func(t *testing.T) {
 			src := "testdata/example." + ext
-			dst := "testdata/example." + ext + fs.ExtPNG
+			dst := "testdata/example." + ext + fs.ExtPng
 
 			assert.NoFileExists(t, dst)
 
@@ -169,7 +171,7 @@ func TestPng(t *testing.T) {
 		})
 		t.Run("OrientationUnspecified", func(t *testing.T) {
 			src := "testdata/example." + ext
-			dst := "testdata/example." + ext + fs.ExtPNG
+			dst := "testdata/example." + ext + fs.ExtPng
 
 			assert.NoFileExists(t, dst)
 
@@ -191,7 +193,7 @@ func TestPng(t *testing.T) {
 		})
 		t.Run("OrientationNormal", func(t *testing.T) {
 			src := "testdata/example." + ext
-			dst := "testdata/example." + ext + fs.ExtPNG
+			dst := "testdata/example." + ext + fs.ExtPng
 
 			assert.NoFileExists(t, dst)
 
@@ -211,9 +213,9 @@ func TestPng(t *testing.T) {
 				t.Fatal(err)
 			}
 		})
-		t.Run("invalid orientation", func(t *testing.T) {
+		t.Run("InvalidOrientation", func(t *testing.T) {
 			src := "testdata/example." + ext
-			dst := "testdata/example." + ext + fs.ExtPNG
+			dst := "testdata/example." + ext + fs.ExtPng
 
 			assert.NoFileExists(t, dst)
 
@@ -235,7 +237,7 @@ func TestPng(t *testing.T) {
 		})
 	}
 
-	t.Run("foo", func(t *testing.T) {
+	t.Run("Foo", func(t *testing.T) {
 		src := "testdata/example.foo"
 		dst := "testdata/example.foo.png"
 
@@ -250,5 +252,56 @@ func TestPng(t *testing.T) {
 		}
 
 		assert.Error(t, err)
+	})
+	t.Run("MalformedTiffIfdOffset", func(t *testing.T) {
+		src := filepath.Join(t.TempDir(), "evil.tiff")
+		dst := filepath.Join(t.TempDir(), "evil.png")
+		payload := []byte{0x49, 0x49, 0x2a, 0x00, 0xff, 0xff, 0xff, 0xff}
+		require.NoError(t, os.WriteFile(src, payload, fs.ModeFile))
+
+		img, err := Png(src, dst, OrientationNormal)
+
+		assert.NoFileExists(t, dst)
+		assert.Nil(t, img)
+		assert.Error(t, err)
+	})
+	t.Run("MalformedBigEndianTiffIfdOffset", func(t *testing.T) {
+		src := filepath.Join(t.TempDir(), "evil-mm.tiff")
+		dst := filepath.Join(t.TempDir(), "evil-mm.png")
+		payload := []byte{0x4d, 0x4d, 0x00, 0x2a, 0xff, 0xff, 0xff, 0xff}
+		require.NoError(t, os.WriteFile(src, payload, fs.ModeFile))
+
+		img, err := Png(src, dst, OrientationNormal)
+
+		assert.NoFileExists(t, dst)
+		assert.Nil(t, img)
+		assert.Error(t, err)
+	})
+	t.Run("TruncatedTiffBody", func(t *testing.T) {
+		src := filepath.Join(t.TempDir(), "truncated.tiff")
+		dst := filepath.Join(t.TempDir(), "truncated.png")
+		payload := []byte{0x49, 0x49, 0x2a, 0x00, 0x08, 0x00, 0x00, 0x00, 0x00}
+		require.NoError(t, os.WriteFile(src, payload, fs.ModeFile))
+
+		img, err := Png(src, dst, OrientationNormal)
+
+		assert.NoFileExists(t, dst)
+		assert.Nil(t, img)
+		require.Error(t, err)
+	})
+	t.Run("BadIccProfileSurvivesPngConversion", func(t *testing.T) {
+		// The vipsConvert PNG path (used for vector → PNG and other
+		// format conversions) must recover when libpng rejects a malformed
+		// iCCP chunk by retrying without the broken profile.
+		src := "testdata/icc_profile_bad_length.jpg"
+		dst := filepath.Join(t.TempDir(), "icc_profile_bad_length.jpg.png")
+
+		img, err := Png(src, dst, OrientationNormal)
+
+		if err != nil {
+			t.Fatal(err)
+		}
+		assert.FileExists(t, dst)
+		assert.NotNil(t, img)
 	})
 }

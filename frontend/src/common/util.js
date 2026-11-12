@@ -1,6 +1,6 @@
 /*
 
-Copyright (c) 2018 - 2023 PhotoPrism UG. All rights reserved.
+Copyright (c) 2018 - 2026 PhotoPrism UG. All rights reserved.
 
     This program is free software: you can redistribute it and/or modify
     it under Version 3 of the GNU Affero General Public License (the "AGPL"):
@@ -13,7 +13,7 @@ Copyright (c) 2018 - 2023 PhotoPrism UG. All rights reserved.
 
     The AGPL is supplemented by our Trademark and Brand Guidelines,
     which describe how our Brand Assets may be used:
-    <https://www.photoprism.app/trademark>
+    <https://www.photoprism.app/trademark/>
 
 Feel free to send an email to hello@photoprism.app if you have questions,
 want to support our work, or just want to say hello.
@@ -23,6 +23,15 @@ Additional information can be found in our Developer Guide:
 
 */
 
+import { $config } from "app/session";
+import sanitizeHtml from "sanitize-html";
+import { DateTime } from "luxon";
+import { $gettext } from "common/gettext";
+import $notify from "common/notify";
+import * as media from "common/media";
+import * as can from "common/can";
+import * as formats from "options/formats";
+
 const Nanosecond = 1;
 const Microsecond = 1000 * Nanosecond;
 const Millisecond = 1000 * Microsecond;
@@ -31,12 +40,184 @@ const Minute = 60 * Second;
 const Hour = 60 * Minute;
 let start = new Date();
 
-export default class Util {
-  static fps(fps) {
-    return `${fps.toFixed(1)} FPS`;
+// List of characters used in the values returned by generateToken.
+const tokenAlphabet = "abcdefghijklmnopqrstuvwxyz0123456789";
+export const tokenRegexp = /^[a-z0-9]{7}$/;
+export const tokenLength = 7;
+
+const sanitizeHtmlOptions = Object.freeze({
+  allowedTags: [
+    "a",
+    "b",
+    "blockquote",
+    "br",
+    "code",
+    "div",
+    "em",
+    "h1",
+    "h2",
+    "h3",
+    "h4",
+    "h5",
+    "h6",
+    "i",
+    "li",
+    "ol",
+    "p",
+    "span",
+    "strong",
+    "sub",
+    "sup",
+    "u",
+    "ul",
+  ],
+  allowedAttributes: {
+    a: ["href", "target", "rel", "dir"],
+    span: ["dir"],
+  },
+  allowedSchemes: ["http", "https", "mailto"],
+  allowProtocolRelative: false,
+  parseStyleAttributes: false,
+  transformTags: {
+    a: (tagName, attribs) => {
+      const nextAttribs = { ...attribs };
+
+      if (nextAttribs.target === "_blank") {
+        nextAttribs.rel = "noopener noreferrer";
+      }
+
+      return { tagName, attribs: nextAttribs };
+    },
+  },
+});
+
+// True if debug logs should be created.
+const debug = window.__CONFIG__?.debug || window.__CONFIG__?.trace;
+
+export default class $util {
+  // normalizeTitle returns the dedup-comparison form of a user-typed identifier:
+  // lowercased, `&` → `and`, non-letter/digit/emoji runs collapsed to single
+  // spaces and trimmed. Emoji sequences (ZWJ, skin tone, regional indicators)
+  // are preserved so emoji-only titles round-trip.
+  static normalizeTitle(s) {
+    if (s === null || s === undefined) {
+      return "";
+    }
+    return (
+      String(s)
+        .toLowerCase()
+        .replace(/&/g, "and")
+        // ZWJ (U+200D), VS-15/16 (U+FE0E/F), and the keycap combining mark (U+20E3) sit in this
+        // class on purpose so composite emoji sequences survive normalization; eslint flags them as
+        // a "misleading character class" because they only carry meaning when paired with the
+        // pictographic ranges already listed above.
+        // eslint-disable-next-line no-misleading-character-class
+        .replace(/[^\p{L}\p{N}\p{Extended_Pictographic}\p{Emoji_Component}\p{Regional_Indicator}\p{Emoji_Modifier}\u200d\ufe0e\ufe0f\u20e3 ]+/gu, " ")
+        .replace(/\s+/g, " ")
+        .trim()
+    );
+  }
+  static slugifyLabelTitle(s) {
+    if (s === null || s === undefined) {
+      return "";
+    }
+    return String(s)
+      .toLowerCase()
+      .replace(/&/g, "and")
+      .replace(/[^a-z0-9]+/g, "-")
+      .replace(/-+/g, "-")
+      .replace(/^-|-$/g, "");
   }
 
-  static duration(d) {
+  // formatBytes returns a human-readable size string for a byte count.
+  static formatBytes(b) {
+    if (!b) {
+      return "0 KB";
+    }
+
+    if (typeof b === "string") {
+      b = Number.parseFloat(b);
+    }
+
+    if (b >= 1073741824) {
+      const gb = b / 1073741824;
+      return gb.toFixed(1) + " GB";
+    } else if (b >= 1048576) {
+      const mb = b / 1048576;
+      return mb.toFixed(1) + " MB";
+    }
+
+    return Math.ceil(b / 1024) + " KB";
+  }
+
+  // gigaBytes converts bytes to the nearest whole number of gigabytes.
+  static gigaBytes(b) {
+    if (!b) {
+      return 0;
+    }
+
+    if (typeof b === "string") {
+      b = Number.parseFloat(b);
+    }
+
+    return Math.round(b / 1073741824);
+  }
+
+  // formatDate renders an ISO-8601 string using the configured display format.
+  static formatDate(s, format, zone) {
+    if (!s || !s.length) {
+      return s;
+    }
+
+    const l = s.length;
+
+    if (l !== 20 || s[l - 1] !== "Z") {
+      return s;
+    }
+
+    let options;
+
+    switch (format) {
+      case "date_med":
+      case "DATE_MED":
+        options = formats.DATE_MED;
+        break;
+      case "datetime_med":
+      case "DATETIME_MED":
+        options = formats.DATETIME_MED;
+        break;
+      case "date_med_tz":
+      case "DATE_MED_TZ":
+      case "datetime_med_tz":
+      case "DATETIME_MED_TZ":
+        options = formats.DATETIME_MED_TZ;
+        break;
+      case "date_full":
+      case "DATE_FULL":
+      case "datetime_full":
+      case "DATETIME_FULL":
+        options = formats.DATETIME_LONG;
+        break;
+      case "date_full_tz":
+      case "datetime_full_tz":
+      case "DATE_FULL_TZ":
+      case "DATETIME_FULL_TZ":
+        options = formats.DATETIME_LONG_TZ;
+        break;
+      default:
+        options = formats.DATETIME_LONG;
+        break;
+    }
+
+    if (!zone) {
+      zone = "UTC";
+    }
+
+    return DateTime.fromISO(s, { zone }).toLocaleString(options);
+  }
+
+  // formatDuration formats a duration expressed in nanoseconds as h:mm:ss.
+  static formatDuration(d) {
     let u = d;
 
     let neg = d < 0;
@@ -69,8 +250,13 @@ export default class Util {
     let min = Math.floor(u / Minute) % 60;
     let sec = Math.ceil(u / Second) % 60;
 
-    result.push(h.toString().padStart(2, "0"));
-    result.push(min.toString().padStart(2, "0"));
+    if (h && h > 0) {
+      result.push(h.toString());
+      result.push(min.toString().padStart(2, "0"));
+    } else {
+      result.push(min.toString());
+    }
+
     result.push(sec.toString().padStart(2, "0"));
 
     // return `${h}h${min}m${sec}s`
@@ -78,6 +264,46 @@ export default class Util {
     return result.join(":");
   }
 
+  // formatSeconds turns a number of seconds into m:ss text.
+  static formatSeconds(time) {
+    if (!time || time < 0) {
+      return "0:00";
+    }
+
+    let sec = time % 60;
+    let min = Math.floor((time - sec) / 60);
+
+    return `${min.toString()}:${sec.toString().padStart(2, "0")}`;
+  }
+
+  // formatRemainingSeconds returns the remaining playback time in m:ss.
+  static formatRemainingSeconds(time, duration) {
+    if (!duration || (time && time >= duration - 0.00001)) {
+      return "0:00";
+    } else if (!time || time < 0) {
+      return this.formatSeconds(Math.ceil(duration));
+    }
+
+    return this.formatSeconds(Math.ceil(duration - Math.floor(time)));
+  }
+
+  // formatNs converts nanoseconds to a localized millisecond string.
+  static formatNs(d) {
+    if (!d || Number.isNaN(d)) {
+      return "";
+    }
+
+    const ms = Math.round(d / 1000000).toLocaleString();
+
+    return `${ms} ms`;
+  }
+
+  // formatFPS formats a floating frames-per-second value.
+  static formatFPS(fps) {
+    return `${fps.toFixed(1)} FPS`;
+  }
+
+  // arabicToRoman converts decimal numbers to Roman numerals.
   static arabicToRoman(number) {
     let roman = "";
     const romanNumList = {
@@ -96,8 +322,9 @@ export default class Util {
       I: 1,
     };
     let a;
-    if (number < 1 || number > 3999) return "";
-    else {
+    if (number < 1 || number > 3999) {
+      return "";
+    } else {
       for (let key in romanNumList) {
         a = Math.floor(number / romanNumList[key]);
         if (a >= 0) {
@@ -112,6 +339,61 @@ export default class Util {
     return roman;
   }
 
+  // stripBidiControls removes C0 and C1 controls, DEL, line and paragraph separators, and explicit bidi
+  // controls from a name before it is displayed, since isolating an element does not neutralize them.
+  static stripBidiControls(s) {
+    if (typeof s !== "string" || s === "") {
+      return s;
+    }
+
+    // eslint-disable-next-line no-control-regex
+    return s.replace(/[\u0000-\u001f\u007f-\u009f\u061c\u200e\u200f\u2028-\u202e\u2066-\u2069]/g, "");
+  }
+
+  // balanceBidi prepares a title or name for an isolated element while keeping its bidi marks: CRLF becomes
+  // LF, other paragraph separators a space, unmatched isolate terminators are removed, and isolates are closed
+  // before each line break, which ends a paragraph where white space is preserved.
+  static balanceBidi(s) {
+    // eslint-disable-next-line no-control-regex
+    if (typeof s !== "string" || !/[\r\u001c-\u001e\u0085\u2029\u2066-\u2069]/.test(s)) {
+      return s;
+    }
+
+    let open = 0;
+    let result = "";
+
+    // eslint-disable-next-line no-control-regex
+    for (const c of s.replace(/\r\n/g, "\n").replace(/[\r\u001c-\u001e\u0085\u2029]/g, " ")) {
+      if (c === "\n") {
+        result += "\u2069".repeat(open);
+        open = 0;
+      } else if (c === "\u2069") {
+        if (open === 0) {
+          continue;
+        }
+
+        open--;
+      } else if (c >= "\u2066" && c <= "\u2068") {
+        open++;
+      }
+
+      result += c;
+    }
+
+    return result + "\u2069".repeat(open);
+  }
+
+  // isolate wraps a title or name in first-strong isolate characters for single-line strings that cannot
+  // contain an isolating element, such as messages and the document title.
+  static isolate(s) {
+    if (typeof s !== "string" || s === "") {
+      return s;
+    }
+
+    return "\u2068" + $util.balanceBidi(s).replace(/\n/g, " ") + "\u2069";
+  }
+
+  // truncate shortens a string and appends an ellipsis when it exceeds length.
   static truncate(str, length, ending) {
     if (length == null) {
       length = 100;
@@ -126,25 +408,87 @@ export default class Util {
     }
   }
 
-  static encodeHTML(text) {
-    return text
-      .replace(/&/g, "&amp;")
-      .replace(/</g, "&lt;")
-      .replace(/>/g, "&gt;")
-      .replace(/"/g, "&quot;")
-      .replace(/'/g, "&#x27;");
+  // sanitizeHtml removes unsafe markup using the shared sanitizer.
+  static sanitizeHtml(html) {
+    if (!html) {
+      return "";
+    }
+
+    return sanitizeHtml(html, sanitizeHtmlOptions);
   }
 
+  // openUrl opens a URL in a new tab if possible.
+  static openUrl(url) {
+    if (!url) {
+      return;
+    }
+
+    const newWindow = window.open(url, "_blank");
+
+    if (newWindow) {
+      newWindow.focus();
+    }
+  }
+
+  // openExternalUrl opens a URL with noopener/noreferrer safeguards.
+  static openExternalUrl(externalUrl) {
+    if (!externalUrl) {
+      return;
+    }
+
+    const newWindow = window.open(externalUrl, "_blank", "noopener,noreferrer");
+
+    if (newWindow) {
+      newWindow.focus();
+    }
+  }
+
+  // encodeHTML escapes HTML and links plain URLs.
+  static encodeHTML(text) {
+    const linkRegex = /(https?:\/\/)[-a-zA-Z0-9@:%._+~#=]{1,256}\.[a-zA-Z0-9()]{1,6}\b([-a-zA-Z0-9()@:%_+.~#?&;/=]*)/g;
+
+    function linkFunc(matched) {
+      if (!matched) {
+        return "";
+      }
+
+      // Strip query parameters for added security and shorter links.
+      matched = matched.split("?")[0];
+
+      // Ampersand characters (&) should generally be ok in the link URL (though it should already be stripped as it may only be part of the query).
+      let url = matched.replace(/&amp;/g, "&");
+
+      // Make sure the URL uses "https://".
+      if (url.startsWith("http://")) {
+        url = "https://" + url.substring(7);
+      }
+
+      // Return HTML link markup.
+      return `<a href="${url}" target="_blank" rel="noopener noreferrer" dir="ltr">${matched}</a>`;
+    }
+
+    // Escape HTML control characters.
+    text = text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&apos;");
+
+    // Make URLs clickable.
+    text = text.replace(linkRegex, linkFunc);
+
+    return text;
+  }
+
+  // resetTimer restarts the internal duration stopwatch.
   static resetTimer() {
     start = new Date();
   }
 
+  // logTime logs elapsed time since the last reset under the given label.
   static logTime(label) {
     const now = new Date();
     console.log(`${label}: ${now.getTime() - start.getTime()}ms`);
     start = now;
   }
 
+  // capitalize uppercases the first letter of every word in a string.
   static capitalize(s) {
     if (!s || s === "") {
       return "";
@@ -153,24 +497,85 @@ export default class Util {
     return s.replace(/\w\S*/g, (w) => w.replace(/^\w/, (c) => c.toUpperCase()));
   }
 
-  static generateToken() {
-    return (Math.random() + 1).toString(36).substring(6);
+  // ucFirst uppercases the first character of a string.
+  static ucFirst(s) {
+    if (!s || s === "") {
+      return "";
+    }
+
+    return s.charAt(0).toUpperCase() + s.slice(1);
   }
 
+  // generateToken returns a short random identifier for non-critical use.
+  static generateToken() {
+    let result = "";
+    for (let i = 0; i < tokenLength; i++) {
+      result += tokenAlphabet.charAt(Math.floor(Math.random() * tokenAlphabet.length));
+    }
+    return result;
+  }
+
+  // hasTouch reports whether the device supports touch input.
+  static hasTouch() {
+    if (!navigator.maxTouchPoints) {
+      return false;
+    }
+
+    return navigator.maxTouchPoints > 0;
+  }
+
+  // shouldOpenOnHover reports whether menus should open on hover: the user's UI
+  // preference (default on) gated by the device having no touch input.
+  static shouldOpenOnHover() {
+    return ($config.getSettings()?.ui?.openOnHover ?? true) && !$util.hasTouch();
+  }
+
+  // mapAnimateDuration returns the map fly-to animation duration in milliseconds, forcing 0
+  // (no animation) when the Reduce Motion accessibility setting is enabled. A non-negative
+  // overrideMs takes precedence over the global Maps.Animate preference.
+  static mapAnimateDuration(settings, overrideMs = -1) {
+    if (settings?.ui?.reduceMotion) {
+      return 0;
+    }
+
+    if (overrideMs >= 0) {
+      return overrideMs;
+    }
+
+    return settings?.maps?.animate ?? 0;
+  }
+
+  // isMobile returns true when the current user agent or touch capability indicates a mobile device.
+  // The `> 2` touch check covers iPads in desktop mode, where the user agent omits the mobile hint.
+  static isMobile() {
+    return /Android|webOS|iPhone|iPad|iPod|BlackBerry|Mobile|IEMobile|Opera Mini/i.test(navigator?.userAgent) || navigator?.maxTouchPoints > 2;
+  }
+
+  // isHttps returns true when the current page is served over HTTPS.
+  static isHttps() {
+    return window.location.protocol === "https:";
+  }
+
+  // fileType maps a file extension or codec to a readable label.
   static fileType(value) {
     if (!value || typeof value !== "string") {
       return "";
     }
 
     switch (value) {
+      case "pdf":
+        return "PDF";
       case "jpg":
         return "JPEG";
-      case "jxl":
+      case media.FormatJpegXL:
         return "JPEG XL";
+      case "cin":
+        return "Kodak Cineon";
       case "raw":
         return "Unprocessed Sensor Data (RAW)";
       case "mov":
       case "qt":
+      case "qt  ":
         return "Apple QuickTime";
       case "bmp":
         return "Bitmap";
@@ -182,37 +587,78 @@ export default class Util {
         return "TIFF";
       case "psd":
         return "Adobe Photoshop";
+      case "mpo":
+        return "Stereoscopic JPEG (3D)";
+      case "insp":
+        return "Insta360 Panoramic";
+      case "thm":
+        return "Thumbnail";
       case "gif":
         return "GIF";
       case "dng":
         return "Adobe Digital Negative";
-      case "avc":
-      case "avc1":
+      case media.CodecAvc1:
+      case media.FormatAvc:
         return "Advanced Video Coding (AVC) / H.264";
-      case "avif":
+      case media.CodecAvc3:
+        return "Advanced Video Coding (AVC) Bitstream";
+      case media.FormatAv1:
         return "AOMedia Video 1 (AV1)";
+      case "avif":
+        return "AV1 Image File Format (AVIF)";
       case "avifs":
         return "AVIF Image Sequence";
-      case "hevc":
+      case "heic":
+      case "heif":
+        return "High Efficiency Image Container (HEIC)";
+      case "heics":
+      case "heifs":
+        return "HEIC Image Sequence";
+      case "hev":
       case "hvc":
-      case "hvc1":
+      case media.CodecHvc1:
+      case media.FormatHvc:
         return "High Efficiency Video Coding (HEVC) / H.265";
+      case media.CodecHev1:
+      case media.FormatHev:
+        return "High Efficiency Video Coding (HEVC) Bitstream";
+      case media.FormatEvc:
+      case media.CodecEvc1:
+        return "Essential Video Coding (MPEG-5 Part 1)";
+      case media.FormatVvc:
+      case media.CodecVvc1:
+        return "Versatile Video Coding (VVC) / H.266";
+      case media.FormatMp4:
+        return "MPEG-4 Multimedia Container";
       case "m4v":
         return "Apple iTunes Multimedia Container";
+      case "insv":
+        return "Insta360";
+      case "lrv":
+        return "Insta360 Proxy";
       case "mkv":
         return "Matroska Multimedia Container";
       case "mts":
         return "Advanced Video Coding High Definition (AVCHD)";
+      case "m2t":
       case "m2ts":
-        return "Blu-ray MPEG-2 Transport Stream";
+        return "MPEG-2 Transport Stream (M2TS)";
       case "webp":
         return "Google WebP";
-      case "webm":
+      case media.FormatWebm:
         return "Google WebM";
+      case media.CodecVp08:
+      case media.FormatVp8:
+        return "Google VP8";
+      case media.CodecVp09:
+      case media.FormatVp9:
+        return "Google VP9";
       case "flv":
         return "Flash";
       case "mpg":
         return "MPEG";
+      case "mp2":
+        return "MPEG-2 (H.262)";
       case "mjpg":
         return "Motion JPEG";
       case "ogg":
@@ -220,21 +666,113 @@ export default class Util {
         return "Ogg Media";
       case "wmv":
         return "Windows Media";
+      case "asf":
+        return "Advanced Systems Format (ASF)";
+      case "avi":
+        return "Microsoft Audio Video Interleave (AVI)";
+      case "dv":
+        return "DV";
+      case "mxf":
+        return "Material Exchange Format (MXF)";
+      case "3gp":
+        return "Mobile Multimedia Container (3G)";
+      case "3g2":
+        return "Mobile Multimedia Container (CDMA2000)";
       case "svg":
-        return "Scalable Vector Graphics";
-      case "pdf":
-        return "Portable Document Format";
+        return "SVG";
       case "ai":
         return "Adobe Illustrator";
       case "ps":
         return "Adobe PostScript";
       case "eps":
-        return "Encapsulated PostScript";
+        return "EPS";
+      case "xmp":
+        return "Adobe XMP";
+      case "aae":
+        return "Apple Image Edits";
       default:
         return value.toUpperCase();
     }
   }
 
+  // formatCamera builds a camera display name from metadata fallbacks.
+  static formatCamera(camera, cameraID, cameraMake, cameraModel, long) {
+    if (camera) {
+      if (!long && camera.Model.length > 7) {
+        // Return only the model name if it is longer than 7 characters.
+        return camera.Model;
+      } else {
+        // Return the full camera name with make and model.
+        return camera.Make + " " + camera.Model;
+      }
+    } else if (cameraMake && cameraModel) {
+      if (!long && cameraModel.length > 7) {
+        // Return only the model name if it is longer than 7 characters.
+        return cameraModel;
+      } else {
+        // Return the full camera name with make and model.
+        return cameraMake + " " + cameraModel;
+      }
+    } else if (cameraID > 1 && cameraModel) {
+      return cameraModel;
+    } else if (cameraID > 1 && cameraMake) {
+      return cameraMake;
+    }
+
+    // Return a placeholder string for unknown cameras.
+    if (long) {
+      return $gettext("Unknown");
+    }
+
+    return "";
+  }
+
+  // formatCodec normalizes codec identifiers to short labels.
+  static formatCodec(codec) {
+    if (!codec) {
+      return "";
+    }
+
+    switch (codec) {
+      case media.CodecAv1C:
+      case media.CodecAv1:
+        return "AV1";
+      case media.CodecAvc1:
+      case media.CodecAvc3:
+      case media.CodecAvc4:
+      case media.FormatAvc:
+        return "AVC";
+      case "hvc":
+      case media.CodecHev1:
+      case media.FormatHev:
+      case media.CodecHvc1:
+      case media.FormatHvc:
+        return "HEVC";
+      case media.CodecVvc1:
+      case media.FormatVvc:
+        return "VVC";
+      case media.CodecEvc1:
+      case media.FormatEvc:
+        return "EVC";
+      case media.FormatWebm:
+        return "WebM";
+      case media.CodecVp08:
+      case media.FormatVp8:
+        return "VP8";
+      case media.CodecVp09:
+      case media.FormatVp9:
+        return "VP9";
+      case media.FormatM2TS:
+        return "M2TS";
+      case "extended webp":
+      case media.FormatWebp:
+        return "WebP";
+      default:
+        return codec.toUpperCase();
+    }
+  }
+
+  // codecName expands codec identifiers to descriptive names.
   static codecName(value) {
     if (!value || typeof value !== "string") {
       return "";
@@ -245,16 +783,30 @@ export default class Util {
         return "Unprocessed Sensor Data (RAW)";
       case "mov":
       case "qt":
+      case "qt  ":
         return "Apple QuickTime (MOV)";
       case "avc":
-      case "avc1":
+      case media.CodecAvc1:
         return "Advanced Video Coding (AVC) / H.264";
-      case "hevc":
+      case media.CodecAvc3:
+        return "Advanced Video Coding (AVC) Bitstream";
       case "hvc":
-      case "hvc1":
+      case "hev":
+      case media.CodecHvc1:
+      case media.FormatHvc:
         return "High Efficiency Video Coding (HEVC) / H.265";
-      case "vvc":
+      case media.CodecHev1:
+      case media.FormatHev:
+        return "High Efficiency Video Coding (HEVC) Bitstream";
+      case media.FormatVvc:
+      case media.CodecVvc1:
         return "Versatile Video Coding (VVC) / H.266";
+      case media.FormatEvc:
+      case media.CodecEvc1:
+        return "Essential Video Coding (MPEG-5 Part 1)";
+      case "av1":
+      case "av1c":
+      case "av1C":
       case "av01":
         return "AOMedia Video 1 (AV1)";
       case "gif":
@@ -263,8 +815,13 @@ export default class Util {
         return "Matroska Multimedia Container (MKV)";
       case "webp":
         return "Google WebP";
+      case "extended webp":
+        return "Extended WebP";
       case "webm":
         return "Google WebM";
+      case "m2t":
+      case "m2ts":
+        return "MPEG-2 Transport Stream (M2TS)";
       case "mpeg":
         return "Moving Picture Experts Group (MPEG)";
       case "mjpg":
@@ -279,6 +836,8 @@ export default class Util {
         return "High Efficiency Image Container (HEIC)";
       case "heics":
         return "HEIC Image Sequence";
+      case media.FormatJpegXL:
+        return "JPEG XL";
       case "1":
         return "Uncompressed";
       case "2":
@@ -382,44 +941,270 @@ export default class Util {
     }
   }
 
-  static async copyToMachineClipboard(text) {
-    if (window.navigator.clipboard) {
-      await window.navigator.clipboard.writeText(text);
-    } else if (document.execCommand) {
-      // Clipboard is available only in HTTPS pages. see https://web.dev/async-clipboard/
-      // So if the the official 'clipboard' doesn't supported and the 'document.execCommand' is supported.
-      // copy by a work-around by creating a textarea in the DOM and execute copy command from him.
-
-      // Create the text area element (to copy from)
-      const clipboardElement = document.createElement("textarea");
-
-      // Set the text content to copy
-      clipboardElement.value = text;
-
-      // Avoid scrolling to bottom
-      clipboardElement.style.top = "0";
-      clipboardElement.style.left = "0";
-      clipboardElement.style.position = "fixed";
-
-      // Add element to DOM
-      document.body.appendChild(clipboardElement);
-
-      // "Select" the new textarea
-      clipboardElement.focus();
-      clipboardElement.select();
-
-      // Copy the selected textarea content
-      const succeed = document.execCommand("copy");
-
-      // Remove the textarea from DOM
-      document.body.removeChild(clipboardElement);
-
-      // Validate operation succeed
-      if (!succeed) {
-        throw new Error("Failed copying to clipboard");
-      }
-    } else {
-      throw new Error("Copy to clipboard does not support in your browser");
+  // typeName returns the localized label for a media type value
+  // (the same `value` field used by options/options.js#PhotoTypes).
+  // Returns `defaultValue` (or the empty string) for unknown / missing
+  // types so callers can fall back to a generic label like "File".
+  static typeName(type, defaultValue) {
+    switch (type) {
+      case media.Image:
+        return $gettext("Image");
+      case media.Raw:
+        return $gettext("Raw");
+      case media.Live:
+        return $gettext("Live");
+      case media.Video:
+        return $gettext("Video");
+      case media.Audio:
+        return $gettext("Audio");
+      case media.Animated:
+        return $gettext("Animated");
+      case media.Vector:
+        return $gettext("Vector");
+      case media.Document:
+        return $gettext("Document");
+      case media.Sidecar:
+        return $gettext("Sidecar");
+      default:
+        return defaultValue !== undefined ? defaultValue : "";
     }
+  }
+
+  // sourceName returns the localized label for a metadata source.
+  static sourceName(src, defaultValue) {
+    switch (src) {
+      case null:
+      case false:
+      case undefined:
+      case "":
+      case "auto":
+        return defaultValue ? defaultValue : $gettext("Auto");
+      case "default":
+        return $gettext("Default");
+      case "estimate":
+        return $gettext("Estimate");
+      case "file":
+        return $gettext("File");
+      case "modified":
+        return $gettext("Modified");
+      case "name":
+        return $gettext("Name");
+      case "image":
+        return $gettext("Image");
+      case "location":
+        return $gettext("Location");
+      case "marker":
+        return $gettext("Marker");
+      case "ollama":
+        return "Ollama";
+      case "openai":
+        return "OpenAI";
+      case "caption":
+        return $gettext("Caption");
+      case "keyword":
+        return $gettext("Keyword");
+      case "meta":
+        return $gettext("Metadata");
+      case "subject":
+        return $gettext("Subject");
+      case "title":
+        return $gettext("Title");
+      case "xmp":
+        return "XMP";
+      case "batch":
+        return $gettext("Batch");
+      case "manual":
+        return $gettext("Manual");
+      case "vision":
+        return $gettext("Vision");
+      case "admin":
+        return $gettext("Admin");
+      default:
+        return this.ucFirst(src);
+    }
+  }
+
+  // thumb selects the best matching thumbnail for the current viewport.
+  static thumb(thumbs, viewportWidth, viewportHeight) {
+    const sizes = $config.values.thumbs;
+
+    if (!sizes || !thumbs || typeof thumbs !== "object") {
+      return {
+        src: `${$config.staticUri}/img/404.jpg`,
+        w: 1280,
+        h: 720,
+        size: "fit_1280",
+      };
+    }
+
+    for (let i = 0; i < sizes.length; i++) {
+      const t = thumbs[sizes[i].size];
+
+      if (t && (t.w >= viewportWidth || t.h >= viewportHeight)) {
+        return Object.assign({}, sizes[i], t);
+      }
+    }
+
+    let fallback = sizes[sizes.length - 1];
+
+    if (!fallback?.size || !thumbs[fallback.size]) {
+      fallback = sizes[0];
+    }
+
+    return Object.assign({}, fallback, thumbs[fallback.size]);
+  }
+
+  // thumbSize returns the most suitable thumbnail size identifier for the viewport.
+  static thumbSize(viewportWidth, viewportHeight) {
+    const sizes = $config.values.thumbs;
+
+    for (let i = 0; i < sizes.length; i++) {
+      let t = sizes[i];
+
+      if (t.w >= viewportWidth || t.h >= viewportHeight) {
+        return t.size;
+      }
+    }
+
+    const largest = sizes[sizes.length - 1];
+
+    if (largest?.size) {
+      return largest?.size;
+    }
+
+    return "fit_720";
+  }
+
+  // videoFormat chooses the preferred download format for the supplied codec info.
+  static videoFormat(codec, mime) {
+    if ((!codec && !mime) || mime?.startsWith('video/mp4; codecs="avc')) {
+      return media.FormatAvc;
+    } else if (can.useMp4Hvc && (codec === media.CodecHvc1 || mime?.startsWith('video/mp4; codecs="hvc'))) {
+      return media.FormatHvc; // HEVC video with parameter sets not in the Samples
+    } else if (can.useMp4Hev && (codec === media.CodecHev1 || mime?.startsWith('video/mp4; codecs="hev'))) {
+      return media.FormatHev; // HEVC video with parameter sets also in the Samples, won't play on macOS
+    } else if (can.useMp4Vvc && (codec === media.CodecVvc1 || mime?.startsWith('video/mp4; codecs="vvc'))) {
+      return media.FormatVvc;
+    } else if (can.useMp4Evc && (codec === media.CodecEvc1 || mime?.startsWith('video/mp4; codecs="evc'))) {
+      return media.FormatEvc;
+    } else if (can.useVP8 && (codec === media.CodecVp08 || mime?.startsWith('video/mp4; codecs="vp8'))) {
+      return media.FormatVp8;
+    } else if (can.useVP9 && (codec === media.CodecVp09 || mime?.startsWith('video/mp4; codecs="vp09'))) {
+      return media.FormatVp9;
+    } else if (can.useMp4Av1 && (mime?.startsWith('video/mp4; codecs="av01') || mime?.startsWith("video/AV1"))) {
+      return media.FormatAv1;
+    } else if (can.useWebmAv1 && mime?.startsWith('video/webm; codecs="av01')) {
+      return media.FormatWebmAv1;
+    } else if (can.useMkvAv1 && mime?.startsWith('video/matroska; codecs="av01')) {
+      return media.FormatMkvAv1;
+    } else if (can.useWebM && (codec === media.FormatWebm || mime === media.ContentTypeWebm)) {
+      return media.FormatWebm;
+    } else if (can.useTheora && (codec === media.CodecTheora || mime === media.ContentTypeOgg)) {
+      return media.FormatTheora;
+    }
+
+    return media.FormatAvc;
+  }
+
+  // videoFormatUrl builds the signed video URL for a specific format.
+  static videoFormatUrl(hash, format) {
+    if (!hash) {
+      return "";
+    }
+
+    if (!format) {
+      format = media.FormatAvc;
+    }
+
+    return `${$config.videoUri}/videos/${hash}/${$config.previewToken}/${format}`;
+  }
+
+  // videoUrl resolves the best playable video URL for given codec hints.
+  static videoUrl(hash, codec, mime) {
+    return this.videoFormatUrl(hash, this.videoFormat(codec, mime));
+  }
+
+  // pdfUrl builds the inline PDF URL for a file hash. The bytes are served by the
+  // session-scoped /files/<hash>/file.pdf endpoint; pdf.js authenticates the request via the
+  // X-Auth-Token header (see loadPdfDocument), so no token is needed in the path.
+  static pdfUrl(hash) {
+    if (!hash) {
+      return "";
+    }
+
+    return `${$config.apiUri}/files/${hash}/file.pdf`;
+  }
+
+  // videoContentType returns the HTTP content type matching the chosen video format.
+  static videoContentType(codec, mime) {
+    switch (this.videoFormat(codec, mime)) {
+      case media.FormatAvc:
+        return media.ContentTypeMp4AvcMain;
+      case media.FormatHvc:
+        return media.ContentTypeMp4HvcMain;
+      case media.FormatHev:
+        return media.ContentTypeMp4HevMain;
+      case media.FormatVvc:
+        return media.ContentTypeMp4Vvc;
+      case media.FormatVp8:
+        return media.ContentTypeWebmVp8;
+      case media.FormatVp9:
+        return media.ContentTypeWebmVp9;
+      case media.FormatWebmAv1:
+        return media.ContentTypeWebmAv1Main10;
+      case media.FormatMkvAv1:
+        return media.ContentTypeMkvAv1Main10;
+      case media.FormatWebm:
+        return media.ContentTypeWebm;
+      case media.FormatTheora:
+        return media.ContentTypeOgg;
+      default:
+        return "video/mp4";
+    }
+  }
+
+  // copyText copies text (and optional extras) to the clipboard.
+  static copyText(text) {
+    if (!text) {
+      if (debug) {
+        console.warn("clipboard: missing text");
+      }
+
+      return false;
+    }
+
+    // Join additional text arguments, if any.
+    for (let i = 1; i < arguments.length; i++) {
+      if (typeof arguments[i] === "string" && arguments[i].length > 0) {
+        text += " " + arguments[i];
+      }
+    }
+
+    return this.writeToClipboard(text);
+  }
+
+  // writeToClipboard writes the provided string using the Clipboard API or shows errors.
+  static writeToClipboard(text) {
+    if (window.navigator?.clipboard && window.navigator.clipboard instanceof EventTarget) {
+      window.navigator.clipboard
+        .writeText(text)
+        .then(() => {
+          $notify.success($gettext("Copied to clipboard"));
+        })
+        .catch((err) => {
+          if (debug && err) {
+            console.error("clipboard:", err);
+          }
+
+          $notify.error($gettext("Cannot copy to clipboard"));
+        });
+      return true;
+    } else if (debug) {
+      console.warn("clipboard: window.navigator.clipboard is not an instance of EventTarget");
+    }
+
+    $notify.warn($gettext("Cannot copy to clipboard"));
+
+    return false;
   }
 }

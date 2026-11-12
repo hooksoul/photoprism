@@ -3,56 +3,76 @@ package thumb
 import (
 	"fmt"
 	"image"
+	"image/jpeg"
+	"io"
 	"os"
 	"path/filepath"
 
-	"github.com/disintegration/imaging"
+	"github.com/mandykoh/prism/meta"
 	"github.com/mandykoh/prism/meta/autometa"
 
 	"github.com/photoprism/photoprism/pkg/clean"
-	"github.com/photoprism/photoprism/pkg/colors"
+	"github.com/photoprism/photoprism/pkg/media/colors"
 )
 
+// decodeImage opens an image and decodes its color metadata.
+func decodeImage(reader io.ReadSeeker, logName string) (metaData *meta.Data, img image.Image, err error) {
+	// The geometry is validated before the pixel data is read, so an image is only decoded at
+	// a resolution the configured limit allows.
+	if err = checkJpegPixels(reader, logName); err != nil {
+		return nil, nil, err
+	}
+
+	// Read color metadata.
+	metaData, imgReader, err := autometa.Load(reader)
+
+	if err == nil {
+		img, err = jpeg.Decode(imgReader)
+		return metaData, img, err
+	}
+
+	// Log color metadata read error.
+	log.Infof("thumb: %s in %s (read color metadata)", err, logName)
+
+	// Seek to the file start in order to avoid decoding errors,
+	// see https://github.com/photoprism/photoprism/issues/3843
+	if _, err = reader.Seek(0, io.SeekStart); err != nil {
+		log.Errorf("thumb: %s in %s (seek to file start)", err, logName)
+	}
+
+	// Decode image file.
+	img, err = jpeg.Decode(reader)
+
+	return metaData, img, err
+}
+
 // OpenJpeg loads a JPEG image from disk, rotates it, and converts the color profile if necessary.
-func OpenJpeg(fileName string, orientation int) (result image.Image, err error) {
+func OpenJpeg(fileName string, orientation int) (image.Image, error) {
 	if fileName == "" {
-		return result, fmt.Errorf("filename missing")
+		return nil, fmt.Errorf("filename missing")
 	}
 
 	logName := clean.Log(filepath.Base(fileName))
 
 	// Open file.
-	fileReader, err := os.Open(fileName)
-
+	fileReader, err := os.Open(fileName) //nolint:gosec // fileName is provided by caller and validated earlier
 	if err != nil {
-		return result, err
+		return nil, err
 	}
-
 	defer fileReader.Close()
 
 	// Reset file offset.
 	// see https://github.com/golang/go/issues/45902#issuecomment-1007953723
-	_, err = fileReader.Seek(0, 0)
-
-	if err != nil {
-		return result, fmt.Errorf("%s on seek", err)
+	if _, err := fileReader.Seek(0, 0); err != nil {
+		return nil, fmt.Errorf("%s on seek", err)
 	}
 
-	// Read color metadata.
-	md, imgStream, err := autometa.Load(fileReader)
+	// Decode image incl color metadata.
+	md, img, err := decodeImage(fileReader, logName)
 
-	// Decode image.
-	var img image.Image
-
+	// Ok?
 	if err != nil {
-		log.Warnf("thumb: %s in %s (read color metadata)", err, logName)
-		img, err = imaging.Decode(fileReader)
-	} else {
-		img, err = imaging.Decode(imgStream)
-	}
-
-	if err != nil {
-		return result, fmt.Errorf("%s while decoding", err)
+		return nil, fmt.Errorf("%w while decoding", err)
 	}
 
 	// Read ICC profile and convert colors if possible.
@@ -62,8 +82,7 @@ func OpenJpeg(fileName string, orientation int) (result image.Image, err error) 
 			log.Tracef("thumb: %s has no color profile", logName)
 		} else if profile, err := iccProfile.Description(); err == nil && profile != "" {
 			log.Tracef("thumb: %s has color profile %s", logName, clean.Log(profile))
-			switch {
-			case colors.ProfileDisplayP3.Equal(profile):
+			if colors.ProfileDisplayP3.Equal(profile) {
 				img = colors.ToSRGB(img, colors.ProfileDisplayP3)
 			}
 		}

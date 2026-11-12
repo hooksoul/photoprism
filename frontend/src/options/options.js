@@ -1,21 +1,101 @@
 import { timeZonesNames } from "@vvo/tzdb";
-import { $gettext } from "common/vm";
+import { $gettext } from "common/gettext";
 import { Info } from "luxon";
-import { config } from "app/session";
-import {
-  MediaImage,
-  MediaLive,
-  MediaVideo,
-  MediaAnimated,
-  MediaVector,
-  MediaRaw,
-} from "model/photo";
+import { $config } from "app/session";
+import countries from "./countries.json";
+import * as media from "common/media";
+import * as locales from "../locales";
 
-export const TimeZones = () =>
+export const Deleted = {
+  ID: -1,
+  String: "deleted",
+  Label: () => {
+    return $gettext("deleted");
+  },
+  Placeholder: () => {
+    return "<" + $gettext("deleted") + ">";
+  },
+};
+
+export const Mixed = {
+  ID: -2,
+  String: "mixed",
+  Label: () => {
+    return $gettext("mixed");
+  },
+  Placeholder: () => {
+    return "<" + $gettext("mixed") + ">";
+  },
+};
+
+// Batch returns a copy of the supplied options array and prepends a localized
+// "mixed" placeholder when `mixed` is true so form controls can display that
+// state without mutating the original items.
+export const Batch = (items, mixed) => {
+  if (!items.length) {
+    return [];
+  }
+
+  if (mixed) {
+    let result;
+
+    if (items[0].Code) {
+      result = [{ Code: Mixed.ID, Name: Mixed.Placeholder() }];
+    } else if (items[0].ID) {
+      result = [{ ID: Mixed.ID, Name: Mixed.Placeholder() }];
+    } else if (Number.isInteger(items[0].value)) {
+      result = [{ value: Mixed.ID, text: Mixed.Placeholder() }];
+    } else {
+      result = [{ value: Mixed.String, text: Mixed.Placeholder() }];
+    }
+
+    result.unshift(...items);
+    return result;
+  }
+
+  return items;
+};
+
+// Countries returns the country options, with a localized name for the "zz" code.
+export const Countries = () => {
+  return countries.map((c) => (c.Code === "zz" ? { ...c, Name: $gettext("Unknown") } : c));
+};
+
+export const GmtOffsets = [
+  { ID: "GMT", Name: "Etc/GMT" },
+  { ID: "UTC+1", Name: "UTC+01:00" },
+  { ID: "UTC+2", Name: "UTC+02:00" },
+  { ID: "UTC+3", Name: "UTC+03:00" },
+  { ID: "UTC+4", Name: "UTC+04:00" },
+  { ID: "UTC+5", Name: "UTC+05:00" },
+  { ID: "UTC+6", Name: "UTC+06:00" },
+  { ID: "UTC+7", Name: "UTC+07:00" },
+  { ID: "UTC+8", Name: "UTC+08:00" },
+  { ID: "UTC+9", Name: "UTC+09:00" },
+  { ID: "UTC+10", Name: "UTC+10:00" },
+  { ID: "UTC+11", Name: "UTC+11:00" },
+  { ID: "UTC+12", Name: "UTC+12:00" },
+  { ID: "UTC-1", Name: "UTC-01:00" },
+  { ID: "UTC-2", Name: "UTC-02:00" },
+  { ID: "UTC-3", Name: "UTC-03:00" },
+  { ID: "UTC-4", Name: "UTC-04:00" },
+  { ID: "UTC-5", Name: "UTC-05:00" },
+  { ID: "UTC-6", Name: "UTC-06:00" },
+  { ID: "UTC-7", Name: "UTC-07:00" },
+  { ID: "UTC-8", Name: "UTC-08:00" },
+  { ID: "UTC-9", Name: "UTC-09:00" },
+  { ID: "UTC-10", Name: "UTC-10:00" },
+  { ID: "UTC-11", Name: "UTC-11:00" },
+  { ID: "UTC-12", Name: "UTC-12:00" },
+];
+
+export const TimeZones = (defaultName) =>
   [
+    { ID: "Local", Name: defaultName ? defaultName : $gettext("Local") },
     { ID: "UTC", Name: "UTC" },
-    { ID: "", Name: $gettext("Local Time") },
-  ].concat(timeZonesNames);
+  ]
+    .concat(timeZonesNames)
+    .concat(GmtOffsets);
 
 export const Days = () => {
   let result = [];
@@ -29,12 +109,16 @@ export const Days = () => {
   return result;
 };
 
-export const Years = () => {
+export const Years = (start) => {
+  if (!start) {
+    start = 1000;
+  }
+
   let result = [];
 
   const currentYear = new Date().getUTCFullYear();
 
-  for (let i = currentYear; i >= 1750; i--) {
+  for (let i = currentYear; i >= start; i--) {
     result.push({ value: i, text: i.toString().padStart(4, "0") });
   }
 
@@ -46,11 +130,11 @@ export const Years = () => {
 export const IndexedYears = () => {
   let result = [];
 
-  if (config.values.years) {
-    for (let i = 0; i < config.values.years.length; i++) {
+  if ($config.values.years) {
+    for (let i = 0; i < $config.values.years.length; i++) {
       result.push({
-        value: parseInt(config.values.years[i]),
-        text: config.values.years[i].toString(),
+        value: parseInt($config.values.years[i]),
+        text: $config.values.years[i].toString(),
       });
     }
   }
@@ -86,182 +170,107 @@ export const MonthsShort = () => {
   return result;
 };
 
+// Specifies the default language locale.
+export let DefaultLocale = "en";
+
+// Change the default language locale.
+export const SetDefaultLocale = (locale) => {
+  if (!locale || locale === DefaultLocale) {
+    return;
+  }
+
+  // Clears the previous default, so a locale that is not offered resolves to the first offered one.
+  DefaultLocale = "";
+  DefaultLocale = FindLocale(locale);
+};
+
 // Available locales sorted by region and alphabet.
-export const Languages = () => [
-  {
-    text: "English", // English
-    translated: "English",
-    value: "en",
-  },
-  {
-    text: "Afrikaans", // Afrikaans (South Africa)
-    value: "af",
-  },
-  {
-    text: "Bahasa Indonesia", // Bahasa Indonesia
-    value: "id",
-  },
-  {
-    text: "Català", // Catalan
-    value: "ca",
-  },
-  {
-    text: "Čeština", // Czech
-    value: "cs",
-  },
-  {
-    text: "Dansk", // Danish
-    value: "da",
-  },
-  {
-    text: "Deutsch", // German
-    value: "de",
-  },
-  {
-    text: "Eesti", // Estonian
-    value: "et",
-  },
-  {
-    text: "Español", // Spanish
-    value: "es",
-  },
-  {
-    text: "Euskara", // Basque
-    value: "eu",
-  },
-  {
-    text: "Français", // French
-    value: "fr",
-  },
-  {
-    text: "Ελληνικά", // Greek
-    value: "el",
-  },
-  {
-    text: "עברית", // Hebrew
-    value: "he",
-    rtl: true,
-  },
-  {
-    text: "Hrvatski", // Croatian
-    value: "hr",
-  },
-  {
-    text: "Lietuvis", // Lithuanian
-    value: "lt",
-  },
-  {
-    text: "Magyar", // Hungarian
-    value: "hu",
-  },
-  {
-    text: "Melayu", // Malay
-    value: "ms",
-  },
-  {
-    text: "Norsk (Bokmål)", // Norwegian
-    value: "nb",
-  },
-  {
-    text: "Italiano", // Italian
-    value: "it",
-  },
-  {
-    text: "Nederlands", // Dutch
-    value: "nl",
-  },
-  {
-    text: "Polski", // Polish
-    value: "pl",
-  },
-  {
-    text: "Português", // Portuguese (Portugal)
-    value: "pt",
-  },
-  {
-    text: "Português do Brasil", // Portuguese (Brazil)
-    value: "pt_BR",
-  },
-  {
-    text: "Slovenčina", // Slovak
-    value: "sk",
-  },
-  {
-    text: "Slovenščina", // Slovene
-    value: "sl",
-  },
-  {
-    text: "Suomi", // Finnish
-    value: "fi",
-  },
-  {
-    text: "Svenska", // Swedish
-    value: "sv",
-  },
-  {
-    text: "Română", // Romanian
-    value: "ro",
-  },
-  {
-    text: "Türk", // Turkish
-    value: "tr",
-  },
-  {
-    text: "عربى", // Arabic
-    value: "ar",
-    rtl: true,
-  },
-  {
-    text: "کوردی", // Kurdish
-    value: "ku",
-    rtl: true,
-  },
-  {
-    text: "Беларуская", // Belarusian
-    value: "be",
-  },
-  {
-    text: "Български", // Bulgarian
-    value: "bg",
-  },
-  {
-    text: "Українська", // Ukrainian
-    value: "uk",
-  },
-  {
-    text: "Русский", // Russian
-    value: "ru",
-  },
-  {
-    text: "简体中文", // Chinese (Simplified)
-    value: "zh",
-  },
-  {
-    text: "繁體中文", // Chinese (Traditional)
-    value: "zh_TW",
-  },
-  {
-    text: "日本語", // Japanese
-    value: "ja_JP",
-  },
-  {
-    text: "한국어", // Korean
-    value: "ko",
-  },
-  {
-    text: "हिन्दी", // Hindi
-    value: "hi",
-  },
-  {
-    text: "ภาษาไทย", // Thai
-    value: "th",
-  },
-  {
-    text: "فارسی", // Persian
-    value: "fa",
-    rtl: true,
-  },
+export const Languages = () => (window.__LOCALES__ ? window.__LOCALES__ : locales.Options);
+
+// Returns the language name (text) and locale (value) to use when no other choice is available.
+export const FallbackLanguage = () => {
+  if (locales?.Options?.length > 0) {
+    return locales.Options[0];
+  }
+
+  return { text: "English", value: "en" };
+};
+
+// Finds the best matching language by locale, or else the default language if offered, or else the first one.
+// Reads DefaultLocale directly, since SetDefaultLocale resolves its value through this function.
+export const FindLanguage = (locale) => {
+  if (!locale || locale.length < 2) {
+    locale = DefaultLocale;
+  }
+
+  let found;
+  const code = locale.substring(0, 2).toLowerCase();
+  const languages = Languages();
+
+  if (locale.length > 4) {
+    const region = locale.substring(3, 5).toUpperCase();
+    const exact = `${code}_${region}`;
+    found = languages.findLast((l) => l.value === exact || l.value === code);
+  } else {
+    found = languages.findLast((l) => l.value === code);
+  }
+
+  if (found) {
+    return found;
+  } else if (languages.length > 0) {
+    return languages.find((l) => l.value === DefaultLocale) ?? languages[0];
+  } else {
+    return locales.Options[0];
+  }
+};
+
+// Returns the fallback locale to use when no other choice is available.
+export const FallbackLocale = () => {
+  return FallbackLanguage().value;
+};
+
+// Finds the best matching language locale based on the specified locale;
+export const FindLocale = (locale) => {
+  if (!locale) {
+    return DefaultLocale;
+  }
+
+  const language = FindLanguage(locale);
+
+  if (language) {
+    return language.value;
+  }
+
+  return FallbackLocale();
+};
+
+export const ItemsPerPage = () => [
+  { text: "10", title: "10", value: 10 },
+  { text: "20", title: "20", value: 20 },
+  { text: "50", title: "50", value: 50 },
+  { text: "100", title: "100", value: 100 },
 ];
+
+export const StartPages = (features, isPortal) => {
+  if (isPortal) {
+    return [{ value: "default", text: $gettext("Default"), visible: true }];
+  }
+  return [
+    { value: "default", text: $gettext("Default"), visible: true },
+    { value: "browse", text: $gettext("Search"), props: { disabled: !features?.library } },
+    { value: "albums", text: $gettext("Albums"), props: { disabled: !features?.albums } },
+    { value: "media", text: $gettext("Media"), props: { disabled: !features?.videos } },
+    { value: "videos", text: $gettext("Videos"), props: { disabled: !features?.videos } },
+    { value: "people", text: $gettext("People"), props: { disabled: !(features?.people && features?.edit) } },
+    { value: "favorites", text: $gettext("Favorites"), props: { disabled: !features?.favorites } },
+    { value: "places", text: $gettext("Places"), props: { disabled: !features?.places } },
+    { value: "calendar", text: $gettext("Calendar"), props: { disabled: !features?.calendar } },
+    { value: "moments", text: $gettext("Moments"), props: { disabled: !features?.moments } },
+    { value: "labels", text: $gettext("Labels"), props: { disabled: !features?.labels } },
+    { value: "folders", text: $gettext("Folders"), props: { disabled: !features?.folders } },
+    { value: "settings", text: $gettext("Settings"), props: { disabled: !features?.settings } },
+  ];
+};
 
 export const MapsAnimate = () => [
   {
@@ -282,61 +291,90 @@ export const MapsAnimate = () => [
   },
 ];
 
-export const MapsStyle = () => [
-  {
-    text: $gettext("Default"),
-    value: "",
-  },
-  {
-    text: $gettext("Low Resolution"),
-    value: "offline",
-  },
-  {
-    text: $gettext("Streets"),
-    value: "streets",
-    sponsor: true,
-  },
-  {
-    text: $gettext("Satellite"),
-    value: "hybrid",
-    sponsor: true,
-  },
-  {
-    text: $gettext("Outdoor"),
-    value: "outdoor",
-    sponsor: true,
-  },
-  {
-    text: $gettext("Topographic"),
-    value: "topographique",
-    sponsor: true,
-  },
-];
+// MapsStyle returns the selectable map styles.
+// Styles that require a MapTiler API key are omitted unless mapKey is true.
+export const MapsStyle = (experimental, mapKey = true) => {
+  const styles = [
+    {
+      title: $gettext("Default"),
+      value: "default",
+      style: "default",
+    },
+    {
+      title: $gettext("Streets"),
+      value: "streets",
+      style: "streets-v2",
+      sponsor: true,
+    },
+    {
+      title: $gettext("Hybrid"),
+      value: "hybrid",
+      style: "414c531c-926d-4164-a057-455a215c0eee",
+      sponsor: true,
+    },
+    {
+      title: $gettext("Satellite"),
+      value: "satellite",
+      style: "0195eda5-6f09-7acd-8520-ab103fc75810",
+      sponsor: true,
+    },
+    {
+      title: $gettext("Outdoor"),
+      value: "outdoor",
+      style: "outdoor-v2",
+      sponsor: true,
+    },
+    {
+      title: $gettext("Terrain"),
+      value: "topographique",
+      style: "topo-v2",
+      sponsor: true,
+    },
+  ];
+
+  if (experimental) {
+    styles.push({
+      title: $gettext("Offline"),
+      value: "low-resolution",
+      style: "low-resolution",
+    });
+  }
+
+  return mapKey ? styles : styles.filter((s) => !s.sponsor);
+};
 
 export const PhotoTypes = () => [
   {
     text: $gettext("Image"),
-    value: MediaImage,
+    value: media.Image,
   },
   {
     text: $gettext("Raw"),
-    value: MediaRaw,
-  },
-  {
-    text: $gettext("Animated"),
-    value: MediaAnimated,
+    value: media.Raw,
   },
   {
     text: $gettext("Live"),
-    value: MediaLive,
+    value: media.Live,
   },
   {
     text: $gettext("Video"),
-    value: MediaVideo,
+    value: media.Video,
+  },
+  {
+    text: $gettext("Audio"),
+    value: media.Audio,
+  },
+  {
+    text: $gettext("Animated"),
+    value: media.Animated,
   },
   {
     text: $gettext("Vector"),
-    value: MediaVector,
+    value: media.Vector,
+  },
+  {
+    text: $gettext("Document"),
+    value: media.Document,
   },
 ];
 
@@ -427,20 +465,28 @@ export const Colors = () => [
 ];
 
 export const FeedbackCategories = () => [
-  { value: "help", text: $gettext("Customer Support") },
   { value: "feedback", text: $gettext("Product Feedback") },
   { value: "feature", text: $gettext("Feature Request") },
   { value: "bug", text: $gettext("Bug Report") },
-  { value: "donations", text: $gettext("Donations") },
   { value: "other", text: $gettext("Other") },
 ];
 
-export const ThumbFilters = () => [
-  { value: "blackman", text: $gettext("Blackman: Lanczos Modification, Less Ringing Artifacts") },
-  { value: "lanczos", text: $gettext("Lanczos: Detail Preservation, Minimal Artifacts") },
-  { value: "cubic", text: $gettext("Cubic: Moderate Quality, Good Performance") },
-  { value: "linear", text: $gettext("Linear: Very Smooth, Best Performance") },
-];
+export const Thumbs = () => {
+  return $config.values.thumbs;
+};
+
+export const ThumbSizes = () => {
+  const thumbs = Thumbs();
+  const result = [{ text: $gettext("Originals"), value: "" }];
+
+  for (let i = 0; i < thumbs.length; i++) {
+    let t = thumbs[i];
+
+    result.push({ text: t.w + " × " + t.h, value: t.size });
+  }
+
+  return result;
+};
 
 export const Gender = () => [
   { value: "male", text: $gettext("Male") },
@@ -449,8 +495,40 @@ export const Gender = () => [
 ];
 
 export const Orientations = () => [
-  { value: 1, text: "" },
+  { value: 1, text: "0°" },
   { value: 6, text: "90°" },
   { value: 3, text: "180°" },
   { value: 8, text: "270°" },
 ];
+
+export const AccountTypes = () => [{ value: "webdav", text: $gettext("WebDAV") }];
+
+export const DownloadName = () => [
+  { value: "file", text: $gettext("Current Name") },
+  { value: "original", text: $gettext("Original Name") },
+  { value: "share", text: $gettext("Share Friendly") },
+];
+
+// SortOrderLabels maps the picture sort-order keys to their translated display labels.
+const SortOrderLabels = () => ({
+  newest: $gettext("Newest First"),
+  oldest: $gettext("Oldest First"),
+  added: $gettext("Recently Added"),
+  archived: $gettext("Recently Archived"),
+  edited: $gettext("Recently Edited"),
+  title: $gettext("Picture Title"),
+  name: $gettext("File Name"),
+  size: $gettext("File Size"),
+  duration: $gettext("Video Duration"),
+  similar: $gettext("Visual Similarity"),
+  relevance: $gettext("Most Relevant"),
+});
+
+// SortOrderOptions builds sort-order select items for the given keys, in the order provided.
+export const SortOrderOptions = (keys) => {
+  const labels = SortOrderLabels();
+  return keys.filter((key) => key in labels).map((key) => ({ value: key, text: labels[key] }));
+};
+
+// AlbumSortOrder returns the sort-order options offered for albums and collections.
+export const AlbumSortOrder = () => SortOrderOptions(["newest", "oldest", "added", "title", "name", "size", "duration", "relevance"]);

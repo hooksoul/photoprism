@@ -3,6 +3,8 @@ import { ClientFunction } from "testcafe";
 import testcafeconfig from "../../testcafeconfig.json";
 import Menu from "../page-model/menu";
 import Places from "../page-model/places";
+import Photo from "../page-model/photo";
+import Toolbar from "../page-model/toolbar";
 
 const getLocation = ClientFunction(() => document.location.href);
 
@@ -10,12 +12,14 @@ fixture`Search and open photo from places`.page`${testcafeconfig.url}`;
 
 const menu = new Menu();
 const places = new Places();
+const photo = new Photo();
+const toolbar = new Toolbar();
 
-test.meta("testID", "places-001").meta({ mode: "public" })("Common: Test places", async (t) => {
+test.meta("testID", "places-001").meta({ mode: "public" })("Multi-Window: Test places", async (t) => {
   await menu.openPage("places");
 
   await t
-    .expect(Selector("#map").exists, { timeout: 15000 })
+    .expect(Selector("div.map-loaded").exists, { timeout: 15000 })
     .ok()
     .expect(Selector("div.map-control").visible)
     .ok();
@@ -27,17 +31,40 @@ test.meta("testID", "places-001").meta({ mode: "public" })("Common: Test places"
   await menu.openPage("places");
 
   await t
-    .expect(Selector("#map").exists, { timeout: 15000 })
+    .expect(Selector("div.map-loaded").exists, { timeout: 15000 })
     .ok()
     .expect(Selector("div.map-control").visible)
+    .ok()
+    .expect(Selector("div.cluster-marker").visible)
     .ok();
 
+  const clusterCountAll = await Selector("div.cluster-marker").count;
+
   await places.search("canada");
-  await t.wait(8000);
+
+  // Waits until the map shows the two photos found, since fitting the map to the results resets the zoom.
+  await t.expect(Selector("div.marker:not(.cluster-marker)").count).eql(2, { timeout: 15000 });
+  await t.expect(Selector("div.cluster-marker").count).eql(0);
+
+  for (let i = 0; i < 6 && !(await Selector("div.cluster-marker").exists); i++) {
+    await t.click(places.zoomOut).wait(500);
+  }
+
+  const clusterCountCanada = await Selector("div.cluster-marker").count;
+
+  await t.expect(clusterCountAll).gt(clusterCountCanada);
+
+  await t.click(Selector("div.cluster-marker"));
+
+  await t.expect(await photo.getPhotoCount("all")).eql(2);
+  await t.expect(Selector('div[title="Cape / Bowen Island / 2019"]').visible).ok();
+  await t.click(places.openClusterInSearch);
 
   await t.expect(Selector('div[title="Cape / Bowen Island / 2019"]').visible).ok();
+  await t.expect(await photo.getPhotoCount("all")).eql(2);
+  await t.expect(toolbar.search1.value).eql("canada");
 
-  await t.click(Selector('div[title="Cape / Bowen Island / 2019"]'));
-
-  await t.expect(Selector("#photo-viewer").visible).ok();
+  await t.click(places.clearLocation);
+  await t.expect(await photo.getPhotoCount("all")).gte(2);
+  await t.expect(toolbar.search1.value).eql("");
 });

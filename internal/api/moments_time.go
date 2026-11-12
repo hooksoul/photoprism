@@ -5,18 +5,25 @@ import (
 
 	"github.com/gin-gonic/gin"
 
-	"github.com/photoprism/photoprism/internal/acl"
-	"github.com/photoprism/photoprism/internal/get"
-	"github.com/photoprism/photoprism/internal/query"
+	"github.com/photoprism/photoprism/internal/auth/acl"
+	"github.com/photoprism/photoprism/internal/entity/query"
+	"github.com/photoprism/photoprism/internal/photoprism/get"
 	"github.com/photoprism/photoprism/pkg/txt"
 )
 
 // GetMomentsTime returns monthly albums as JSON.
 //
-// GET /api/v1/moments/time
+//	@Summary	returns monthly albums as JSON
+//	@Id			GetMomentsTime
+//	@Tags		Albums
+//	@Produce	json
+//	@Success	200				{array}		query.Moment
+//	@Failure	401,403,429,500	{object}	i18n.Response
+//	@Router		/api/v1/moments/time [get]
 func GetMomentsTime(router *gin.RouterGroup) {
 	router.GET("/moments/time", func(c *gin.Context) {
-		s := Auth(c, acl.ResourceCalendar, acl.ActionSearch)
+		// Monthly counts cover the whole library, so shared-only access is not sufficient.
+		s := AuthAccess(c, acl.ResourceCalendar, acl.ActionSearch, acl.Permissions{acl.AccessAll, acl.AccessLibrary})
 
 		if s.Abort(c) {
 			return

@@ -5,17 +5,26 @@ import (
 
 	"github.com/gin-gonic/gin"
 
-	"github.com/photoprism/photoprism/internal/acl"
+	"github.com/photoprism/photoprism/internal/auth/acl"
 	"github.com/photoprism/photoprism/internal/form"
-	"github.com/photoprism/photoprism/internal/get"
-	"github.com/photoprism/photoprism/internal/i18n"
 	"github.com/photoprism/photoprism/internal/mutex"
+	"github.com/photoprism/photoprism/internal/photoprism/get"
 	"github.com/photoprism/photoprism/pkg/clean"
+	"github.com/photoprism/photoprism/pkg/i18n"
 )
 
 // Connect confirms external service accounts using a token.
 //
-// PUT /api/v1/connect/:name
+//	@Summary	confirm external service accounts using a token
+//	@Id			ConnectService
+//	@Tags		Config
+//	@Accept		json
+//	@Produce	json
+//	@Param		name			path		string			true	"service name (e.g., hub)"
+//	@Param		connect			body		form.Connect	true	"connection token"
+//	@Success	200				{object}	gin.H
+//	@Failure	400,401,403,413	{object}	i18n.Response
+//	@Router		/api/v1/connect/{name} [put]
 func Connect(router *gin.RouterGroup) {
 	router.PUT("/connect/:name", func(c *gin.Context) {
 		name := clean.ID(c.Param("name"))
@@ -26,16 +35,25 @@ func Connect(router *gin.RouterGroup) {
 			return
 		}
 
-		var f form.Connect
+		var frm form.Connect
 
-		if err := c.BindJSON(&f); err != nil {
+		// Assign and validate request form values.
+		LimitRequestBodyBytes(c, MaxAuthRequestBytes)
+
+		if err := c.BindJSON(&frm); err != nil {
+			if IsRequestBodyTooLarge(err) {
+				log.Warnf("connect: request too large (%s)", clean.Log(name))
+				AbortRequestTooLarge(c, i18n.ErrAccountConnect)
+				return
+			}
+
 			log.Warnf("connect: invalid form values (%s)", clean.Log(name))
 			Abort(c, http.StatusBadRequest, i18n.ErrAccountConnect)
 			return
 		}
 
-		if f.Invalid() {
-			log.Warnf("connect: invalid token %s", clean.Log(f.Token))
+		if frm.Invalid() {
+			log.Warnf("connect: invalid connect token (%s)", clean.Log(name))
 			Abort(c, http.StatusBadRequest, i18n.ErrAccountConnect)
 			return
 		}
@@ -50,7 +68,7 @@ func Connect(router *gin.RouterGroup) {
 		s := Auth(c, acl.ResourceConfig, acl.ActionUpdate)
 
 		if !s.IsSuperAdmin() {
-			log.Errorf("connect: %s not authorized", clean.Log(s.User().UserName))
+			log.Errorf("connect: %s not authorized", clean.Log(s.GetUser().UserName))
 			AbortForbidden(c)
 			return
 		}
@@ -61,7 +79,7 @@ func Connect(router *gin.RouterGroup) {
 		switch name {
 		case "hub":
 			old := conf.Hub().Session
-			err = conf.ResyncHub(f.Token)
+			err = conf.RenewApiKeysWithToken(frm.Token)
 			restart = old != conf.Hub().Session
 		default:
 			log.Errorf("connect: invalid service %s", clean.Log(name))

@@ -1,0 +1,230 @@
+package commands
+
+import (
+	"fmt"
+
+	"github.com/urfave/cli/v2"
+
+	"github.com/photoprism/photoprism/internal/config"
+	"github.com/photoprism/photoprism/internal/entity"
+	"github.com/photoprism/photoprism/internal/entity/search"
+	"github.com/photoprism/photoprism/internal/ffmpeg"
+	"github.com/photoprism/photoprism/internal/photoprism"
+	"github.com/photoprism/photoprism/internal/photoprism/get"
+	"github.com/photoprism/photoprism/pkg/clean"
+	"github.com/photoprism/photoprism/pkg/fs"
+)
+
+// VideoTranscodeCommand configures the command name, flags, and action.
+var VideoTranscodeCommand = &cli.Command{
+	Name:      "transcode",
+	Usage:     "Transcodes matching videos to AVC sidecar files",
+	ArgsUsage: "[filter]...",
+	Flags: []cli.Flag{
+		videoCountFlag,
+		OffsetFlag,
+		videoForceFlag,
+		DryRunFlag("prints planned transcode operations without writing files"),
+		YesFlag(),
+	},
+	Action: videoTranscodeAction,
+}
+
+// videoTranscodeAction transcodes matching videos into sidecar AVC files.
+func videoTranscodeAction(ctx *cli.Context) error {
+	return CallWithDependencies(ctx, func(conf *config.Config) error {
+		if conf.DisableFFmpeg() {
+			return fmt.Errorf("ffmpeg is disabled")
+		}
+
+		filter := videoNormalizeFilter(ctx.Args().Slice())
+		results, err := videoSearchResults(filter, ctx.Int(videoCountFlag.Name), ctx.Int(OffsetFlag.Name))
+		if err != nil {
+			return err
+		}
+
+		convert := get.Convert()
+		plans, preflight, err := videoBuildTranscodePlans(conf, convert, results, ctx.Bool(videoForceFlag.Name))
+		if err != nil {
+			return err
+		}
+
+		if len(plans) == 0 {
+			log.Infof("transcode: found no matching videos")
+			return nil
+		}
+
+		if !ctx.Bool("dry-run") {
+			if err = videoCheckFreeSpace(preflight); err != nil {
+				return err
+			}
+		}
+
+		if !ctx.Bool("dry-run") {
+			if proceed, confirmErr := ConfirmAction(ctx.Bool("yes"), fmt.Sprintf("Transcode %d video files", len(plans))); confirmErr != nil {
+				return confirmErr
+			} else if !proceed {
+				log.Info("transcode: canceled")
+				return nil
+			}
+		}
+
+		var planned, processed, skipped, failed int
+
+		for _, plan := range plans {
+			if ctx.Bool("dry-run") {
+				log.Infof("transcode: would transcode %s to %s", clean.Log(plan.SrcPath), clean.Log(plan.DestPath))
+				planned++
+				continue
+			}
+
+			_, err := videoTranscodeFile(conf, convert, plan, ctx.Bool(videoForceFlag.Name))
+			if err != nil {
+				log.Errorf("transcode: %s", clean.ErrorFull(err))
+				failed++
+				continue
+			}
+
+			if err = videoReindexRelated(conf, plan.IndexPath); err != nil {
+				log.Errorf("transcode: %s", clean.ErrorFull(err))
+				failed++
+				continue
+			}
+
+			processed++
+		}
+
+		log.Info(formatVideoSummary("transcode", ctx.Bool("dry-run"), planned, processed, skipped, failed))
+
+		if failed > 0 {
+			return fmt.Errorf("transcode: %s", formatFailedCount(failed, "file", "files"))
+		}
+
+		return nil
+	})
+}
+
+// videoTranscodePlan holds a resolved transcode operation for a single video file.
+type videoTranscodePlan struct {
+	IndexPath string
+	SrcPath   string
+	DestPath  string
+	SizeBytes int64
+}
+
+// videoBuildTranscodePlans prepares transcode operations and preflight size checks from search results.
+func videoBuildTranscodePlans(conf *config.Config, convert *photoprism.Convert, results []search.Photo, force bool) ([]videoTranscodePlan, []videoOutputPlan, error) {
+	plans := make([]videoTranscodePlan, 0, len(results))
+	preflight := make([]videoOutputPlan, 0, len(results))
+	planned := make(map[string]bool, len(results))
+
+	for _, found := range results {
+		videoFile, ok := videoPrimaryFile(found)
+		if !ok {
+			log.Warnf("transcode: missing video file for %s", clean.Log(found.PhotoUID))
+			continue
+		}
+
+		if videoFile.FileSidecar {
+			log.Warnf("transcode: skipping sidecar file %s", clean.Log(videoFile.FileName))
+			continue
+		}
+
+		if videoFile.MediaType == entity.MediaLive {
+			log.Warnf("transcode: skipping live photo video %s", clean.Log(videoFile.FileName))
+			continue
+		}
+
+		srcPath := photoprism.FileName(videoFile.FileRoot, videoFile.FileName)
+		if !fs.FileExistsNotEmpty(srcPath) {
+			log.Warnf("transcode: missing file %s", clean.Log(srcPath))
+			continue
+		}
+
+		if matched := ffmpeg.Exclude().Match(videoFile.FileCodec, fs.FileType(srcPath).String()); matched != "" {
+			log.Warnf("transcode: skipping %s because format %s is on the FFmpeg exclude list", clean.Log(videoFile.FileName), clean.Log(matched))
+			continue
+		}
+
+		if !conf.SidecarWritable() || !fs.PathWritable(conf.SidecarPath()) {
+			return nil, nil, config.ErrReadOnly
+		}
+
+		destPath, existing, err := videoTranscodeTarget(convert, srcPath)
+		if err != nil {
+			log.Warnf("transcode: %s", clean.ErrorFull(err))
+			continue
+		}
+
+		if destPath == srcPath {
+			log.Warnf("transcode: skipping because output equals source %s", clean.Log(srcPath))
+			continue
+		}
+
+		// Both lenses of an Insta360 capture are transcoded to the same file.
+		if planned[destPath] {
+			log.Warnf("transcode: skipping %s because its output is already planned", clean.Log(videoFile.FileName))
+			continue
+		}
+
+		// Like the converter, keep an existing output unless it is a sidecar replaced with --force.
+		if existing != nil && (!force || !existing.InSidecar()) {
+			log.Warnf("transcode: output already exists %s", clean.Log(existing.FileName()))
+			continue
+		}
+
+		planned[destPath] = true
+		plans = append(plans, videoTranscodePlan{
+			IndexPath: srcPath,
+			SrcPath:   srcPath,
+			DestPath:  destPath,
+			SizeBytes: videoFile.FileSize,
+		})
+
+		preflight = append(preflight, videoOutputPlan{
+			Destination: destPath,
+			SizeBytes:   videoFile.FileSize,
+		})
+	}
+
+	return plans, preflight, nil
+}
+
+// videoTranscodeTarget returns the sidecar file name the converter writes a transcode of srcPath to, and
+// an existing transcode it would use instead, if any.
+func videoTranscodeTarget(convert *photoprism.Convert, srcPath string) (destPath string, existing *photoprism.MediaFile, err error) {
+	if convert == nil {
+		return "", nil, fmt.Errorf("transcode: convert service unavailable")
+	}
+
+	mediaFile, err := photoprism.NewMediaFile(srcPath)
+	if err != nil {
+		return "", nil, err
+	}
+
+	if destPath, err = convert.AvcName(mediaFile); err != nil {
+		return "", nil, err
+	}
+
+	if existingName := convert.FindAvc(mediaFile); existingName == "" {
+		return destPath, nil, nil
+	} else if existing, err = photoprism.NewMediaFile(existingName); err != nil || !existing.IsVideo() {
+		return destPath, nil, nil
+	}
+
+	return destPath, existing, nil
+}
+
+// videoTranscodeFile runs the transcode operation and returns the resulting media file.
+func videoTranscodeFile(conf *config.Config, convert *photoprism.Convert, plan videoTranscodePlan, force bool) (*photoprism.MediaFile, error) {
+	if convert == nil {
+		return nil, fmt.Errorf("transcode: convert service unavailable")
+	}
+
+	mediaFile, err := photoprism.NewMediaFile(plan.SrcPath)
+	if err != nil {
+		return nil, err
+	}
+
+	return convert.ToAvc(mediaFile, conf.FFmpegEncoder(), false, force)
+}

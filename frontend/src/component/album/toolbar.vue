@@ -1,86 +1,81 @@
 <template>
-  <v-form ref="form" lazy-validation
-          dense autocomplete="off" class="p-photo-toolbar p-album-toolbar" accept-charset="UTF-8"
-          @submit.prevent="updateQuery()">
-    <v-toolbar flat :dense="$vuetify.breakpoint.smAndDown" class="page-toolbar" color="secondary">
-      <v-toolbar-title :title="album.Title">
-        <span class="hidden-xs-only">
-        <router-link :to="{ name: collRoute }">
-          {{ T(collName) }}
+  <v-form
+    ref="form"
+    validate-on="invalid-input"
+    autocomplete="off"
+    class="p-photo-toolbar p-album-toolbar"
+    accept-charset="UTF-8"
+    @submit.prevent="updateQuery()"
+  >
+    <v-toolbar flat :density="$vuetify.display.smAndDown ? 'compact' : 'default'" class="page-toolbar" color="secondary">
+      <v-toolbar-title :title="album.Title" class="page__title">
+        <router-link :to="{ name: collectionRoute }" class="hidden-xs">
+          {{ T(collectionTitle) }}
+          <v-icon>{{ navIcon }}</v-icon>
         </router-link>
-        <v-icon>{{ navIcon }}</v-icon>
-        </span>
-        {{ album.Title }}
+        <router-link :to="{ name: collectionRoute }">
+          <bdi>{{ $util.balanceBidi(album.Title) }}</bdi>
+        </router-link>
       </v-toolbar-title>
 
-      <v-spacer></v-spacer>
+      <v-btn-toggle
+        :model-value="settings.view"
+        :title="$gettext('Toggle View')"
+        :density="$vuetify.display.smAndDown ? 'comfortable' : 'default'"
+        base-color="secondary"
+        variant="flat"
+        rounded="pill"
+        mandatory
+        border
+        group
+        class="ms-1"
+      >
+        <v-btn value="cards" icon="mdi-view-column" class="ps-1 action-view-cards" @click="setView('cards')"></v-btn>
+        <v-btn v-if="listView" value="list" icon="mdi-view-list" class="action-view-list" @click="setView('list')"></v-btn>
+        <v-btn value="mosaic" icon="mdi-view-comfy" class="pe-1 action-view-mosaic" @click="setView('mosaic')"></v-btn>
+      </v-btn-toggle>
 
-      <v-btn icon class="hidden-xs-only action-reload" :title="$gettext('Reload')" @click.stop="refresh()">
-        <v-icon>refresh</v-icon>
-      </v-btn>
-
-      <v-btn v-if="canManage" icon class="action-edit" :title="$gettext('Edit')" @click.stop="dialog.edit = true">
-        <v-icon>edit</v-icon>
-      </v-btn>
-
-      <v-btn v-if="canShare" icon class="action-share" :title="$gettext('Share')"
-             @click.stop="dialog.share = true">
-        <v-icon>share</v-icon>
-      </v-btn>
-
-      <v-btn v-if="canDownload" icon class="action-download" :title="$gettext('Download')"
-             @click.stop="download()">
-        <v-icon>get_app</v-icon>
-      </v-btn>
-
-      <v-btn v-if="settings.view === 'cards'" icon class="action-view-list" :title="$gettext('Toggle View')" @click.stop="setView('list')">
-        <v-icon>view_list</v-icon>
-      </v-btn>
-      <v-btn v-else-if="settings.view === 'list'" icon class="action-view-mosaic" :title="$gettext('Toggle View')" @click.stop="setView('mosaic')">
-        <v-icon>view_comfy</v-icon>
-      </v-btn>
-      <v-btn v-else icon class="action-view-cards" :title="$gettext('Toggle View')" @click.stop="setView('cards')">
-        <v-icon>view_column</v-icon>
-      </v-btn>
-
-      <v-btn v-if="canUpload" icon class="hidden-sm-and-down action-upload"
-             :title="$gettext('Upload')" @click.stop="showUpload()">
-        <v-icon>cloud_upload</v-icon>
-      </v-btn>
+      <p-action-menu :items="menuActions" button-class="ms-1"></p-action-menu>
     </v-toolbar>
 
-    <template v-if="album.Description">
-      <v-card flat class="px-2 py-1 hidden-sm-and-down"
-              color="secondary-light"
-      >
-        <v-card-text>
-          {{ album.Description }}
-        </v-card-text>
-      </v-card>
-      <v-card flat class="pa-0 hidden-md-and-up"
-              color="secondary-light"
-      >
-        <v-card-text>
-          {{ album.Description }}
-        </v-card-text>
-      </v-card>
-    </template>
+    <div v-if="album.Description" class="toolbar-details-panel">
+      {{ album.Description }}
+    </div>
 
-    <p-share-dialog :show="dialog.share" :model="album" @upload="webdavUpload"
-                    @close="dialog.share = false"></p-share-dialog>
-    <p-share-upload-dialog :show="dialog.upload" :items="{albums: album.getId()}" :model="album" @cancel="dialog.upload = false"
-                           @confirm="dialog.upload = false"></p-share-upload-dialog>
-    <p-album-edit-dialog :show="dialog.edit" :album="album" @close="dialog.edit = false"></p-album-edit-dialog>
+    <p-share-dialog :visible="dialog.share" :model="album" @upload="webdavUpload" @close="dialog.share = false"></p-share-dialog>
+    <p-service-upload
+      :visible="dialog.upload"
+      :items="{ albums: album.getId() }"
+      :model="album"
+      @close="dialog.upload = false"
+      @confirm="dialog.upload = false"
+    ></p-service-upload>
+    <p-album-edit-dialog :visible="dialog.edit" :album="album" @close="dialog.edit = false"></p-album-edit-dialog>
+    <p-confirm-dialog
+      :visible="dialog.delete"
+      :text="$gettext('Are you sure you want to delete this album?')"
+      :action="$gettext('Delete')"
+      icon="mdi-delete-outline"
+      @close="dialog.delete = false"
+      @confirm="onDeleteConfirm"
+    ></p-confirm-dialog>
   </v-form>
 </template>
 <script>
-import Event from "pubsub-js";
-import Notify from "common/notify";
+import $notify from "common/notify";
 import download from "common/download";
-import { T } from "common/vm";
+import { T } from "common/gettext";
+import $api from "common/api";
+
+import PActionMenu from "component/action/menu.vue";
+import PConfirmDialog from "component/confirm/dialog.vue";
 
 export default {
-  name: 'PAlbumToolbar',
+  name: "PAlbumToolbar",
+  components: {
+    PActionMenu,
+    PConfirmDialog,
+  },
   props: {
     album: {
       type: Object,
@@ -108,57 +103,103 @@ export default {
     },
   },
   data() {
-    const cameras = [{
-      ID: 0,
-      Name: this.$gettext('All Cameras')
-    }].concat(this.$config.get('cameras'));
-    const countries = [{
-      ID: '',
-      Name: this.$gettext('All Countries')
-    }].concat(this.$config.get('countries'));
-    const features = this.$config.settings().features;
+    const settings = this.$config.getSettings();
+    const features = settings.features;
     return {
+      expanded: false,
       canUpload: this.$config.allow("files", "upload") && features.upload,
-      canDownload: this.$config.allow("albums", "download") && features.download,
+      canDownload: this.$config.allow("albums", "download") && features.download && !settings?.albums?.download?.disabled,
       canShare: this.$config.allow("albums", "share") && features.share,
       canManage: this.$config.allow("albums", "manage"),
+      canDelete: this.$config.allow("albums", "delete"),
       experimental: this.$config.get("experimental"),
       isFullScreen: !!document.fullscreenElement,
       categories: this.$config.albumCategories(),
-      collName: this.$route.meta && this.$route.meta.collName ? this.$route.meta.collName : this.$gettext("Albums"),
-      collRoute: this.$route.meta && this.$route.meta.collRoute ? this.$route.meta.collRoute : "albums",
-      navIcon: this.$rtl ? 'navigate_before' : 'navigate_next',
-      searchExpanded: false,
-      options: {
-        'views': [
-          {value: 'mosaic', text: this.$gettext('Mosaic')},
-          {value: 'cards', text: this.$gettext('Cards')},
-          {value: 'list', text: this.$gettext('List')},
-        ],
-        'countries': countries,
-        'cameras': cameras,
-        'sorting': [
-          {value: 'newest', text: this.$gettext('Newest First')},
-          {value: 'oldest', text: this.$gettext('Oldest First')},
-          {value: 'added', text: this.$gettext('Recently Added')},
-          {value: 'edited', text: this.$gettext('Recently Edited')},
-          {value: 'name', text: this.$gettext('File Name')},
-          {value: 'size', text: this.$gettext('File Size')},
-          {value: 'duration', text: this.$gettext('Video Duration')},
-          {value: 'relevance', text: this.$gettext('Most Relevant')},
-          {value: 'similar', text: this.$gettext('Visual Similarity')},
-        ],
-      },
+      collectionTitle: this.$route.meta?.collectionTitle ? this.$route.meta.collectionTitle : this.$gettext("Albums"),
+      collectionRoute: this.$route.meta?.collectionRoute ? this.$route.meta.collectionRoute : "albums",
+      navIcon: this.$isRtl ? "mdi-chevron-left" : "mdi-chevron-right",
+      listView: this.$config.getSettings()?.search?.listView,
       dialog: {
         share: false,
         upload: false,
         edit: false,
+        delete: false,
       },
-      titleRule: v => v.length <= this.$config.get('clip') || this.$gettext("Name too long"),
-      growDesc: false,
     };
   },
   methods: {
+    showExpansionPanel() {
+      if (!this.expanded) {
+        this.expanded = true;
+      }
+    },
+    hideExpansionPanel() {
+      if (this.expanded) {
+        this.expanded = false;
+      }
+    },
+    menuActions() {
+      return [
+        {
+          name: "refresh",
+          icon: "mdi-refresh",
+          text: this.$gettext("Refresh"),
+          shortcut: "Ctrl-R",
+          visible: true,
+          click: () => {
+            this.refresh();
+          },
+        },
+        {
+          name: "edit",
+          icon: "mdi-pencil",
+          text: this.$gettext("Edit"),
+          visible: this.canManage,
+          click: () => {
+            this.dialog.edit = true;
+          },
+        },
+        {
+          name: "share",
+          icon: "mdi-share-variant",
+          text: this.$gettext("Share"),
+          class: "action-share",
+          visible: this.canShare,
+          click: () => {
+            this.dialog.share = true;
+          },
+        },
+        {
+          name: "upload",
+          icon: "mdi-cloud-upload",
+          text: this.$gettext("Upload") + "…",
+          shortcut: "Ctrl-U",
+          visible: this.canUpload,
+          click: () => {
+            this.showUpload();
+          },
+        },
+        {
+          name: "download",
+          icon: "mdi-download",
+          text: this.$gettext("Download"),
+          visible: this.canDownload,
+          click: () => {
+            this.download();
+          },
+        },
+        {
+          name: "delete",
+          color: "danger",
+          icon: "mdi-delete-outline",
+          text: this.$gettext("Delete Album"),
+          visible: this.canDelete && ["album", "moment", "state"].includes(this.album.Type),
+          click: () => {
+            this.dialog.delete = true;
+          },
+        },
+      ];
+    },
     T() {
       return T.apply(this, arguments);
     },
@@ -167,25 +208,39 @@ export default {
       this.dialog.upload = true;
     },
     showUpload() {
-      Event.publish("dialog.upload");
+      // Pre-select manually managed albums in upload dialog.
+      if (this.album.Type === "album") {
+        this.$event.publish("dialog.upload", { albums: [this.album] });
+      } else {
+        this.$event.publish("dialog.upload", { albums: [] });
+      }
     },
-    expand() {
-      this.searchExpanded = !this.searchExpanded;
-      this.growDesc = !this.growDesc;
+    onUpdate(v) {
+      this.updateQuery(v);
     },
     setView(name) {
       if (name) {
-        this.refresh({'view': name});
+        if (name === "list" && !this.listView) {
+          name = "mosaic";
+        }
+
+        this.refresh({ view: name });
       }
     },
     download() {
       this.onDownload(`${this.$config.apiUri}/albums/${this.album.UID}/dl?t=${this.$config.downloadToken}`);
     },
     onDownload(path) {
-      Notify.success(this.$gettext("Downloading…"));
+      $notify.success(this.$gettext("Downloading…"));
 
       download(path, "album.zip");
     },
-  }
+    onDeleteConfirm() {
+      $api.delete(`albums/${this.album.UID}`).catch(() => {
+        $notify.error(this.$gettext("Unable to delete"));
+      });
+      this.dialog.delete = false;
+    },
+  },
 };
 </script>

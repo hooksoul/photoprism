@@ -1,23 +1,47 @@
 package api
 
 import (
+	"errors"
 	"net/http"
 
 	"github.com/gin-gonic/gin"
 
-	"github.com/photoprism/photoprism/internal/acl"
+	"github.com/photoprism/photoprism/internal/auth/acl"
 	"github.com/photoprism/photoprism/internal/entity"
+	"github.com/photoprism/photoprism/internal/entity/search"
 	"github.com/photoprism/photoprism/internal/event"
 	"github.com/photoprism/photoprism/internal/form"
-	"github.com/photoprism/photoprism/internal/i18n"
 	"github.com/photoprism/photoprism/internal/mutex"
 	"github.com/photoprism/photoprism/pkg/clean"
+	"github.com/photoprism/photoprism/pkg/i18n"
 	"github.com/photoprism/photoprism/pkg/txt"
 )
 
+// FindSubjectForSession returns the subject with the given uid only when the session may read it.
+// Callers answer not found, so a person a session cannot see reads the same as one that does not
+// exist. entity.FindSubject stays unscoped because renaming needs it; see specs.
+func FindSubjectForSession(uid string, s *entity.Session) *entity.Subject {
+	subj := entity.FindSubject(clean.UID(uid))
+
+	if subj == nil || subj.Deleted() {
+		return nil
+	} else if subj.NameWithheld() && !search.SubjectSessionSeesPrivate(s) {
+		return nil
+	}
+
+	return subj
+}
+
 // GetSubject returns a subject as JSON.
 //
-// GET /api/v1/subjects/:uid
+//	@Summary	returns a subject as JSON
+//	@Id			GetSubject
+//	@Tags		Subjects
+//	@Produce	json
+//	@Success	200				{object}	entity.Subject
+//	@Failure	401,403,404,429	{object}	i18n.Response
+//	@Param		uid				path		string	true	"subject uid"
+//	@Router		/api/v1/subjects/{uid} [get]
 func GetSubject(router *gin.RouterGroup) {
 	router.GET("/subjects/:uid", func(c *gin.Context) {
 		s := Auth(c, acl.ResourcePeople, acl.ActionView)
@@ -26,18 +50,29 @@ func GetSubject(router *gin.RouterGroup) {
 			return
 		}
 
-		if subj := entity.FindSubject(clean.UID(c.Param("uid"))); subj == nil {
+		subj := FindSubjectForSession(c.Param("uid"), s)
+
+		if subj == nil {
 			Abort(c, http.StatusNotFound, i18n.ErrSubjectNotFound)
 			return
-		} else {
-			c.JSON(http.StatusOK, subj)
 		}
+
+		c.JSON(http.StatusOK, subj)
 	})
 }
 
 // UpdateSubject updates subject properties.
 //
-// PUT /api/v1/subjects/:uid
+//	@Summary	updates subject properties
+//	@Id			UpdateSubject
+//	@Tags		Subjects
+//	@Accept		json
+//	@Produce	json
+//	@Success	200								{object}	entity.Subject
+//	@Failure	400,401,403,404,409,413,429,500	{object}	i18n.Response
+//	@Param		uid								path		string			true	"subject uid"
+//	@Param		subject							body		form.Subject	true	"properties to be updated (only submit values that should be changed)"
+//	@Router		/api/v1/subjects/{uid} [put]
 func UpdateSubject(router *gin.RouterGroup) {
 	router.PUT("/subjects/:uid", func(c *gin.Context) {
 		if err := mutex.UpdatePeople.Start(); err != nil {
@@ -53,33 +88,56 @@ func UpdateSubject(router *gin.RouterGroup) {
 			return
 		}
 
+		// Abort if a face migration is rebuilding the people this would rename.
+		if faceMigrationRunning(c) {
+			return
+		}
+
 		uid := clean.UID(c.Param("uid"))
-		m := entity.FindSubject(uid)
+		m := FindSubjectForSession(uid, s)
 
 		if m == nil {
 			Abort(c, http.StatusNotFound, i18n.ErrSubjectNotFound)
 			return
 		}
 
-		// Initialize form.
-		f, err := form.NewSubject(*m)
+		// Create request value form.
+		frm, err := form.NewSubject(*m)
 
+		// Assign and validate request form values.
 		if err != nil {
 			log.Errorf("subject: %s (new form)", err)
 			AbortSaveFailed(c)
 			return
-		} else if err := c.BindJSON(&f); err != nil {
+		}
+
+		LimitRequestBodyBytes(c, MaxMutationRequestBytes)
+
+		if err = c.BindJSON(frm); err != nil {
+			if IsRequestBodyTooLarge(err) {
+				AbortRequestTooLarge(c, i18n.ErrBadRequest)
+				return
+			}
+
 			log.Errorf("subject: %s (update form)", err)
-			AbortBadRequest(c)
+			AbortBadRequest(c, err)
 			return
 		}
 
 		// Update subject from form values.
-		if changed, err := m.SaveForm(f); err != nil {
+		if changed, err := m.SaveForm(frm); errors.Is(err, entity.ErrInvalidValue) {
+			// A value the client must correct is a bad request, not a server fault. Logged at warn
+			// as well, since AbortBadRequest only reaches the debug log and a caller submitting
+			// rejected values in a loop would otherwise leave no record at all.
+			log.Warnf("subject: %s", err)
+			AbortBadRequest(c, err)
+			return
+		} else if err != nil {
 			log.Errorf("subject: %s", err)
 			AbortSaveFailed(c)
 			return
 		} else if changed {
+			// Show success message.
 			if m.IsPerson() {
 				event.SuccessMsg(i18n.MsgPersonSaved)
 			} else {
@@ -93,11 +151,14 @@ func UpdateSubject(router *gin.RouterGroup) {
 
 // LikeSubject flags a subject as favorite.
 //
-// POST /api/v1/subjects/:uid/like
-//
-// Parameters:
-//
-//	uid: string Subject UID
+//	@Summary	flags a subject as favorite
+//	@Id			LikeSubject
+//	@Tags		Subjects
+//	@Accept		json
+//	@Produce	json
+//	@Failure	401,403,404,429,500	{object}	i18n.Response
+//	@Param		uid					path		string	true	"subject uid"
+//	@Router		/api/v1/subjects/{uid}/like [post]
 func LikeSubject(router *gin.RouterGroup) {
 	router.POST("/subjects/:uid/like", func(c *gin.Context) {
 		s := Auth(c, acl.ResourcePeople, acl.ActionUpdate)
@@ -107,7 +168,7 @@ func LikeSubject(router *gin.RouterGroup) {
 		}
 
 		uid := clean.UID(c.Param("uid"))
-		subj := entity.FindSubject(uid)
+		subj := FindSubjectForSession(uid, s)
 
 		if subj == nil {
 			Abort(c, http.StatusNotFound, i18n.ErrSubjectNotFound)
@@ -119,7 +180,7 @@ func LikeSubject(router *gin.RouterGroup) {
 			return
 		}
 
-		PublishSubjectEvent(EntityUpdated, uid, c)
+		PublishSubjectEvent(StatusUpdated, uid)
 
 		c.JSON(http.StatusOK, http.Response{})
 	})
@@ -127,11 +188,14 @@ func LikeSubject(router *gin.RouterGroup) {
 
 // DislikeSubject removes the favorite flag from a subject.
 //
-// DELETE /api/v1/subjects/:uid/like
-//
-// Parameters:
-//
-//	uid: string Subject UID
+//	@Summary	removes the favorite flag from a subject
+//	@Id			DislikeSubject
+//	@Tags		Subjects
+//	@Accept		json
+//	@Produce	json
+//	@Failure	401,403,404,429,500	{object}	i18n.Response
+//	@Param		uid					path		string	true	"subject uid"
+//	@Router		/api/v1/subjects/{uid}/like [delete]
 func DislikeSubject(router *gin.RouterGroup) {
 	router.DELETE("/subjects/:uid/like", func(c *gin.Context) {
 		s := Auth(c, acl.ResourcePeople, acl.ActionUpdate)
@@ -141,7 +205,7 @@ func DislikeSubject(router *gin.RouterGroup) {
 		}
 
 		uid := clean.UID(c.Param("uid"))
-		subj := entity.FindSubject(uid)
+		subj := FindSubjectForSession(uid, s)
 
 		if subj == nil {
 			Abort(c, http.StatusNotFound, i18n.ErrSubjectNotFound)
@@ -153,7 +217,7 @@ func DislikeSubject(router *gin.RouterGroup) {
 			return
 		}
 
-		PublishSubjectEvent(EntityUpdated, uid, c)
+		PublishSubjectEvent(StatusUpdated, uid)
 
 		c.JSON(http.StatusOK, http.Response{})
 	})

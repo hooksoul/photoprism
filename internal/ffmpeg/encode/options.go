@@ -1,0 +1,181 @@
+package encode
+
+import (
+	"fmt"
+	"time"
+
+	"github.com/photoprism/photoprism/pkg/fs"
+)
+
+// Options represents FFmpeg encoding options.
+type Options struct {
+	Bin         string        // FFmpeg binary filename, e.g. /usr/bin/ffmpeg
+	Container   fs.Type       // Multimedia Container File Format
+	Encoder     Encoder       // Supported FFmpeg output Encoder
+	SizeLimit   int           // Maximum width and height of the output video file in pixels.
+	Quality     int           // See https://ffmpeg.org/ffmpeg-codecs.html
+	Preset      string        // See https://trac.ffmpeg.org/wiki/Encode/H.264#Preset
+	MaxBitrate  int           // Peak video bitrate in Mbit/s for encoders that support a limit, 0 for no limit.
+	Device      string        // Hardware device path or index, see https://trac.ffmpeg.org/wiki/HWAccelIntro
+	MapVideo    string        // See https://trac.ffmpeg.org/wiki/Map#Videostreamsonly
+	MapAudio    string        // See https://trac.ffmpeg.org/wiki/Map#Audiostreamsonly
+	MapMetadata string        // See https://ffmpeg.org/ffmpeg.html
+	SeekOffset  string        // See https://trac.ffmpeg.org/wiki/Seeking and https://ffmpeg.org/ffmpeg-utils.html#time-duration-syntax
+	TimeOffset  string        // See https://trac.ffmpeg.org/wiki/Seeking and https://ffmpeg.org/ffmpeg-utils.html#time-duration-syntax
+	Duration    time.Duration // See https://ffmpeg.org/ffmpeg.html#Main-options
+	MovFlags    string        // FFmpeg "-movflags" value for the MP4 muxer (e.g. "use_metadata_tags+faststart"). See https://ffmpeg.org/ffmpeg-formats.html#Options-12
+	VideoTag    string        // FFmpeg "-tag:v" override (e.g. "hvc1" for HEVC in MP4/MOV containers)
+	V360        string        // Optional FFmpeg "v360" filter applied before scaling, e.g. to dewarp dual-fisheye 360° video to equirectangular. See https://ffmpeg.org/ffmpeg-filters.html#v360
+	Title       string
+	Description string
+	Comment     string
+	Author      string
+	Created     time.Time
+	Timeout     time.Duration // Wall-clock budget for the command, 0 for no limit.
+	Force       bool
+}
+
+// NewVideoOptions creates and returns new FFmpeg video transcoding options.
+func NewVideoOptions(ffmpegBin string, encoder Encoder, sizeLimit, quality int, preset, device, mapVideo, mapAudio string) Options {
+	if ffmpegBin == "" {
+		ffmpegBin = FFmpegBin
+	}
+
+	if encoder == "" {
+		encoder = DefaultAvcEncoder()
+	}
+
+	switch {
+	case sizeLimit < 1:
+		sizeLimit = 1920
+	case sizeLimit > 15360:
+		sizeLimit = 15360
+	}
+
+	switch {
+	case quality <= 0:
+		quality = DefaultQuality
+	case quality < WorstQuality:
+		quality = WorstQuality
+	case quality >= BestQuality:
+		quality = BestQuality
+	}
+
+	if preset == "" {
+		preset = PresetFast
+	}
+
+	if mapVideo == "" {
+		mapVideo = DefaultMapVideo
+	}
+
+	if mapAudio == "" {
+		mapAudio = DefaultMapAudio
+	}
+
+	return Options{
+		Bin:         ffmpegBin,
+		Container:   fs.VideoMp4,
+		Encoder:     encoder,
+		SizeLimit:   sizeLimit,
+		Quality:     quality,
+		Preset:      preset,
+		Device:      device,
+		MapVideo:    mapVideo,
+		MapAudio:    mapAudio,
+		MapMetadata: DefaultMapMetadata,
+		MovFlags:    MovFlags,
+	}
+}
+
+// NewRemuxOptions creates and returns new video remux options.
+func NewRemuxOptions(ffmpegBin string, container fs.Type, force bool) Options {
+	if ffmpegBin == "" {
+		ffmpegBin = FFmpegBin
+	}
+
+	if container == "" {
+		container = fs.VideoMp4
+	}
+
+	return Options{
+		Bin:         ffmpegBin,
+		Container:   fs.VideoMp4,
+		MapVideo:    DefaultMapVideo,
+		MapAudio:    DefaultMapAudio,
+		MapMetadata: DefaultMapMetadata,
+		MovFlags:    MovFlags,
+		Force:       force,
+	}
+}
+
+// NewPreviewImageOptions generates encoding options for extracting a video preview image.
+func NewPreviewImageOptions(ffmpegBin string, videoDuration time.Duration) *Options {
+	return &Options{
+		Bin:         ffmpegBin,
+		MapVideo:    DefaultMapVideo,
+		MapAudio:    DefaultMapAudio,
+		MapMetadata: DefaultMapMetadata,
+		SeekOffset:  PreviewSeekOffset(videoDuration),
+		TimeOffset:  PreviewTimeOffset(videoDuration),
+	}
+}
+
+// VideoFilter returns the FFmpeg video filter string based on the size limit in pixels and the pixel format.
+func (o *Options) VideoFilter(format PixelFormat) string {
+	// prefix is an optional geometry filter (e.g. a v360 dewarp) applied before scaling. It is a
+	// software filter, so it is only expected on the CPU transcode path (not hardware pixel formats).
+	var prefix string
+	if o.V360 != "" {
+		prefix = o.V360 + ","
+	}
+
+	// scale specifies the FFmpeg downscale filter, see http://trac.ffmpeg.org/wiki/Scaling.
+	switch format {
+	case "":
+		return prefix + fmt.Sprintf("scale='if(gte(iw,ih), min(%d, iw), -2):if(gte(iw,ih), -2, min(%d, ih))'", o.SizeLimit, o.SizeLimit)
+	case FormatQSV:
+		return prefix + fmt.Sprintf("scale_qsv=w='if(gte(iw,ih), min(%d, iw), -1)':h='if(gte(iw,ih), -1, min(%d, ih))':format=nv12", o.SizeLimit, o.SizeLimit)
+	}
+
+	return prefix + fmt.Sprintf("scale='if(gte(iw,ih), min(%d, iw), -2):if(gte(iw,ih), -2, min(%d, ih))',format=%s", o.SizeLimit, o.SizeLimit, format)
+}
+
+// QvQuality returns the video encoding quality as "-q:v" parameter string.
+func (o *Options) QvQuality() string {
+	return QvQuality(o.Quality)
+}
+
+// GlobalQuality returns the video encoding quality as Intel QSV "-global_quality" parameter string.
+func (o *Options) GlobalQuality() string {
+	return GlobalQuality(o.Quality)
+}
+
+// CrfQuality returns the video encoding quality as "-crf" parameter string.
+func (o *Options) CrfQuality() string {
+	return CrfQuality(o.Quality)
+}
+
+// QpQuality returns the video encoding quality as "-qp" parameter string.
+func (o *Options) QpQuality() string {
+	return QpQuality(o.Quality)
+}
+
+// VaapiQuality returns the video encoding quality as VA-API "-qp" parameter string.
+func (o *Options) VaapiQuality() string {
+	return VaapiQuality(o.Quality)
+}
+
+// CqQuality returns the video encoding quality as NVENC "-cq" parameter string.
+func (o *Options) CqQuality() string {
+	return CqQuality(o.Quality)
+}
+
+// MaxRate returns the peak video bitrate as "-maxrate" parameter string, or an empty string for no limit.
+func (o *Options) MaxRate() string {
+	if o.MaxBitrate <= 0 {
+		return ""
+	}
+
+	return fmt.Sprintf("%dM", o.MaxBitrate)
+}

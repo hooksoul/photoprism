@@ -7,8 +7,18 @@ import ContextMenu from "../page-model/context-menu";
 import Photo from "../page-model/photo";
 import Page from "../page-model/page";
 import AlbumDialog from "../page-model/dialog-album";
+import { helperBeforeFixture, helperBeforeEach, helperAfterEach } from "../page-model/helpers";
 
-fixture`Test folders`.page`${testcafeconfig.url}`;
+fixture`Test folders`.page`${testcafeconfig.url}`
+.beforeEach(async t => {
+  await helperBeforeEach(t);
+})
+.afterEach(async t => {
+  await helperAfterEach(t);
+})
+.before(async ctx => {
+  await helperBeforeFixture(ctx);
+});
 
 const menu = new Menu();
 const album = new Album();
@@ -18,132 +28,133 @@ const photo = new Photo();
 const page = new Page();
 const albumdialog = new AlbumDialog();
 
-test.meta("testID", "folders-001").meta({ type: "short", mode: "public" })(
-  "Common: View folders",
-  async (t) => {
-    await menu.openPage("folders");
+test.meta("testID", "folders-001").meta({ type: "short", mode: "public" })("Common: View folders", async (t) => {
+  await menu.openPage("folders");
 
-    await t
-      .expect(Selector("a").withText("BotanicalGarden").visible)
-      .ok()
-      .expect(Selector("a").withText("Kanada").visible)
-      .ok()
-      .expect(Selector("a").withText("KorsikaAdventure").visible)
-      .ok();
+  await t
+    .expect(Selector("button").withText("BotanicalGarden").visible)
+    .ok()
+    .expect(Selector("button").withText("Kanada").visible)
+    .ok()
+    .expect(Selector("button").withText("KorsikaAdventure").visible)
+    .ok();
+});
+
+test.meta("testID", "folders-002").meta({ mode: "public" })("Common: Update folder details", async (t) => {
+  await menu.openPage("folders");
+  await toolbar.search("Kanada");
+  const AlbumUid = await album.getNthAlbumUid("all", 0);
+  await t.expect(page.cardTitle.nth(0).innerText).contains("Kanada");
+
+  await t.click(page.cardTitle.nth(0));
+
+  await t
+    .expect(albumdialog.title.value)
+    .eql("Kanada")
+    .expect(albumdialog.location.value)
+    .eql("")
+    .expect(albumdialog.description.value)
+    .eql("")
+    .expect(albumdialog.category.value)
+    .eql("");
+
+  await t
+    .typeText(albumdialog.title, "MyFolder", { replace: true })
+    .typeText(albumdialog.location, "United States", { replace: true })
+    .typeText(albumdialog.description, "Last holiday")
+    .typeText(albumdialog.category, "Mountains")
+    .pressKey("enter")
+    .click(albumdialog.dialogSave);
+
+  await t
+    .expect(page.cardTitle.nth(0).innerText)
+    .contains("MyFolder")
+    .expect(page.cardDescription.nth(0).innerText)
+    .contains("Last holiday")
+    .expect(Selector("button.meta-category").innerText)
+    .contains("Mountains")
+    .expect(Selector("button.meta-location").innerText)
+    .contains("United States");
+
+  await album.openNthAlbum(0);
+
+  await t
+    .expect(toolbar.toolbarDescription.nth(0).innerText)
+    .contains("Last holiday")
+    .expect(toolbar.toolbarSecondTitle.innerText)
+    .contains("MyFolder");
+
+  await menu.openPage("folders");
+  if (t.browser.platform === "mobile") {
+    await toolbar.search("category:Mountains");
+  } else {
+    await toolbar.setFilter("category", "Mountains");
   }
-);
 
-test.meta("testID", "folders-002").meta({ mode: "public" })(
-  "Common: Update folder details",
-  async (t) => {
-    await menu.openPage("folders");
-    await toolbar.search("Kanada");
-    const AlbumUid = await album.getNthAlbumUid("all", 0);
-    await t.expect(page.cardTitle.nth(0).innerText).contains("Kanada");
+  await t.expect(page.cardTitle.nth(0).innerText).contains("MyFolder");
 
-    await t.click(page.cardTitle.nth(0));
+  await album.openAlbumWithUid(AlbumUid);
+  await toolbar.triggerToolbarAction("edit");
 
-    await t
-      .expect(albumdialog.title.value)
-      .eql("Kanada")
-      .expect(albumdialog.location.value)
-      .eql("")
-      .expect(albumdialog.description.value)
-      .eql("")
-      .expect(albumdialog.category.value)
-      .eql("");
+  await t
+    .expect(albumdialog.description.value)
+    .eql("Last holiday")
+    .expect(albumdialog.category.value)
+    .eql("Mountains")
+    .expect(albumdialog.location.value)
+    .eql("United States");
 
-    await t
-      .typeText(albumdialog.title, "MyFolder", { replace: true })
-      .typeText(albumdialog.location, "USA", { replace: true })
-      .typeText(albumdialog.description, "Last holiday")
-      .typeText(albumdialog.category, "Mountains")
-      .pressKey("enter")
-      .click(albumdialog.dialogSave);
+  await t
+    .typeText(albumdialog.title, "Kanada", { replace: true })
+    .click(albumdialog.category)
+    .click(albumdialog.category)
+    .pressKey("ctrl+a delete")
+    .click(albumdialog.description)
+    .pressKey("ctrl+a delete")
+    .pressKey("enter")
+    .click(albumdialog.location)
+    .pressKey("ctrl+a delete")
+    .pressKey("enter")
+    .click(albumdialog.dialogSave);
+  await menu.openPage("folders");
+  await toolbar.search("Kanada");
 
-    await t
-      .expect(page.cardTitle.nth(0).innerText)
-      .contains("MyFolder")
-      .expect(page.cardDescription.nth(0).innerText)
-      .contains("Last holiday")
-      .expect(Selector("div.caption").nth(1).innerText)
-      .contains("Mountains")
-      .expect(Selector("div.caption").nth(2).innerText)
-      .contains("USA");
+  await t
+    .expect(page.cardTitle.nth(0).innerText)
+    .contains("Kanada")
+    .expect(page.cardDescription.exists)
+    .notOk();
 
-    await album.openNthAlbum(0);
+  // Card-level checks aren't sufficient for these fields: the location button can render
+  // via the album's Country/State fallback, and the category never had a card affordance.
+  await album.openAlbumWithUid(AlbumUid);
+  await toolbar.triggerToolbarAction("edit");
+  await t.expect(albumdialog.location.value).eql("").expect(albumdialog.category.value).eql("");
+  await t.click(albumdialog.dialogCancel);
+});
 
-    await t
-      .expect(toolbar.toolbarDescription.nth(0).innerText)
-      .contains("Last holiday")
-      .expect(toolbar.toolbarSecondTitle.innerText)
-      .contains("MyFolder");
-
-    await menu.openPage("folders");
-    if (t.browser.platform === "mobile") {
-      await toolbar.search("category:Mountains");
-    } else {
-      await toolbar.setFilter("category", "Mountains");
-    }
-
-    await t.expect(page.cardTitle.nth(0).innerText).contains("MyFolder");
-
-    await album.openAlbumWithUid(AlbumUid);
-    await toolbar.triggerToolbarAction("edit");
-
-    await t
-      .expect(albumdialog.description.value)
-      .eql("Last holiday")
-      .expect(albumdialog.category.value)
-      .eql("Mountains")
-      .expect(albumdialog.location.value)
-      .eql("USA");
-
-    await t
-      .typeText(albumdialog.title, "Kanada", { replace: true })
-      .click(albumdialog.category)
-      .pressKey("ctrl+a delete")
-      .pressKey("enter")
-      .click(albumdialog.description)
-      .pressKey("ctrl+a delete")
-      .pressKey("enter")
-      .click(albumdialog.location)
-      .pressKey("ctrl+a delete")
-      .pressKey("enter")
-      .click(albumdialog.dialogSave);
-    await menu.openPage("folders");
-    await toolbar.search("Kanada");
-
-    await t
-      .expect(page.cardTitle.nth(0).innerText)
-      .contains("Kanada")
-      .expect(page.cardDescription.nth(0).innerText)
-      .notContains("We went to ski")
-      .expect(Selector("div.caption").nth(0).innerText)
-      .notContains("USA");
-  }
-);
-
-test.meta("testID", "folders-003").meta({ mode: "public" })(
-  "Common: Create, Edit, delete sharing link",
-  async (t) => {
-    await page.testCreateEditDeleteSharingLink("folders");
-  }
-);
+test.meta("testID", "folders-003").meta({ mode: "public" })("Common: Create, Edit, delete sharing link", async (t) => {
+  await page.testCreateEditDeleteSharingLink("folders");
+});
 
 test.meta("testID", "folders-004").meta({ mode: "public" })(
   "Common: Create/delete album-clone from folder",
   async (t) => {
     await menu.openPage("albums");
     const AlbumCount = await album.getAlbumCount("all");
+    await toolbar.search("Holiday");
+    const HolidayAlbumUid = await album.getNthAlbumUid("all", 0);
+    await album.openAlbumWithUid(HolidayAlbumUid);
+    const InitialPhotoCountHoliday = await photo.getPhotoCount("all");
     await menu.openPage("folders");
-    const ThirdFolderUid = await album.getNthAlbumUid("all", 2);
-    await album.openAlbumWithUid(ThirdFolderUid);
+    await toolbar.search("Kanada");
+    const KanadaFolderUid = await album.getAlbumUidByTitle("Kanada");
+    await album.openAlbumWithUid(KanadaFolderUid);
     const PhotoCountInFolder = await photo.getPhotoCount("all");
     const FirstPhotoUid = await photo.getNthPhotoUid("image", 0);
     await menu.openPage("folders");
-    await album.selectAlbumFromUID(ThirdFolderUid);
-    await contextmenu.triggerContextMenuAction("clone", "NotYetExistingAlbumForFolder");
+    await album.selectAlbumFromUID(KanadaFolderUid);
+    await contextmenu.triggerContextMenuAction("clone", ["Holiday", "NotYetExistingAlbumForFolder"]);
     await menu.openPage("albums");
     const AlbumCountAfterCreation = await album.getAlbumCount("all");
 
@@ -164,8 +175,30 @@ test.meta("testID", "folders-004").meta({ mode: "public" })(
 
     await t.expect(AlbumCountAfterDelete).eql(AlbumCount);
 
+    await album.openAlbumWithUid(HolidayAlbumUid);
+    await photo.selectPhotoFromUID(FirstPhotoUid);
+    await contextmenu.triggerContextMenuAction("remove", "");
+    const PhotoCountHolidayAfterDelete = await photo.getPhotoCount("all");
+
+    await t.expect(PhotoCountHolidayAfterDelete).eql(InitialPhotoCountHoliday);
+
     await menu.openPage("folders");
-    await album.openAlbumWithUid(ThirdFolderUid);
+    await album.openAlbumWithUid(KanadaFolderUid);
     await photo.checkPhotoVisibility(FirstPhotoUid, true);
+  }
+);
+
+test.meta("testID", "folders-005").meta({ type: "short", mode: "public" })(
+  "Common: Verify folder sort options",
+  async (t) => {
+    await menu.openPage("folders");
+    await album.checkSortOptions("folder");
+  }
+);
+
+test.meta("testID", "folders-006").meta({ type: "short", mode: "public" })(
+  "Common: Set album cover from Folders Page",
+  async (t) => {
+    await page.testSetAlbumCover("folders");
   }
 );

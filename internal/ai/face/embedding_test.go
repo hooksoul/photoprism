@@ -1,0 +1,314 @@
+package face
+
+import (
+	"fmt"
+	"math"
+	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+func TestEmbedding_Dist(t *testing.T) {
+	t.Run("EqualLength", func(t *testing.T) {
+		a := Embedding{0, 0, 0}
+		b := Embedding{3, 4, 0}
+
+		assert.InDelta(t, 5.0, a.Dist(b), 1e-9)
+		assert.InDelta(t, 5.0, b.Dist(a), 1e-9)
+	})
+	t.Run("MismatchedLength", func(t *testing.T) {
+		a := Embedding{0, 0}
+		b := Embedding{1}
+
+		assert.Equal(t, -1.0, a.Dist(b))
+	})
+	t.Run("NonFinite", func(t *testing.T) {
+		// A NaN distance is below every threshold it is compared with, so it would be
+		// accepted as a match and could never be displaced by a real one.
+		a := Embedding{0, 0, 0}
+		nan := Embedding{math.NaN(), 0, 0}
+		inf := Embedding{math.Inf(1), 0, 0}
+
+		assert.Equal(t, -1.0, a.Dist(nan))
+		assert.Equal(t, -1.0, nan.Dist(a))
+		assert.Equal(t, -1.0, a.Dist(inf))
+	})
+}
+
+func TestEmbedding_Zero(t *testing.T) {
+	t.Run("AllZero", func(t *testing.T) {
+		assert.True(t, Embedding{0, 0, 0}.Zero())
+		assert.True(t, make(Embedding, 512).Zero())
+	})
+	t.Run("Empty", func(t *testing.T) {
+		assert.True(t, Embedding{}.Zero())
+	})
+	t.Run("HasMagnitude", func(t *testing.T) {
+		assert.False(t, Embedding{0, 0, 0.1}.Zero())
+		assert.False(t, Embedding{-1, 0, 0}.Zero())
+		assert.False(t, RandomEmbedding().Zero())
+	})
+}
+
+func TestEmbedding_DistWithin(t *testing.T) {
+	a := Embedding{0, 0, 0}
+	b := Embedding{3, 4, 0}
+
+	t.Run("Within", func(t *testing.T) {
+		assert.InDelta(t, 5.0, a.DistWithin(b, 6), 1e-9)
+	})
+	t.Run("AtLimit", func(t *testing.T) {
+		assert.InDelta(t, 5.0, a.DistWithin(b, 5), 1e-9)
+	})
+	t.Run("Beyond", func(t *testing.T) {
+		assert.Equal(t, -1.0, a.DistWithin(b, 4.999))
+	})
+	t.Run("ZeroLimit", func(t *testing.T) {
+		assert.InDelta(t, 0.0, a.DistWithin(a, 0), 1e-9)
+		assert.Equal(t, -1.0, a.DistWithin(b, 0))
+	})
+	t.Run("NegativeLimit", func(t *testing.T) {
+		assert.Equal(t, -1.0, a.DistWithin(b, -1))
+	})
+	t.Run("MismatchedLength", func(t *testing.T) {
+		assert.Equal(t, -1.0, Embedding{0, 0}.DistWithin(Embedding{1}, 100))
+	})
+	t.Run("Empty", func(t *testing.T) {
+		assert.Equal(t, -1.0, a.DistWithin(Embedding{}, 100))
+	})
+	t.Run("NonFinite", func(t *testing.T) {
+		// Dist reports NaN for these, which passes every threshold comparison it is fed to.
+		// DistWithin reports "not comparable" instead, so a corrupt vector cannot win.
+		nan := Embedding{math.NaN(), 0, 0}
+		inf := Embedding{math.Inf(1), 0, 0}
+
+		assert.Equal(t, -1.0, a.DistWithin(nan, 100))
+		assert.Equal(t, -1.0, nan.DistWithin(a, 100))
+		assert.Equal(t, -1.0, a.DistWithin(inf, 100))
+	})
+	t.Run("AbandonsMidVector", func(t *testing.T) {
+		// A limit the running sum passes early is decided by the in-loop test rather than the
+		// final one, which is the path the block stride exists for.
+		x := make(Embedding, 512)
+		y := make(Embedding, 512)
+		for i := range x {
+			x[i] = 1
+		}
+
+		assert.Equal(t, -1.0, x.DistWithin(y, 0.5))
+		assert.InDelta(t, x.Dist(y), x.DistWithin(y, x.Dist(y)), 1e-9)
+	})
+	t.Run("AgreesWithDist", func(t *testing.T) {
+		// Lengths that are not a multiple of the block matter because their tail is never
+		// block-tested, so only the final verdict can reject them.
+		for _, dims := range []int{1, 15, 16, 17, 128, 129, 512} {
+			for i := range 32 {
+				x := make(Embedding, dims)
+				y := make(Embedding, dims)
+
+				for j := range x {
+					x[j] = float64((i*7+j*13)%97)/97 - 0.5
+					y[j] = float64((i*11+j*5)%89)/89 - 0.5
+				}
+
+				full := x.Dist(y)
+
+				assert.InDelta(t, full, x.DistWithin(y, full), 1e-9,
+					"dims %d case %d must report the true distance at its own limit", dims, i)
+
+				if full > 0 {
+					assert.Equal(t, -1.0, x.DistWithin(y, math.Nextafter(full, 0)),
+						"dims %d case %d must be refused just below the true distance", dims, i)
+				}
+			}
+		}
+	})
+}
+
+func TestNewEmbedding_Normalized(t *testing.T) {
+	raw := []float32{3, 4}
+	result := NewEmbedding(raw)
+
+	var sum float64
+	for _, v := range result {
+		sum += v * v
+	}
+
+	assert.InDelta(t, 1.0, math.Sqrt(sum), 1e-9)
+}
+
+func TestNormalizeEmbedding(t *testing.T) {
+	t.Run("Unnormalized", func(t *testing.T) {
+		e := Embedding{3, 4}
+		normalizeEmbedding(e)
+		assert.InDelta(t, 0.6, e[0], 1e-6)
+		assert.InDelta(t, 0.8, e[1], 1e-6)
+	})
+	t.Run("AlreadyNormalized", func(t *testing.T) {
+		// Clustering unmarshals vectors that are already unit length and then hands the
+		// same slices to EmbeddingsMidpoint, so the second pass has to leave them alone
+		// rather than rewrite the caller's data.
+		e := Embedding{0.6, 0.8}
+		normalizeEmbedding(e)
+		assert.Equal(t, Embedding{0.6, 0.8}, e)
+	})
+	t.Run("Idempotent", func(t *testing.T) {
+		// A vector whose normalized magnitude is not exactly 1, so that a second pass would
+		// change the bits unless the tolerance check returns before the write loop. Compared
+		// as raw bits, since the values differ by far less than any delta would catch.
+		e := Embedding{0.1, 0.2, 0.3, 0.4}
+		normalizeEmbedding(e)
+		require.NotEqual(t, 1.0, e.Magnitude(), "this case needs a vector that is not exactly unit")
+
+		first := make([]uint64, len(e))
+		for i, v := range e {
+			first[i] = math.Float64bits(v)
+		}
+
+		normalizeEmbedding(e)
+
+		for i, v := range e {
+			assert.Equalf(t, first[i], math.Float64bits(v), "component %d changed on the second pass", i)
+		}
+	})
+	t.Run("Zero", func(t *testing.T) {
+		e := Embedding{0, 0}
+		normalizeEmbedding(e)
+		assert.Equal(t, Embedding{0, 0}, e)
+	})
+	t.Run("Empty", func(t *testing.T) {
+		assert.NotPanics(t, func() { normalizeEmbedding(Embedding{}) })
+	})
+	t.Run("TinyComponents", func(t *testing.T) {
+		// Squaring these rounds to zero, which would report no magnitude and leave the vector
+		// at a length no configured distance is stated for.
+		e := Embedding{3e-200, 4e-200}
+		normalizeEmbedding(e)
+		assert.InDelta(t, 0.6, e[0], 1e-9)
+		assert.InDelta(t, 0.8, e[1], 1e-9)
+		assert.True(t, e.Unit())
+	})
+	t.Run("HugeComponents", func(t *testing.T) {
+		// Squaring these reaches infinity, and scaling by its inverse would zero the vector.
+		e := Embedding{3e200, 4e200}
+		normalizeEmbedding(e)
+		assert.InDelta(t, 0.6, e[0], 1e-9)
+		assert.InDelta(t, 0.8, e[1], 1e-9)
+		assert.False(t, e.Zero())
+		assert.True(t, e.Unit())
+	})
+	t.Run("NonFinite", func(t *testing.T) {
+		e := Embedding{math.Inf(1), 1}
+		normalizeEmbedding(e)
+		assert.True(t, math.IsInf(e[0], 1))
+		assert.False(t, e.Unit())
+	})
+}
+
+func TestEmbedding_Magnitude(t *testing.T) {
+	t.Run("Unit", func(t *testing.T) {
+		assert.InDelta(t, 1.0, Embedding{0.6, 0.8}.Magnitude(), 1e-12)
+	})
+	t.Run("Plain", func(t *testing.T) {
+		assert.InDelta(t, 5.0, Embedding{3, 4}.Magnitude(), 1e-12)
+	})
+	t.Run("Tiny", func(t *testing.T) {
+		assert.InDelta(t, 5e-200, Embedding{3e-200, 4e-200}.Magnitude(), 1e-210)
+	})
+	t.Run("Huge", func(t *testing.T) {
+		assert.InDelta(t, 5e200, Embedding{3e200, 4e200}.Magnitude(), 1e190)
+	})
+	t.Run("Zero", func(t *testing.T) {
+		assert.Equal(t, 0.0, Embedding{0, 0}.Magnitude())
+	})
+	t.Run("NaN", func(t *testing.T) {
+		assert.True(t, math.IsNaN(Embedding{math.NaN(), 1}.Magnitude()))
+	})
+	t.Run("Inf", func(t *testing.T) {
+		assert.True(t, math.IsInf(Embedding{math.Inf(1), 1}.Magnitude(), 1))
+	})
+	t.Run("Empty", func(t *testing.T) {
+		assert.Equal(t, 0.0, Embedding{}.Magnitude())
+	})
+}
+
+func TestEmbedding_Unit(t *testing.T) {
+	t.Run("Unit", func(t *testing.T) {
+		assert.True(t, Embedding{0.6, 0.8}.Unit())
+	})
+	t.Run("TooShort", func(t *testing.T) {
+		assert.False(t, Embedding{0.06, 0.08}.Unit())
+	})
+	t.Run("TooLong", func(t *testing.T) {
+		assert.False(t, Embedding{6, 8}.Unit())
+	})
+	t.Run("Zero", func(t *testing.T) {
+		assert.False(t, Embedding{0, 0}.Unit())
+	})
+	t.Run("Empty", func(t *testing.T) {
+		assert.False(t, Embedding{}.Unit())
+	})
+}
+
+var benchmarkEmbeddingDist float64
+
+// benchmarkEmbeddingPair returns deterministic embeddings for Dist benchmarks.
+func benchmarkEmbeddingPair(dim int) (Embedding, Embedding) {
+	a := make(Embedding, dim)
+	other := make(Embedding, dim)
+
+	scale := float64(dim)
+
+	for i := 0; i < dim; i++ {
+		a[i] = float64(i+1) / scale
+		other[i] = float64(dim-i) / scale
+	}
+
+	return a, other
+}
+
+func BenchmarkEmbeddingDist(b *testing.B) {
+	for _, dim := range []int{128, 512, 1024} {
+		b.Run(fmt.Sprintf("Dim%d", dim), func(b *testing.B) {
+			a, other := benchmarkEmbeddingPair(dim)
+
+			b.SetBytes(int64(dim * 16))
+			b.ReportAllocs()
+
+			for b.Loop() {
+				benchmarkEmbeddingDist = a.Dist(other)
+			}
+		})
+	}
+}
+
+func TestUnmarshalEmbedding(t *testing.T) {
+	t.Run("Ok", func(t *testing.T) {
+		emb, err := UnmarshalEmbedding("[-0.013,-0.031]")
+
+		assert.NoError(t, err)
+		assert.Len(t, emb, 2)
+
+		var norm float64
+		for _, v := range emb {
+			norm += v * v
+		}
+
+		assert.InDelta(t, 1.0, math.Sqrt(norm), 1e-9)
+		assert.Less(t, emb[0], 0.0)
+		assert.Less(t, emb[1], 0.0)
+	})
+	t.Run("NoPrefix", func(t *testing.T) {
+		emb, err := UnmarshalEmbedding("-0.013,-0.031]")
+
+		assert.Error(t, err)
+		assert.Nil(t, emb)
+	})
+	t.Run("InvalidValues", func(t *testing.T) {
+		emb, err := UnmarshalEmbedding("[true, false]")
+
+		assert.Error(t, err)
+		assert.Equal(t, Embedding{0, 0}, emb)
+	})
+}

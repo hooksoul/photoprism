@@ -1,39 +1,328 @@
 package api
 
 import (
+	"fmt"
 	"net/http"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/tidwall/gjson"
+	"gopkg.in/yaml.v2"
 
+	"github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"github.com/photoprism/photoprism/internal/config"
+	"github.com/photoprism/photoprism/pkg/clean"
+	"github.com/photoprism/photoprism/pkg/fs"
 )
 
 func TestGetConfig(t *testing.T) {
-	t.Run("successful request", func(t *testing.T) {
-		app, router, _ := NewApiTest()
+	t.Run("Success", func(t *testing.T) {
+		app, router, conf := NewApiTest()
+
 		GetClientConfig(router)
+
 		r := PerformRequest(app, "GET", "/api/v1/config")
 		val := gjson.Get(r.Body.String(), "flags")
-		assert.Equal(t, "public debug test sponsor experimental settings", val.String())
+
+		if conf.Develop() {
+			assert.Equal(t, "public debug test sponsor develop experimental settings", val.String())
+		} else {
+			assert.Equal(t, "public debug test sponsor experimental settings", val.String())
+		}
+
 		assert.Equal(t, http.StatusOK, r.Code)
 	})
 }
 
 func TestGetConfigOptions(t *testing.T) {
-	t.Run("unauthorised", func(t *testing.T) {
+	t.Run("Forbidden", func(t *testing.T) {
 		app, router, _ := NewApiTest()
+
 		GetConfigOptions(router)
+
 		r := PerformRequest(app, "GET", "/api/v1/config/options")
 		assert.Equal(t, http.StatusForbidden, r.Code)
 	})
 }
 
 func TestSaveConfigOptions(t *testing.T) {
-	t.Run("unauthorised", func(t *testing.T) {
+	t.Run("Forbidden", func(t *testing.T) {
 		app, router, _ := NewApiTest()
+
 		SaveConfigOptions(router)
+
 		r := PerformRequest(app, "POST", "/api/v1/config/options")
 		assert.Equal(t, http.StatusForbidden, r.Code)
 	})
+	t.Run("Success", func(t *testing.T) {
+		app, router, conf := NewApiTest()
+
+		SaveConfigOptions(router)
+
+		prepareConfigOptionsSuccessTest(t, conf)
+
+		authToken := AuthenticateAdmin(app, router)
+
+		tempCfg := t.TempDir()
+		originalConfigPath := conf.Options().ConfigPath
+		originalOptionsYaml := conf.Options().OptionsYaml
+
+		t.Cleanup(func() {
+			conf.Options().ConfigPath = originalConfigPath
+			conf.Options().OptionsYaml = originalOptionsYaml
+		})
+
+		conf.Options().ConfigPath = tempCfg
+		conf.Options().OptionsYaml = filepath.Join(tempCfg, "options.yml")
+
+		seed := map[string]any{
+			"Existing":        "value",
+			"SiteUrl":         "https://old.example/",
+			"HttpCachePublic": false,
+		}
+
+		b, err := yaml.Marshal(seed)
+
+		assert.NoError(t, err)
+		assert.NoError(t, os.WriteFile(conf.OptionsYaml(), b, fs.ModeFile))
+
+		r := AuthenticatedRequestWithBody(app, "POST", "/api/v1/config/options", `{"SiteUrl":"https://photos.example.com/","HttpCachePublic":true}`, authToken)
+
+		assert.Equal(t, http.StatusOK, r.Code)
+		assert.Equal(t, "https://photos.example.com/", gjson.Get(r.Body.String(), "SiteUrl").String())
+		assert.True(t, gjson.Get(r.Body.String(), "HttpCachePublic").Bool())
+
+		optionsData, readErr := os.ReadFile(conf.OptionsYaml())
+		assert.NoError(t, readErr)
+
+		var merged map[string]any
+		assert.NoError(t, yaml.Unmarshal(optionsData, &merged))
+		assert.Equal(t, "value", merged["Existing"])
+		assert.Equal(t, "https://photos.example.com/", merged["SiteUrl"])
+		assert.Equal(t, true, merged["HttpCachePublic"])
+	})
+	t.Run("OptionsFileTooLarge", func(t *testing.T) {
+		// A change that would make the options file too large to read is refused and not applied.
+		app, router, conf := NewApiTest()
+
+		SaveConfigOptions(router)
+
+		prepareConfigOptionsSuccessTest(t, conf)
+
+		authToken := AuthenticateAdmin(app, router)
+
+		tempCfg := t.TempDir()
+		conf.Options().ConfigPath = tempCfg
+		conf.Options().OptionsYaml = filepath.Join(tempCfg, "options.yml")
+
+		seed, err := yaml.Marshal(map[string]any{"SiteCaption": strings.Repeat("c", (1<<20)-1000)})
+		require.NoError(t, err)
+		require.NoError(t, os.WriteFile(conf.OptionsYaml(), seed, fs.ModeFile))
+
+		hook := captureLog(t)
+		body := `{"SiteDescription":"` + strings.Repeat("d", 2000) + `"}`
+		r := AuthenticatedRequestWithBody(app, "POST", "/api/v1/config/options", body, authToken)
+
+		assert.Equal(t, http.StatusRequestEntityTooLarge, r.Code)
+
+		// One warning tells the operator why the change was not applied, without the request content.
+		var warnings []string
+		for _, e := range hook.AllEntries() {
+			if e.Level == logrus.WarnLevel {
+				warnings = append(warnings, e.Message)
+			}
+		}
+		require.Len(t, warnings, 1)
+		assert.Contains(t, warnings[0], "options file would exceed its size limit")
+		assert.NotContains(t, warnings[0], "ddd")
+		assert.NotContains(t, conf.Options().SiteDescription, "ddd")
+
+		optionsData, readErr := os.ReadFile(conf.OptionsYaml())
+		require.NoError(t, readErr)
+		assert.Equal(t, seed, optionsData)
+	})
+	t.Run("OptionsFileUnreadable", func(t *testing.T) {
+		// An options file that is already too large to read is a server error, not one of the request.
+		app, router, conf := NewApiTest()
+
+		SaveConfigOptions(router)
+
+		prepareConfigOptionsSuccessTest(t, conf)
+
+		authToken := AuthenticateAdmin(app, router)
+
+		tempCfg := t.TempDir()
+		conf.Options().ConfigPath = tempCfg
+		conf.Options().OptionsYaml = filepath.Join(tempCfg, "options.yml")
+
+		seed := []byte("SiteCaption: " + strings.Repeat("c", 1<<20) + "\n")
+		require.NoError(t, os.WriteFile(conf.OptionsYaml(), seed, fs.ModeFile))
+
+		r := AuthenticatedRequestWithBody(app, "POST", "/api/v1/config/options", `{"SiteDescription":"short"}`, authToken)
+
+		assert.Equal(t, http.StatusInternalServerError, r.Code)
+		assert.NotEqual(t, "short", conf.Options().SiteDescription)
+
+		optionsData, readErr := os.ReadFile(conf.OptionsYaml())
+		require.NoError(t, readErr)
+		assert.Equal(t, seed, optionsData)
+	})
+	t.Run("IgnoresOptionsTheApiDoesNotReturn", func(t *testing.T) {
+		app, router, conf := NewApiTest()
+
+		SaveConfigOptions(router)
+
+		prepareConfigOptionsSuccessTest(t, conf)
+
+		authToken := AuthenticateAdmin(app, router)
+
+		tempCfg := t.TempDir()
+		conf.Options().ConfigPath = tempCfg
+		conf.Options().OptionsYaml = filepath.Join(tempCfg, "options.yml")
+
+		body := `{"SiteUrl":"https://photos.example.com/","VisionKey":"test-key","AdminPassword":"test-pass","NotAnOption":"value"}`
+		r := AuthenticatedRequestWithBody(app, "POST", "/api/v1/config/options", body, authToken)
+
+		assert.Equal(t, http.StatusOK, r.Code)
+
+		optionsData, readErr := os.ReadFile(conf.OptionsYaml())
+		assert.NoError(t, readErr)
+
+		var merged map[string]any
+		assert.NoError(t, yaml.Unmarshal(optionsData, &merged))
+		assert.Equal(t, "https://photos.example.com/", merged["SiteUrl"])
+		assert.NotContains(t, merged, "VisionKey")
+		assert.NotContains(t, merged, "AdminPassword")
+		assert.NotContains(t, merged, "NotAnOption")
+		assert.Empty(t, conf.Options().VisionKey)
+	})
+	t.Run("TypesNumericValues", func(t *testing.T) {
+		app, router, conf := NewApiTest()
+
+		SaveConfigOptions(router)
+
+		prepareConfigOptionsSuccessTest(t, conf)
+
+		authToken := AuthenticateAdmin(app, router)
+
+		tempCfg := t.TempDir()
+		conf.Options().ConfigPath = tempCfg
+		conf.Options().OptionsYaml = filepath.Join(tempCfg, "options.yml")
+
+		body := `{"JpegQuality":85.61960784313726}`
+		r := AuthenticatedRequestWithBody(app, "POST", "/api/v1/config/options", body, authToken)
+
+		assert.Equal(t, http.StatusOK, r.Code)
+
+		optionsData, readErr := os.ReadFile(conf.OptionsYaml())
+		assert.NoError(t, readErr)
+		assert.Contains(t, string(optionsData), "JpegQuality: 86")
+	})
+	t.Run("BadRequest", func(t *testing.T) {
+		app, router, conf := NewApiTest()
+
+		SaveConfigOptions(router)
+
+		prepareConfigOptionsSuccessTest(t, conf)
+
+		authToken := AuthenticateAdmin(app, router)
+
+		tempCfg := t.TempDir()
+		conf.Options().ConfigPath = tempCfg
+		conf.Options().OptionsYaml = filepath.Join(tempCfg, "options.yml")
+
+		body := `{"JpegQuality":1e19}`
+		r := AuthenticatedRequestWithBody(app, "POST", "/api/v1/config/options", body, authToken)
+
+		assert.Equal(t, http.StatusBadRequest, r.Code)
+	})
+	t.Run("RequestTooLarge", func(t *testing.T) {
+		app, router, conf := NewApiTest()
+
+		SaveConfigOptions(router)
+
+		prepareConfigOptionsSuccessTest(t, conf)
+
+		authToken := AuthenticateAdmin(app, router)
+		body := `{"SiteUrl":"https://photos.example.com/","LogLevel":"` + strings.Repeat("a", int(MaxSettingsRequestBytes)) + `"}`
+		r := AuthenticatedRequestWithBody(app, "POST", "/api/v1/config/options", body, authToken)
+
+		assert.Equal(t, http.StatusRequestEntityTooLarge, r.Code)
+	})
+}
+
+// prepareConfigOptionsSuccessTest normalizes shared config state so the success
+// path is deterministic when API tests mutate singleton options.
+func prepareConfigOptionsSuccessTest(t *testing.T, conf *config.Config) {
+	t.Helper()
+
+	originalOptions := *conf.Options()
+	t.Cleanup(func() {
+		*conf.Options() = originalOptions
+		// The handler propagates saved options into package vars such as thumb.CachePublic,
+		// which restoring the struct alone leaves at whatever a request set.
+		conf.Propagate()
+	})
+
+	conf.Options().AuthMode = config.AuthModePasswd
+	conf.Options().Public = false
+	conf.Options().Demo = false
+	conf.Options().DisableSettings = false
+}
+
+func TestSaveConfigOptionsIgnoredKeys(t *testing.T) {
+	app, router, conf := NewApiTest()
+
+	SaveConfigOptions(router)
+	prepareConfigOptionsSuccessTest(t, conf)
+
+	authToken := AuthenticateAdmin(app, router)
+
+	tempCfg := t.TempDir()
+	originalConfigPath := conf.Options().ConfigPath
+	originalOptionsYaml := conf.Options().OptionsYaml
+
+	t.Cleanup(func() {
+		conf.Options().ConfigPath = originalConfigPath
+		conf.Options().OptionsYaml = originalOptionsYaml
+	})
+
+	conf.Options().ConfigPath = tempCfg
+	conf.Options().OptionsYaml = filepath.Join(tempCfg, "options.yml")
+
+	// Keys the API does not expose are reported back, so the request supplies more than are rendered.
+	const supplied = clean.LogNamesLimit + 5
+
+	values := make([]string, 0, supplied)
+	values = append(values, `"report\nsummary":1`)
+
+	for i := len(values); i < supplied; i++ {
+		values = append(values, fmt.Sprintf(`"Unsupported%02d":1`, i))
+	}
+
+	hook := captureLog(t)
+
+	r := AuthenticatedRequestWithBody(app, "POST", "/api/v1/config/options", "{"+strings.Join(values, ",")+"}", authToken)
+	assert.Equal(t, http.StatusOK, r.Code, r.Body.String())
+
+	var line string
+
+	for _, entry := range hook.AllEntries() {
+		if strings.Contains(entry.Message, "ignored") {
+			line = entry.Message
+			break
+		}
+	}
+
+	if line == "" {
+		t.Fatal("expected a log entry naming the ignored keys")
+	}
+
+	assert.NotContains(t, line, "\n", "a log line must not carry a newline from a supplied key")
+	assert.Contains(t, line, fmt.Sprintf("and %d more", supplied-clean.LogNamesLimit))
 }

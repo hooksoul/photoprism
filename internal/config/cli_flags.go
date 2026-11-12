@@ -1,10 +1,26 @@
 package config
 
 import (
-	"github.com/urfave/cli"
+	"reflect"
+	"strings"
 
+	"github.com/urfave/cli/v2"
+
+	"github.com/photoprism/photoprism/pkg/clean"
 	"github.com/photoprism/photoprism/pkg/list"
 )
+
+func firstName(names string) string {
+	if n := strings.Split(names, ","); len(n) > 0 {
+		return strings.TrimSpace(n[0])
+	}
+
+	return ""
+}
+
+// DeprecatedFlagMarker is what a flag's usage text carries when the option still works but is
+// no longer offered. It is rendered as emphasis in the generated reference.
+const DeprecatedFlagMarker = "*deprecated*"
 
 // CliFlags represents a list of command-line parameters.
 type CliFlags []CliFlag
@@ -18,6 +34,22 @@ func (f CliFlags) Cli() (result []cli.Flag) {
 	}
 
 	return result
+}
+
+// Deprecated reports whether the parameter with the specified name is marked as deprecated in
+// its usage text, which is where that is stated for the help output as well.
+func (f CliFlags) Deprecated(name string) bool {
+	if name = firstName(name); name == "" {
+		return false
+	}
+
+	for _, flag := range f {
+		if flag.Name() == name {
+			return strings.Contains(flag.Usage(), DeprecatedFlagMarker)
+		}
+	}
+
+	return false
 }
 
 // Find finds command-line parameters based on a list of tags.
@@ -40,7 +72,7 @@ func (f CliFlags) Remove(names []string) (result CliFlags) {
 	result = make(CliFlags, 0, len(f))
 
 	for _, flag := range f {
-		if list.Contains(names, flag.Name()) {
+		if list.ContainsAny(names, []string{flag.Name(), flag.String()}) {
 			continue
 		}
 
@@ -50,10 +82,39 @@ func (f CliFlags) Remove(names []string) (result CliFlags) {
 	return result
 }
 
-// Insert inserts command flags, if possible after name.
-func (f CliFlags) Insert(name string, insert []CliFlag) (result CliFlags) {
-	result = make(CliFlags, 0, len(f)+len(insert))
+// Replace replaces an existing command flag by name and returns true if successful.
+func (f CliFlags) Replace(name string, replacement CliFlag) CliFlags {
+	if name = firstName(name); name == "" {
+		log.Warnf("config: invalid name provided to replace cli flag %s", clean.Log(name))
+		return f
+	}
 
+	done := false
+
+	if name = firstName(name); name != "" {
+		for i, flag := range f {
+			if !done && flag.Name() == name {
+				f[i] = replacement
+				done = true
+			}
+		}
+	}
+
+	if !done {
+		log.Warnf("config: failed to replace cli flag %s", clean.Log(name))
+	}
+
+	return f
+}
+
+// Insert inserts command flags, if possible after the flag specified by name.
+func (f CliFlags) Insert(name string, insert []CliFlag) (result CliFlags) {
+	if name = firstName(name); name == "" {
+		log.Warnf("config: invalid name provided to insert cli flag after %s", clean.Log(name))
+		return f
+	}
+
+	result = make(CliFlags, 0, len(f)+len(insert))
 	done := false
 
 	for _, flag := range f {
@@ -66,6 +127,34 @@ func (f CliFlags) Insert(name string, insert []CliFlag) (result CliFlags) {
 	}
 
 	if !done {
+		log.Warnf("config: failed to insert cli flags after %s", clean.Log(name))
+		result = append(result, insert...)
+	}
+
+	return result
+}
+
+// InsertBefore inserts command flags, if possible before the flag specified by name.
+func (f CliFlags) InsertBefore(name string, insert []CliFlag) (result CliFlags) {
+	if name = firstName(name); name == "" {
+		log.Warnf("config: invalid name provided to insert cli flag before %s", clean.Log(name))
+		return f
+	}
+
+	result = make(CliFlags, 0, len(f)+len(insert))
+	done := false
+
+	for _, flag := range f {
+		if !done && flag.Name() == name {
+			result = append(result, insert...)
+			done = true
+		}
+
+		result = append(result, flag)
+	}
+
+	if !done {
+		log.Warnf("config: failed to insert cli flags before %s", clean.Log(name))
 		result = append(result, insert...)
 	}
 
@@ -78,5 +167,31 @@ func (f CliFlags) Prepend(el []CliFlag) (result CliFlags) {
 
 	result = append(result, el...)
 	return append(result, f...)
+}
 
+// SetHidden updates the hidden property of the config flags to the specified value.
+func (f CliFlags) SetHidden(hidden bool, names ...string) (result CliFlags) {
+	result = make(CliFlags, 0, len(f))
+
+	for _, flag := range f {
+		if list.Contains(names, flag.Name()) {
+			rv := reflect.ValueOf(flag.Flag)
+
+			if rv.Kind() == reflect.Pointer {
+				rv = rv.Elem()
+			}
+
+			if rv.Kind() == reflect.Struct {
+				field := rv.FieldByName("Hidden")
+
+				if field.IsValid() && field.CanSet() && field.Kind() == reflect.Bool {
+					field.SetBool(hidden)
+				}
+			}
+		}
+
+		result = append(result, flag)
+	}
+
+	return result
 }

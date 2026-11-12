@@ -3,20 +3,19 @@ package commands
 import (
 	"fmt"
 
-	"github.com/photoprism/photoprism/pkg/rnd"
-
-	"github.com/urfave/cli"
+	"github.com/urfave/cli/v2"
 
 	"github.com/photoprism/photoprism/internal/config"
 	"github.com/photoprism/photoprism/internal/entity"
 	"github.com/photoprism/photoprism/pkg/clean"
-	"github.com/photoprism/photoprism/pkg/report"
+	"github.com/photoprism/photoprism/pkg/rnd"
+	"github.com/photoprism/photoprism/pkg/txt/report"
 )
 
 // UsersShowCommand configures the command name, flags, and action.
-var UsersShowCommand = cli.Command{
+var UsersShowCommand = &cli.Command{
 	Name:      "show",
-	Usage:     "Shows user account information",
+	Usage:     "Shows detailed account information",
 	ArgsUsage: "[username]",
 	Flags:     report.CliFlags,
 	Action:    usersShowAction,
@@ -29,7 +28,7 @@ func usersShowAction(ctx *cli.Context) error {
 
 		// Name or UID provided?
 		if id == "" {
-			return cli.ShowSubcommandHelp(ctx)
+			return ShowUsageError(ctx)
 		}
 
 		// Find user record.
@@ -38,7 +37,7 @@ func usersShowAction(ctx *cli.Context) error {
 		if rnd.IsUID(id, entity.UserUID) {
 			m = entity.FindUserByUID(id)
 		} else {
-			m = entity.FindUserByName(id)
+			m = entity.FindUserByExactName(id)
 		}
 
 		if m == nil {

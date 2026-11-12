@@ -6,7 +6,7 @@ import (
 
 	"github.com/sirupsen/logrus"
 
-	"github.com/photoprism/photoprism/pkg/dummy"
+	"github.com/photoprism/photoprism/pkg/log/dummy"
 )
 
 // init initializes the event package.
@@ -31,6 +31,15 @@ func init() {
 		Log:   Log,
 		Level: logrus.DebugLevel,
 	})
+
+	// SystemLog is the global system log.
+	SystemLog = &logrus.Logger{
+		Out:          os.Stderr,
+		Formatter:    TextFormatter,
+		Level:        logrus.DebugLevel,
+		ExitFunc:     func(int) {},
+		ReportCaller: false,
+	}
 
 	// Create dummy audit logger.
 	AuditLog = dummy.NewLogger()

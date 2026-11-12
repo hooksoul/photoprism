@@ -1,0 +1,930 @@
+package config
+
+import (
+	"errors"
+	"fmt"
+	"os"
+	"os/exec"
+	"os/user"
+	"path/filepath"
+	"runtime"
+	"strings"
+	"sync"
+
+	"github.com/dustin/go-humanize/english"
+	"github.com/urfave/cli/v2"
+
+	"github.com/photoprism/photoprism/pkg/clean"
+	"github.com/photoprism/photoprism/pkg/fs"
+	"github.com/photoprism/photoprism/pkg/fs/disk"
+	"github.com/photoprism/photoprism/pkg/rnd"
+)
+
+// DefaultStorageFree is the default value of the "storage-free" option. It is negative so the
+// runtime free-space probe is disabled by default, as the probe can misreport on some network
+// mounts, fuse layers, and container overlays; operators opt in with a 1-99 percentage.
+const DefaultStorageFree = -1.0
+
+// binPaths stores known executable paths.
+var (
+	binPaths = make(map[string]string, 8)
+	binMu    = sync.RWMutex{}
+	tempPath = ""
+)
+
+// FindBin resolves the absolute file path of external binaries.
+func FindBin(configBin string, defaultBin ...string) (binPath string) {
+	// Binary file paths to be checked.
+	var search []string
+
+	if configBin != "" {
+		search = []string{configBin}
+	} else {
+		search = defaultBin
+	}
+
+	// Cache key for the binary file path.
+	binKey := strings.Join(append(defaultBin, configBin), ",")
+
+	// Check if file path is cached.
+	binMu.RLock()
+	cached, found := binPaths[binKey]
+	binMu.RUnlock()
+
+	// Found in cache?
+	if found {
+		return cached
+	}
+
+	// Check binary file paths.
+	for _, binPath = range search {
+		if binPath == "" {
+			continue
+		} else if path, err := exec.LookPath(binPath); err == nil {
+			binPath = path
+			break
+		}
+	}
+
+	// Found?
+	if !fs.FileExists(binPath) {
+		binPath = ""
+	} else {
+		// Cache result if exists.
+		binMu.Lock()
+		binPaths[binKey] = binPath
+		binMu.Unlock()
+	}
+
+	// Return result.
+	return binPath
+}
+
+// CreateDirectories creates directories for storing photos, metadata and cache files.
+func (c *Config) CreateDirectories() error {
+	// Error if the originals and storage path are identical.
+	if c.OriginalsPath() == c.StoragePath() {
+		return fmt.Errorf("originals and storage folder must be different directories")
+	}
+
+	// Make sure that the configured storage path exists and initialize it with
+	// ".ppstorage" and ".ppignore files" so that it is not accidentally indexed.
+	if dir := c.StoragePath(); dir == "" {
+		return notFoundError("storage")
+	} else if err := fs.MkdirAll(dir); err != nil {
+		return createError(dir, err)
+	} else if _, err = fs.WriteUnixTime(filepath.Join(dir, fs.PPStorageFilename)); err != nil {
+		return fmt.Errorf("%s file in %s could not be created", fs.PPStorageFilename, clean.Log(dir))
+	} else if err = fs.WriteString(filepath.Join(dir, fs.PPIgnoreFilename), fs.PPIgnoreAll); err != nil {
+		return fmt.Errorf("%s file in %s could not be created", fs.PPIgnoreFilename, clean.Log(dir))
+	}
+
+	// Create originals path if it does not exist yet and return an error if it could be a storage folder.
+	if dir := c.OriginalsPath(); dir == "" {
+		return notFoundError("originals")
+	} else if err := fs.MkdirAll(dir); err != nil {
+		return createError(dir, err)
+	} else if fs.FileExists(filepath.Join(dir, fs.PPStorageFilename)) {
+		return fmt.Errorf("found a %s file in the originals path", fs.PPStorageFilename)
+	}
+
+	// Create import path if it does not exist yet and return an error if it could be a storage folder.
+	if dir := c.ImportPath(); dir == "" {
+		return notFoundError("import")
+	} else if err := fs.MkdirAll(dir); err != nil {
+		return createError(dir, err)
+	} else if fs.FileExists(filepath.Join(dir, fs.PPStorageFilename)) {
+		return fmt.Errorf("found a %s file in the import path", fs.PPStorageFilename)
+	}
+
+	// Create storage path if it doesn't exist yet.
+	if dir := c.UsersStoragePath(); dir == "" {
+		return notFoundError("users storage")
+	} else if err := fs.MkdirAll(dir); err != nil {
+		return createError(dir, err)
+	}
+
+	// Create assets path if it doesn't exist yet.
+	if dir := c.AssetsPath(); dir == "" {
+		return notFoundError("assets")
+	} else if err := fs.MkdirAll(dir); err != nil {
+		return createError(dir, err)
+	}
+
+	// Create command cache storage path if it doesn't exist yet.
+	if dir := c.CmdCachePath(); dir == "" {
+		return notFoundError("cmd cache")
+	} else if err := fs.MkdirAll(dir); err != nil {
+		return createError(dir, err)
+	}
+
+	// Create backup base path if it doesn't exist yet.
+	if dir := c.BackupBasePath(); dir == "" {
+		return notFoundError("backup")
+	} else if err := fs.MkdirAll(dir); err != nil {
+		return createError(dir, err)
+	}
+
+	// Create sidecar storage path if it doesn't exist yet.
+	if dir := c.SidecarPath(); filepath.IsAbs(dir) {
+		if err := fs.MkdirAll(dir); err != nil {
+			return createError(dir, err)
+		}
+	}
+
+	// Create and initialize cache storage directory.
+	if dir := c.CachePath(); dir == "" {
+		return notFoundError("cache")
+	} else if err := fs.MkdirAll(dir); err != nil {
+		return createError(c.CachePath(), err)
+	} else if err = fs.WriteString(filepath.Join(dir, fs.PPIgnoreFilename), fs.PPIgnoreAll); err != nil {
+		return fmt.Errorf("%s file in %s could not be created", fs.PPIgnoreFilename, clean.Log(dir))
+	}
+
+	// Create media cache storage path if it doesn't exist yet.
+	if dir := c.MediaCachePath(); dir == "" {
+		return notFoundError("media")
+	} else if err := fs.MkdirAll(dir); err != nil {
+		return createError(dir, err)
+	}
+
+	// Create thumbnail cache storage path if it doesn't exist yet.
+	if dir := c.ThumbCachePath(); dir == "" {
+		return notFoundError("thumbs")
+	} else if err := fs.MkdirAll(dir); err != nil {
+		return createError(dir, err)
+	}
+
+	// Create and initialize config directory.
+	if dir := c.ConfigPath(); dir == "" {
+		return notFoundError("config")
+	} else if err := fs.MkdirAll(dir); err != nil {
+		return createError(dir, err)
+	} else if err = fs.WriteString(filepath.Join(dir, fs.PPIgnoreFilename), fs.PPIgnoreAll); err != nil {
+		return fmt.Errorf("%s file in %s could not be created", fs.PPIgnoreFilename, clean.Log(dir))
+	}
+
+	// Create certificates config path if it doesn't exist yet.
+	if dir := c.CertificatesPath(); dir == "" {
+		return notFoundError("certificates")
+	} else if err := fs.MkdirAll(dir); err != nil {
+		return createError(dir, err)
+	}
+
+	// Create temporary file path if it doesn't exist yet.
+	if dir := c.TempPath(); dir == "" {
+		return notFoundError("temp")
+	} else if err := fs.MkdirAll(dir); err != nil {
+		return createError(dir, err)
+	}
+
+	// Create albums backup path if it doesn't exist yet.
+	if dir := c.BackupAlbumsPath(); dir == "" {
+		return notFoundError("albums")
+	} else if err := fs.MkdirAll(dir); err != nil {
+		return createError(dir, err)
+	}
+
+	// Create computer vision models path if it doesn't exist yet.
+	if dir := c.ModelsPath(); dir == "" {
+		return notFoundError("models")
+	} else if err := fs.MkdirAll(dir); err != nil {
+		return createError(dir, err)
+	}
+
+	// Create frontend build path if it doesn't exist yet.
+	if dir := c.StaticBuildPath(); dir == "" {
+		return notFoundError("build")
+	} else if err := fs.MkdirAll(dir); err != nil {
+		return createError(dir, err)
+	}
+
+	if dir := filepath.Dir(c.PIDFilename()); dir == "" {
+		return notFoundError("pid file")
+	} else if err := fs.MkdirAll(dir); err != nil {
+		return createError(dir, err)
+	}
+
+	if dir := filepath.Dir(c.LogFilename()); dir == "" {
+		return notFoundError("log file")
+	} else if err := fs.MkdirAll(dir); err != nil {
+		return createError(dir, err)
+	}
+
+	if c.DarktableEnabled() {
+		if dir, err := c.CreateDarktableCachePath(); err != nil {
+			return fmt.Errorf("could not create darktable cache path %s", clean.Log(dir))
+		}
+
+		if dir, err := c.CreateDarktableConfigPath(); err != nil {
+			return fmt.Errorf("could not create darktable cache path %s", clean.Log(dir))
+		}
+	}
+
+	return nil
+}
+
+// StoragePath returns the absolute path for generated files like cache and index.
+func (c *Config) StoragePath() string {
+	if c.options.StoragePath == "" {
+		// Default directories.
+		originalsDir := fs.Abs(filepath.Join(c.OriginalsPath(), fs.PPHiddenPathname, fs.StorageDir))
+		storageDir := fs.Abs(fs.StorageDir)
+
+		// Find existing directories.
+		if fs.PathWritable(originalsDir) && !c.ReadOnly() {
+			return originalsDir
+		} else if fs.PathWritable(storageDir) && c.ReadOnly() {
+			return storageDir
+		}
+
+		// Fallback to backup storage path.
+		if fs.PathWritable(c.options.BackupPath) {
+			return fs.Abs(filepath.Join(c.options.BackupPath, fs.StorageDir))
+		}
+
+		// Use .photoprism in home directory?
+		if usr, _ := user.Current(); usr.HomeDir != "" {
+			p := fs.Abs(filepath.Join(usr.HomeDir, fs.PPHiddenPathname, fs.StorageDir))
+
+			if fs.PathWritable(p) || c.ReadOnly() {
+				return p
+			}
+		}
+
+		// Fallback directory in case nothing else works.
+		if c.ReadOnly() {
+			return fs.Abs(filepath.Join(fs.PPHiddenPathname, fs.StorageDir))
+		}
+
+		// Store cache and index in "originals/.photoprism/storage".
+		return originalsDir
+	}
+
+	return fs.Abs(c.options.StoragePath)
+}
+
+// StorageFree returns the percentage of total storage space below which it is considered critically low.
+// A negative value disables the check (the default); 0 or values >= 100 fall back to the disk package default.
+func (c *Config) StorageFree() float64 {
+	if c.options.StorageFree < 0 {
+		return -1
+	} else if c.options.StorageFree == 0 || c.options.StorageFree >= 100 {
+		return disk.StorageLowPct
+	}
+
+	return c.options.StorageFree
+}
+
+// ConfigPath returns the config path.
+func (c *Config) ConfigPath() string {
+	if c.options.ConfigPath == "" {
+		if fs.PathExists(filepath.Join(c.StoragePath(), fs.SettingsDir)) {
+			return filepath.Join(c.StoragePath(), fs.SettingsDir)
+		}
+
+		return filepath.Join(c.StoragePath(), fs.ConfigDir)
+	} else if fs.FileExists(c.options.ConfigPath) {
+		if c.options.OptionsYaml == "" {
+			c.options.OptionsYaml = c.options.ConfigPath
+		}
+
+		c.options.ConfigPath = filepath.Dir(c.options.ConfigPath)
+	}
+
+	return fs.Abs(c.options.ConfigPath)
+}
+
+// KeysPath returns the directory that stores the instance's secret signing keys, e.g. the URL token
+// signing key (config/keys). Portal-role keys (cluster JWT, OIDC session cookie) live under
+// PortalConfigPath instead.
+func (c *Config) KeysPath() string {
+	return filepath.Join(c.ConfigPath(), fs.KeysDir)
+}
+
+// OptionsYaml returns the absolute path to the options configuration file.
+// It relies on fs.ConfigFilePath so legacy `.yml` files keep working while
+// newly created instances may use `.yaml` without additional wiring.
+func (c *Config) OptionsYaml() string {
+	if c.options.OptionsYaml == "" {
+		return fs.ConfigFilePath(c.ConfigPath(), fs.ConfigOptionsName, fs.ExtYml)
+	}
+
+	return fs.Abs(c.options.OptionsYaml)
+}
+
+// resolveConfigPath resolves the config path name from the CLI context.
+func resolveConfigPath(ctx *cli.Context) string {
+	if dir := ctx.String("config-path"); dir != "" {
+		return fs.Abs(dir)
+	}
+
+	storagePath := ctx.String("storage-path")
+
+	if storagePath == "" {
+		return ""
+	}
+
+	storagePath = fs.Abs(storagePath)
+
+	if fs.PathExists(filepath.Join(storagePath, fs.SettingsDir)) {
+		return filepath.Join(storagePath, fs.SettingsDir)
+	}
+
+	return filepath.Join(storagePath, fs.ConfigDir)
+}
+
+// defaultsYaml resolves the defaults file from CLI/env overrides and falls back
+// to `defaults.{yml,yaml}` inside the active config directory when the override
+// is missing or unreadable.
+func defaultsYaml(ctx *cli.Context) string {
+	fileName := ctx.String("defaults-yaml")
+
+	if fileName != "" && fs.FileExistsNotEmpty(fileName) {
+		return fs.Abs(fileName)
+	}
+
+	fileName = fs.ConfigFilePath(resolveConfigPath(ctx), fs.ConfigDefaultsName, fs.ExtYml)
+
+	if fs.FileExistsNotEmpty(fileName) {
+		return fs.Abs(fileName)
+	}
+
+	return ""
+}
+
+// DefaultsYaml returns the defaults file path that was resolved during option
+// initialization (CLI/env override first, then config-path fallback). Callers
+// use this to locate the concrete defaults location without re-running the
+// resolution logic.
+func (c *Config) DefaultsYaml() string {
+	return c.options.DefaultsYaml
+}
+
+// HubConfigFile returns the backend API config filename, honoring either the
+// traditional `.yml` suffix or an existing `.yaml` variant in the config
+// directory.
+func (c *Config) HubConfigFile() string {
+	return fs.ConfigFilePath(c.ConfigPath(), fs.ConfigHubName, fs.ExtYml)
+}
+
+// SettingsYaml returns the path to the UI settings file. Like other helpers it
+// defers to fs.ConfigFilePath so administrators can store the file as
+// `settings.yml` or `settings.yaml`.
+func (c *Config) SettingsYaml() string {
+	return fs.ConfigFilePath(c.ConfigPath(), fs.ConfigSettingsName, fs.ExtYml)
+}
+
+// SettingsYamlDefaults returns the defaults file that should seed new settings
+// files. When both `.yml` and `.yaml` exist, the helper mirrors
+// SettingsYaml()'s selection logic to keep behavior consistent.
+func (c *Config) SettingsYamlDefaults(settingsYml string) string {
+	if settingsYml != "" && fs.FileExists(settingsYml) {
+		// Use regular settings YAML file.
+	} else if defaultsYml := c.DefaultsYaml(); defaultsYml == "" {
+		// Use regular settings YAML file.
+	} else if dir := filepath.Dir(defaultsYml); dir == "" || dir == "." {
+		// Use regular settings YAML file.
+	} else if fileName := fs.ConfigFilePath(dir, fs.ConfigSettingsName, fs.ExtYml); settingsYml == "" || fs.FileExistsNotEmpty(fileName) {
+		// Use default settings YAML file.
+		return fileName
+	}
+
+	return settingsYml
+}
+
+// PIDFilename returns the filename for storing the server process id (pid).
+func (c *Config) PIDFilename() string {
+	if c.options.PIDFilename == "" {
+		return filepath.Join(c.StoragePath(), "photoprism.pid")
+	}
+
+	return fs.Abs(c.options.PIDFilename)
+}
+
+// LogFilename returns the filename for storing server logs.
+func (c *Config) LogFilename() string {
+	if c.options.LogFilename == "" {
+		return filepath.Join(c.StoragePath(), "photoprism.log")
+	}
+
+	return fs.Abs(c.options.LogFilename)
+}
+
+// storageCaseInsensitive, originalsCaseInsensitive, and originalsMounts detect the case mode of the storage
+// and originals paths, and the file systems mounted below originals.
+var (
+	storageCaseInsensitive   = fs.CaseInsensitive
+	originalsCaseInsensitive = fs.CaseInsensitiveDir
+	originalsMounts          = fs.MountPoints
+)
+
+// Case modes of the storage-case and originals-case options.
+const (
+	CaseModeAuto        = Auto
+	CaseModeSensitive   = "sensitive"
+	CaseModeInsensitive = "insensitive"
+)
+
+// StorageCase returns the configured case mode of the storage file system.
+func (c *Config) StorageCase() string {
+	c.options.StorageCase = caseMode("storage-case", c.options.StorageCase)
+	return c.options.StorageCase
+}
+
+// OriginalsCase returns the configured case mode of the originals file system.
+func (c *Config) OriginalsCase() string {
+	c.options.OriginalsCase = caseMode("originals-case", c.options.OriginalsCase)
+	return c.options.OriginalsCase
+}
+
+// caseMode normalizes the value of a case mode option and returns CaseModeAuto, with a warning, if it is invalid.
+func caseMode(name, value string) string {
+	switch mode := strings.ToLower(strings.TrimSpace(value)); mode {
+	case "", CaseModeAuto:
+		return CaseModeAuto
+	case CaseModeSensitive, CaseModeInsensitive:
+		return mode
+	default:
+		log.Warnf("config: invalid %s value %s, using %s", name, clean.LogQuote(value), CaseModeAuto)
+		return CaseModeAuto
+	}
+}
+
+// CaseInsensitive checks if the storage path is case-insensitive.
+func (c *Config) CaseInsensitive() (result bool, err error) {
+	return storageCaseInsensitive(c.StoragePath())
+}
+
+// OriginalsCaseInsensitive checks if the originals path is case-insensitive, without writing to it or opening
+// the folders in skip, and returns an error naming the reason if it cannot tell.
+func (c *Config) OriginalsCaseInsensitive(skip ...string) (insensitive bool, err error) {
+	return originalsCaseInsensitive(c.OriginalsPath(), skip...)
+}
+
+// caseLookups returns the name of the lookup mode for logs.
+func caseLookups(insensitive bool) string {
+	if insensitive {
+		return "case-insensitive"
+	}
+
+	return "case-sensitive"
+}
+
+// initCaseMode makes file lookups case-insensitive where the storage or originals path is, as configured or
+// detected. Detected originals follow the storage mode if their own is unknown, and file systems mounted below
+// them check all case variants; a configured originals mode applies to all folders below originals.
+func (c *Config) initCaseMode() error {
+	logf := log.Debugf
+
+	if c.start {
+		logf = log.Infof
+	}
+
+	var storage bool
+
+	switch c.StorageCase() {
+	case CaseModeAuto:
+		var err error
+
+		if storage, err = c.CaseInsensitive(); err != nil {
+			return err
+		}
+
+		logf("config: using %s lookups for storage (detected)", caseLookups(storage))
+	default:
+		storage = c.StorageCase() == CaseModeInsensitive
+		logf("config: using %s lookups for storage (configured)", caseLookups(storage))
+	}
+
+	fs.SetIgnoreCase(storage)
+
+	originalsPath := c.OriginalsPath()
+
+	if mode := c.OriginalsCase(); mode != CaseModeAuto {
+		originals := mode == CaseModeInsensitive
+		logf("config: using %s lookups for originals (configured)", caseLookups(originals))
+		fs.SetCaseScopes(fs.CaseScope{Dir: originalsPath, Ignore: originals})
+		return nil
+	}
+
+	mounts, mountsErr := originalsMounts(originalsPath)
+
+	switch {
+	case mountsErr == nil:
+	case !errors.Is(mountsErr, os.ErrNotExist):
+		log.Debugf("config: file systems mounted below originals not fully detected (%s)", mountsErr)
+	case runtime.GOOS == "linux":
+		log.Debugf("config: file systems mounted below originals not detected (mount table not found)")
+	}
+
+	scopes := make([]fs.CaseScope, 0, len(mounts)+1)
+
+	if originals, originalsErr := c.OriginalsCaseInsensitive(mounts...); originalsErr != nil {
+		log.Debugf("config: case sensitivity of originals not detected (%s)", originalsErr)
+		logf("config: using %s lookups for originals (storage)", caseLookups(storage))
+	} else {
+		logf("config: using %s lookups for originals (detected)", caseLookups(originals))
+		scopes = append(scopes, fs.CaseScope{Dir: originalsPath, Ignore: originals})
+	}
+
+	if len(mounts) > 0 {
+		log.Debugf("config: %s mounted below originals, checking all case variants there", english.Plural(len(mounts), "file system", "file systems"))
+	}
+
+	for _, m := range mounts {
+		scopes = append(scopes, fs.CaseScope{Dir: m, Ignore: false})
+	}
+
+	fs.SetCaseScopes(scopes...)
+
+	return nil
+}
+
+// OriginalsPath returns the absolute path of the originals, or an empty string if none is configured or
+// found. Converters receive media file names below it as arguments, so the names must not be relative.
+func (c *Config) OriginalsPath() string {
+	if c.options.OriginalsPath == "" {
+		// Try to find the right directory by iterating through a list.
+		c.options.OriginalsPath = fs.FindDir(fs.OriginalPaths)
+	}
+
+	return fs.Abs(c.options.OriginalsPath)
+}
+
+// OriginalsDeletable checks if originals can be deleted.
+func (c *Config) OriginalsDeletable() bool {
+	return !c.ReadOnly() && fs.Writable(c.OriginalsPath()) && c.Settings().Features.Delete
+}
+
+// ImportPath returns the absolute path of the import directory, or an empty string, see OriginalsPath.
+func (c *Config) ImportPath() string {
+	if c.options.ImportPath == "" {
+		// Try to find the right directory by iterating through a list.
+		c.options.ImportPath = fs.FindDir(fs.ImportPaths)
+	}
+
+	return fs.Abs(c.options.ImportPath)
+}
+
+// ImportDest returns the relative originals path to which the files should be imported by default.
+func (c *Config) ImportDest() string {
+	return clean.UserPath(c.options.ImportDest)
+}
+
+// ImportAllow returns the file extensions that users are allowed to import.
+func (c *Config) ImportAllow() fs.ExtList {
+	return fs.NewExtList(c.options.ImportAllow)
+}
+
+// SidecarPath returns the storage path for generated sidecar files (relative or absolute).
+func (c *Config) SidecarPath() string {
+	if c.options.SidecarPath == "" {
+		c.options.SidecarPath = filepath.Join(c.StoragePath(), fs.SidecarDir)
+	}
+
+	return c.options.SidecarPath
+}
+
+// SidecarPathIsAbs checks if sidecar path is absolute.
+func (c *Config) SidecarPathIsAbs() bool {
+	return filepath.IsAbs(c.SidecarPath())
+}
+
+// SidecarWritable checks if sidecar files can be created.
+func (c *Config) SidecarWritable() bool {
+	return !c.ReadOnly() || c.SidecarPathIsAbs()
+}
+
+// UsersPath returns the relative base path for user assets.
+func (c *Config) UsersPath() string {
+	// Set default.
+	if c.options.UsersPath == "" {
+		return fs.UsersDir
+	}
+
+	return clean.UserPath(c.options.UsersPath)
+}
+
+// UsersOriginalsPath returns the users originals base path.
+func (c *Config) UsersOriginalsPath() string {
+	return filepath.Join(c.OriginalsPath(), c.UsersPath())
+}
+
+// UsersStoragePath returns the users storage base path.
+func (c *Config) UsersStoragePath() string {
+	return filepath.Join(c.StoragePath(), fs.UsersDir)
+}
+
+// UserStoragePath returns the storage path for user assets.
+func (c *Config) UserStoragePath(userUid string) string {
+	if !rnd.IsUID(userUid, 0) {
+		return ""
+	}
+
+	dir := filepath.Join(c.UsersStoragePath(), userUid)
+
+	if err := fs.MkdirAll(dir); err != nil {
+		return ""
+	}
+
+	return dir
+}
+
+// UserUploadPath returns the upload path for the specified user, or an error if the user's storage folder
+// is not available.
+func (c *Config) UserUploadPath(userUid, token string) (string, error) {
+	if !rnd.IsUID(userUid, 0) {
+		return "", fmt.Errorf("invalid uid")
+	}
+
+	userDir := c.UserStoragePath(userUid)
+
+	if userDir == "" {
+		return "", fmt.Errorf("user storage folder is not available")
+	}
+
+	dir := filepath.Join(userDir, fs.UploadDir, clean.Token(token))
+
+	if err := fs.MkdirAll(dir); err != nil {
+		return "", err
+	}
+
+	return dir, nil
+}
+
+// UserUploadBatchPath returns the folder in which the files a user uploads under the batch name are
+// staged, creating it if needed. It refuses a name that is empty after cleaning, so a batch never
+// resolves to the upload folder itself.
+func (c *Config) UserUploadBatchPath(userUid, batch string) (string, error) {
+	if name := clean.Token(batch); name == "" {
+		return "", fmt.Errorf("invalid upload batch")
+	} else {
+		return c.UserUploadPath(userUid, name)
+	}
+}
+
+// UserUploadBatchDir returns the folder of an upload batch like UserUploadBatchPath, but creates
+// neither it nor the user's storage folder, so it can be used to look up an existing batch.
+func (c *Config) UserUploadBatchDir(userUid, batch string) (string, error) {
+	if !rnd.IsUID(userUid, 0) {
+		return "", fmt.Errorf("invalid uid")
+	} else if name := clean.Token(batch); name == "" {
+		return "", fmt.Errorf("invalid upload batch")
+	} else {
+		return filepath.Join(c.UsersStoragePath(), userUid, fs.UploadDir, name), nil
+	}
+}
+
+// WebStoragePath returns the path used for serving web content.
+func (c *Config) WebStoragePath() string {
+	return filepath.Join(c.StoragePath(), fs.WebDir)
+}
+
+// TempPath returns the cached temporary directory name e.g. for uploads and downloads.
+func (c *Config) TempPath() string {
+	// Return cached value?
+	if tempPath == "" {
+		tempPath = c.tempPath()
+	}
+
+	return tempPath
+}
+
+// tempPath determines the temporary directory name e.g. for uploads and downloads.
+func (c *Config) tempPath() string {
+	osTempDir := os.TempDir()
+
+	// Empty default?
+	if osTempDir == "" {
+		switch runtime.GOOS {
+		case "android":
+			osTempDir = "/data/local/tmp"
+		case "windows":
+			osTempDir = "C:/Windows/Temp"
+		default:
+			osTempDir = "/tmp"
+		}
+
+		log.Infof("config: empty default temp folder path, using %s", clean.Log(osTempDir))
+	}
+
+	// Check configured temp path first.
+	if c.options.TempPath != "" {
+		if dir := fs.Abs(c.options.TempPath); dir == "" {
+			// Ignore.
+		} else if err := fs.MkdirAll(dir); err != nil {
+			// Ignore.
+		} else if fs.PathWritable(dir) {
+			return dir
+		}
+	}
+
+	// Find alternative temp path based on storage serial checksum.
+	if dir := filepath.Join(osTempDir, "photoprism_"+c.SerialChecksum()); dir == "" {
+		// Ignore.
+	} else if err := fs.MkdirAll(dir); err != nil {
+		// Ignore.
+	} else if fs.PathWritable(dir) {
+		return dir
+	}
+
+	// Find alternative temp path based on built-in TempDir() function.
+	if dir, err := os.MkdirTemp(osTempDir, "photoprism_"); err != nil || dir == "" {
+		// Ignore.
+	} else if err = fs.MkdirAll(dir); err != nil {
+		// Ignore.
+	} else if fs.PathWritable(dir) {
+		return dir
+	}
+
+	return osTempDir
+}
+
+// CachePath returns the path for cache files.
+func (c *Config) CachePath() string {
+	if c.options.CachePath == "" {
+		return filepath.Join(c.StoragePath(), fs.CacheDir)
+	}
+
+	return fs.Abs(c.options.CachePath)
+}
+
+// CmdCachePath returns a path that external CLI tools can use as cache directory.
+func (c *Config) CmdCachePath() string {
+	return filepath.Join(c.CachePath(), fs.CmdDir)
+}
+
+// CmdLibPath returns the dynamic loader path that external CLI tools should use.
+func (c *Config) CmdLibPath() string {
+	if dir := os.Getenv("LD_LIBRARY_PATH"); dir != "" {
+		return dir
+	}
+
+	return "/usr/local/lib:/usr/lib"
+}
+
+// MediaCachePath returns the main media cache path.
+func (c *Config) MediaCachePath() string {
+	return filepath.Join(c.CachePath(), fs.MediaDir)
+}
+
+// MediaFileCachePath returns the cache subdirectory path for a given file hash.
+func (c *Config) MediaFileCachePath(hash string) string {
+	dir := c.MediaCachePath()
+
+	switch len(hash) {
+	case 0:
+		return dir
+	case 1:
+		dir = filepath.Join(dir, hash[0:1])
+	case 2:
+		dir = filepath.Join(dir, hash[0:1], hash[1:2])
+	default:
+		dir = filepath.Join(dir, hash[0:1], hash[1:2], hash[2:3])
+	}
+
+	// Ensure the subdirectory exists, or log an error otherwise.
+	if err := fs.MkdirAll(dir); err != nil {
+		log.Errorf("cache: failed to create subdirectory for media file")
+	}
+
+	return dir
+}
+
+// ThumbCachePath returns the thumbnail storage path.
+func (c *Config) ThumbCachePath() string {
+	return filepath.Join(c.CachePath(), fs.ThumbnailsDir)
+}
+
+// AssetsPath returns the path to static assets for models and templates.
+func (c *Config) AssetsPath() string {
+	if c.options.AssetsPath == "" {
+		// Try to find the right directory by iterating through a list.
+		c.options.AssetsPath = fs.FindDir(fs.AssetPaths)
+	}
+
+	return fs.Abs(c.options.AssetsPath)
+}
+
+// CustomAssetsPath returns the path to custom assets such as icons, models and translations.
+func (c *Config) CustomAssetsPath() string {
+	if c.options.CustomAssetsPath != "" {
+		return fs.Abs(c.options.CustomAssetsPath)
+	}
+
+	return ""
+}
+
+// ProfilesPath returns the path where processing profile files are stored.
+func (c *Config) ProfilesPath() string {
+	return filepath.Join(c.AssetsPath(), fs.ProfilesDir)
+}
+
+// IccProfilesPath returns the path where ICC color profile files are stored.
+func (c *Config) IccProfilesPath() string {
+	return filepath.Join(c.AssetsPath(), "profiles/icc")
+}
+
+// CustomStaticPath returns the custom static assets' path.
+func (c *Config) CustomStaticPath() string {
+	if dir := c.CustomAssetsPath(); dir == "" {
+		return ""
+	} else if dir = filepath.Join(dir, fs.StaticDir); !fs.PathExists(dir) {
+		return ""
+	} else {
+		return dir
+	}
+}
+
+// CustomStaticFile returns the path to a custom static file.
+func (c *Config) CustomStaticFile(fileName string) string {
+	if dir := c.CustomStaticPath(); dir == "" {
+		return ""
+	} else {
+		return filepath.Join(dir, fileName)
+	}
+}
+
+// CustomStaticUri returns the URI to a custom static resource.
+func (c *Config) CustomStaticUri() string {
+	if dir := c.CustomAssetsPath(); dir == "" {
+		return ""
+	} else {
+		return c.CdnUrl(c.BaseUri(CustomStaticUri))
+	}
+}
+
+// CustomStaticAssetUri returns the resource URI of the custom static file asset.
+func (c *Config) CustomStaticAssetUri(res string) string {
+	if dir := c.CustomAssetsPath(); dir == "" {
+		return ""
+	} else {
+		return c.CdnUrl(c.BaseUri(CustomStaticUri)) + "/" + res
+	}
+}
+
+// LocalesPath returns the translation locales path.
+func (c *Config) LocalesPath() string {
+	return filepath.Join(c.AssetsPath(), fs.LocalesDir)
+}
+
+// SamplesPath returns the bundled sample files path.
+func (c *Config) SamplesPath() string {
+	return filepath.Join(c.AssetsPath(), fs.SamplesDir)
+}
+
+// TestdataPath returns the test files path.
+func (c *Config) TestdataPath() string {
+	return filepath.Join(c.StoragePath(), fs.TestdataDir)
+}
+
+// MariadbBin returns the mariadb executable file name.
+func (c *Config) MariadbBin() string {
+	return FindBin("", "mariadb", "mysql")
+}
+
+// MariadbDumpBin returns the mariadb-dump executable file name.
+func (c *Config) MariadbDumpBin() string {
+	return FindBin("", "mariadb-dump", "mysqldump")
+}
+
+// PsqlBin returns the psql executable file name.
+func (c *Config) PsqlBin() string {
+	return FindBin("", "psql")
+}
+
+// PgDumpBin returns the pg_dump executable file name.
+func (c *Config) PgDumpBin() string {
+	return FindBin("", "pg_dump")
+}
+
+// SqliteBin returns the sqlite executable file name.
+func (c *Config) SqliteBin() string {
+	return FindBin("", "sqlite3")
+}
+
+// OriginalsAlbumsPath returns the optional album YAML file path inside originals.
+func (c *Config) OriginalsAlbumsPath() string {
+	return filepath.Join(c.OriginalsPath(), fs.AlbumsDir)
+}

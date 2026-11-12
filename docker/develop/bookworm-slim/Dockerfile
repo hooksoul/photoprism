@@ -1,7 +1,7 @@
 #### Base Image: Debian 12 (Bookworm)
 FROM debian:bookworm-slim
 
-# Copyright © 2018 - 2023 PhotoPrism UG. All rights reserved.
+# Copyright © 2018 - 2026 PhotoPrism UG. All rights reserved.
 #
 # Questions? Email us at hello@photoprism.app or visit our website to learn
 # more about our team, products and services: https://www.photoprism.app/
@@ -21,15 +21,30 @@ ARG TARGETARCH
 ARG BUILD_TAG
 
 # Set environment variables, see https://docs.photoprism.app/getting-started/config-options/.
-ENV PHOTOPRISM_ARCH=$TARGETARCH \
+ENV DO_NOT_TRACK=true \
+    GH_TELEMETRY=false \
+    DISABLE_TELEMETRY=1 \
+    ORT_DISABLE_TELEMETRY=1 \
+    DISABLE_ERROR_REPORTING=1 \
+    DISABLE_FEEDBACK_COMMAND=1 \
+    CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY=1 \
+    CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 \
+    DISABLE_AUTOUPDATER=1 \
+    NO_UPDATE_NOTIFIER=true \
+    NPM_CONFIG_AUDIT=false \
+    NPM_CONFIG_FUND=false \
+    NPM_CONFIG_UPDATE_NOTIFIER=false \
+    PHOTOPRISM_ARCH=$TARGETARCH \
+    PHOTOPRISM_CONTAINER="true" \
     DOCKER_TAG=$BUILD_TAG \
-    DOCKER_ENV="prod" \
-    PS1="\u@$DOCKER_TAG:\w\$ " \
+    PS1="\u@$BUILD_TAG:\w\$ " \
     PATH="/usr/local/sbin:/usr/sbin:/sbin:/usr/local/bin:/usr/bin:/bin:/scripts:/opt/photoprism/bin" \
     LD_LIBRARY_PATH="/usr/local/lib:/usr/lib" \
     TMPDIR="/tmp" \
     DEBIAN_FRONTEND="noninteractive" \
-    TF_CPP_MIN_LOG_LEVEL="2" \
+    TF_CPP_MIN_LOG_LEVEL=4 \
+    TF_ENABLE_ONEDNN_OPTS=1 \
+    MALLOC_ARENA_MAX=2 \
     PROG="photoprism"
 
 # Copy scripts and package sources config.
@@ -43,21 +58,22 @@ RUN echo 'APT::Acquire::Retries "3";' > /etc/apt/apt.conf.d/80retries && \
     echo 'APT::Get::Assume-Yes "true";' > /etc/apt/apt.conf.d/80forceyes && \
     echo 'APT::Get::Fix-Missing "true";' > /etc/apt/apt.conf.d/80fixmissing && \
     echo 'force-confold' > /etc/dpkg/dpkg.cfg.d/force-confold && \
-    apt-get update && apt-get -qq upgrade && \
+    apt-get update && apt-get -qq dist-upgrade && \
     apt-get -qq install \
       libc6 ca-certificates sudo bash tzdata \
-      gpg zip unzip wget curl rsync make nano \
-      jq lsof lshw sqlite3 mariadb-client imagemagick libvips-dev \
-      exiftool darktable rawtherapee libheif-examples librsvg2-bin \
-      ffmpeg libavcodec-extra x264 x265 libvpx7 libwebm1 \
-      libmatroska7 libdvdread8 libebml5 libgav1-bin libatomic1 \
+      xz-utils gpg zip unzip wget curl rsync make nano \
+      jq lsof lshw sqlite3 mariadb-client imagemagick libvips42 libyuv0 \
+      exiftool darktable rawtherapee libheif-examples librsvg2-bin librav1e-dev \
+      ffmpeg libavcodec-extra libdav1d-dev x264 x265 libvpx-dev libwebm-dev \
+      libmatroska-dev libdvdread-dev libebml5 libgav1-bin libatomic1 \
+      iputils-ping dnsutils binutils binutils-gold \
+      ghostscript gsfonts \
     && \
-    echo 'alias ll="ls -alh"' >> /etc/skel/.bashrc && \
-    echo 'export PS1="\u@$DOCKER_TAG:\w\$ "' >> /etc/skel/.bashrc && \
-    echo "ALL ALL=(ALL) NOPASSWD:SETENV: /scripts/entrypoint-init.sh" >> /etc/sudoers.d/init && \
-    cp /etc/skel/.bashrc /root/.bashrc && \
+    cp /scripts/convert/policy.xml /etc/ImageMagick-6/policy.xml && \
+    /scripts/install-bashrc.sh && \
+    /scripts/install-sudoers.sh && \
+    /scripts/install-dircolors.sh && \
     /scripts/create-users.sh && \
-    cp /scripts/heif-convert.sh /usr/local/bin/heif-convert && \
     install -d -m 0777 -o 1000 -g 1000 \
       /photoprism/originals \
       /photoprism/import \
@@ -69,7 +85,7 @@ RUN echo 'APT::Acquire::Retries "3";' > /etc/apt/apt.conf.d/80retries && \
       /photoprism/storage/cache && \
     /scripts/cleanup.sh
 
-# Default working directory.
+# Set default working directory.
 WORKDIR /photoprism
 
 # Expose HTTP and HTTPS ports.

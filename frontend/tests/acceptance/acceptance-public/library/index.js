@@ -6,6 +6,7 @@ import Photo from "../../page-model/photo";
 import Page from "../../page-model/page";
 import Library from "../../page-model/library";
 import Album from "../../page-model/album";
+import Notifies from "../../page-model/notifications";
 
 fixture`Test index`.page`${testcafeconfig.url}`;
 
@@ -15,6 +16,7 @@ const photo = new Photo();
 const page = new Page();
 const library = new Library();
 const album = new Album();
+const notifies = new Notifies();
 
 test.meta("testID", "library-index-001").meta({ type: "short", mode: "public" })(
   "Common: Index files from folder",
@@ -64,10 +66,10 @@ test.meta("testID", "library-index-001").meta({ type: "short", mode: "public" })
     await t
       .click(library.indexTab)
       .click(library.indexFolderSelect)
+      .typeText(library.indexFolderSelect, "/mo", { replace: true })
       .click(page.selectOption.withText("/moment"))
-      .click(library.index)
-      //TODO replace wait
-      .wait(50000);
+      .click(library.index);
+    await notifies.waitForIndexing(50000);
 
     await t.expect(Selector("span").withText("Done.").visible, { timeout: 60000 }).ok();
 
@@ -75,7 +77,7 @@ test.meta("testID", "library-index-001").meta({ type: "short", mode: "public" })
     if (t.browser.platform === "mobile") {
       await t.eval(() => location.reload());
     } else {
-      await toolbar.triggerToolbarAction("reload");
+      await toolbar.triggerToolbarAction("refresh");
     }
     await toolbar.search("cheetah");
 
@@ -87,7 +89,7 @@ test.meta("testID", "library-index-001").meta({ type: "short", mode: "public" })
     await t
       .expect(MomentCountAfterIndex)
       .gt(MomentCount)
-      .click(Selector("a").withText("South Africa 2013"))
+      .click(Selector('div[title="South Africa 2013"]'))
       .expect(Selector(".is-photo").visible)
       .ok();
 
@@ -95,7 +97,7 @@ test.meta("testID", "library-index-001").meta({ type: "short", mode: "public" })
     if (t.browser.platform === "mobile") {
       await t.eval(() => location.reload());
     } else {
-      await toolbar.triggerToolbarAction("reload");
+      await toolbar.triggerToolbarAction("refresh");
     }
     if (t.browser.platform === "mobile") {
       await t.navigateTo("/library/calendar?q=December%202013");
@@ -109,7 +111,7 @@ test.meta("testID", "library-index-001").meta({ type: "short", mode: "public" })
     if (t.browser.platform === "mobile") {
       await t.eval(() => location.reload());
     } else {
-      await toolbar.triggerToolbarAction("reload");
+      await toolbar.triggerToolbarAction("refresh");
     }
     if (t.browser.platform === "mobile") {
       await t.navigateTo("/library/folders?q=moment");

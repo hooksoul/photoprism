@@ -1,0 +1,287 @@
+package server
+
+import (
+	"context"
+	"net/http"
+	"path/filepath"
+	"strings"
+	"sync"
+
+	"github.com/gin-gonic/gin"
+
+	"github.com/photoprism/photoprism/internal/api"
+	"github.com/photoprism/photoprism/internal/auth/acl"
+	"github.com/photoprism/photoprism/internal/config"
+	"github.com/photoprism/photoprism/internal/entity"
+	"github.com/photoprism/photoprism/internal/event"
+	"github.com/photoprism/photoprism/internal/form"
+	"github.com/photoprism/photoprism/internal/server/limiter"
+	"github.com/photoprism/photoprism/pkg/authn"
+	"github.com/photoprism/photoprism/pkg/clean"
+	"github.com/photoprism/photoprism/pkg/fs"
+	"github.com/photoprism/photoprism/pkg/http/header"
+	"github.com/photoprism/photoprism/pkg/log/status"
+	"github.com/photoprism/photoprism/pkg/rnd"
+)
+
+// webDAVManagedWriteKey carries the authenticated principal's managed-file write authority.
+type webDAVManagedWriteKey struct{}
+
+// webDAVUploadProbeKey carries the path boundary for upload-only property probes.
+type webDAVUploadProbeKey struct{}
+
+var webdavAuthMutex = sync.Mutex{}
+
+// BasicAuthRealm is the challenge string returned for WebDAV Basic auth prompts.
+var BasicAuthRealm = "Basic realm=\"WebDAV Authorization Required\""
+
+// setWebDAVUser installs the authenticated user and effective managed-file write permission.
+func setWebDAVUser(c *gin.Context, user *entity.User, sess *entity.Session) {
+	allowed := acl.Rules.Allow(acl.ResourcePhotos, user.AclRole(), acl.FullAccess)
+
+	if sess != nil {
+		allowed = sess.Grants(acl.ResourcePhotos, acl.FullAccess)
+	}
+
+	if sess != nil && c.Request.Method == header.MethodPropfind && !WebDAVSessionPermits(sess, c.Request.Method) {
+		c.Request = c.Request.WithContext(context.WithValue(c.Request.Context(), webDAVUploadProbeKey{}, user.GetUploadPath()))
+	}
+
+	c.Set(gin.AuthUserKey, user)
+	c.Request = c.Request.WithContext(context.WithValue(c.Request.Context(), webDAVManagedWriteKey{}, allowed))
+}
+
+// WebDAVAuth authenticates users and checks WebDAV admission.
+func WebDAVAuth(conf *config.Config) gin.HandlerFunc {
+	// Helper function that extracts the login information from the request headers.
+	var basicAuth = func(c *gin.Context) (username, password, cacheKey string, authorized bool) {
+		// Extract credentials from the HTTP request headers.
+		username, password, cacheKey = header.BasicAuth(c)
+
+		// Fail if the username or password is empty, as
+		// this is not allowed under any circumstances.
+		if username == "" || password == "" || cacheKey == "" {
+			return username, password, "", false
+		}
+
+		// To improve performance, check the cache for already authorized users.
+		if user := entity.CachedWebDAVUser(cacheKey); user != nil {
+			// Add user to request context and return to signal successful authentication.
+			setWebDAVUser(c, user, nil)
+			// Credentials have already been authorized within the one-minute cache lifetime.
+			return username, password, cacheKey, true
+		} else {
+			// Credentials found, but not pre-authorized. If successful, the
+			// authorization will be cached for the next request.
+			return username, password, cacheKey, false
+		}
+	}
+
+	// Authentication handler that is called before WebDAV requests are processed.
+	return func(c *gin.Context) {
+		if c == nil {
+			return
+		}
+
+		generation := entity.CurrentAuthCacheGeneration()
+
+		// Add a vary response header for authentication, if any.
+		if c.GetHeader(header.XAuthToken) != "" {
+			c.Writer.Header().Add(header.Vary, header.XAuthToken)
+		} else if c.GetHeader(header.XSessionID) != "" {
+			c.Writer.Header().Add(header.Vary, header.XSessionID)
+		}
+
+		// Get the client IP address from the request headers
+		// for use in logs and to enforce request rate limits.
+		clientIp := header.ClientIP(c)
+
+		// Get access token, if any.
+		authToken := header.AuthToken(c)
+
+		// Answer a client over the authentication failure limit that presents credentials with 429, without a
+		// credential prompt, before any of them is accepted, including cached basic auth credentials.
+		if limiter.Auth.Reject(clientIp) {
+			if _, _, key := header.BasicAuth(c); key != "" || authToken != "" && rnd.IsAuthAny(authToken) {
+				limiter.Abort(c)
+				return
+			}
+		}
+
+		// Get basic authentication credentials, if any.
+		username, password, cacheKey, authorized := basicAuth(c)
+
+		// Allow requests from already authorized users to be processed.
+		if authorized {
+			return
+		}
+
+		// Use the value provided in the password field as auth token if no token was provided
+		// and the format matches an app password e.g. "OXiV72-wTtiL9-d04jO7-X7XP4p".
+		if username != "" && authToken == "" && rnd.IsAppPassword(password, true) {
+			authToken = password
+		}
+
+		// Check webdav access authorization using an auth token or app password, if provided.
+		if sess, user, sid, cached := WebDAVAuthSession(c, authToken); sess != nil && !WebDAVRequestPermits(sess, c.Request) {
+			event.AuditWarn([]string{clientIp, "webdav", "session %s", "%s", status.Denied}, sess.RefID, clean.Log(c.Request.Method))
+			WebDAVAbortUnauthorized(c)
+			return
+		} else if user != nil && cached {
+			// Add user to request context to signal successful authentication if username is empty or matches.
+			if username == "" || strings.EqualFold(clean.Username(username), user.Username()) {
+				setWebDAVUser(c, user, sess)
+				return
+			}
+
+			limiter.Auth.Reserve(clientIp)
+			event.AuditErr([]string{clientIp, "webdav", "access as %s with authorization granted to %s", status.Denied}, clean.Log(username), clean.Log(user.Username()))
+			WebDAVAbortUnauthorized(c)
+			return
+		} else if sess == nil {
+			// Ignore and try basic auth next.
+		} else if !sess.HasUser() || user == nil {
+			// Log error if session does not belong to an authorized user account.
+			event.AuditErr([]string{clientIp, "webdav", "client %s", "session %s", "access without user account", status.Denied}, clean.Log(sess.GetClientInfo()), sess.RefID)
+			WebDAVAbortUnauthorized(c)
+			return
+		} else if sess.IsApplication() && conf.DisableAppPasswords() {
+			// Disabled app passwords receive the WebDAV re-auth response. Cached credentials
+			// remain subject to explicit invalidation and the one-minute lifetime.
+			limiter.Auth.Reserve(clientIp)
+			event.AuditWarn([]string{clientIp, "webdav", "access with app passwords disabled", status.Denied})
+			WebDAVAbortUnauthorized(c)
+			return
+		} else if sess.IsClient() && sess.InsufficientScope(acl.ResourceWebDAV, nil) {
+			// Deny access if the client scope does not include the WebDAV resource.
+			message := authn.ErrInsufficientScope.Error()
+			event.AuditWarn([]string{clientIp, "webdav", "client %s", "session %s", "access as %s", message}, clean.Log(sess.GetClientInfo()), sess.RefID, clean.LogQuote(user.Username()))
+			WebDAVAbortUnauthorized(c)
+			return
+		} else if !user.CanUseWebDAV() {
+			// Log warning if WebDAV is disabled for this account.
+			message := authn.ErrWebDAVAccessDisabled.Error()
+			event.AuditWarn([]string{clientIp, "webdav", "client %s", "session %s", "access as %s", message}, clean.Log(sess.GetClientInfo()), sess.RefID, clean.LogQuote(user.Username()))
+			WebDAVAbortUnauthorized(c)
+			return
+		} else if username != "" && !strings.EqualFold(clean.Username(username), user.Username()) {
+			limiter.Auth.Reserve(clientIp)
+			// Log warning if auth token username and specified username do not match.
+			message := authn.ErrUsernameDoesNotMatch.Error()
+			event.AuditWarn([]string{clientIp, "webdav", "client %s", "session %s", "access as %s", message}, clean.Log(sess.GetClientInfo()), sess.RefID, clean.LogQuote(user.Username()))
+			WebDAVAbortUnauthorized(c)
+			return
+		} else if err := fs.MkdirAll(filepath.Join(conf.OriginalsPath(), user.GetUploadPath())); err != nil {
+			// Log warning if upload path could not be created.
+			message := authn.ErrFailedToCreateUploadPath.Error()
+			event.AuditWarn([]string{clientIp, "webdav", "client %s", "session %s", "access as %s", message}, clean.Log(sess.GetClientInfo()), sess.RefID, clean.LogQuote(user.Username()))
+			WebDAVAbortServerError(c)
+			return
+		} else {
+			// Update session activity.
+			sess.UpdateLastActive(true)
+
+			// Log successful authentication.
+			event.AuditInfo([]string{clientIp, "webdav", "client %s", "session %s", "access as %s", status.Succeeded}, clean.Log(sess.GetClientInfo()), sess.RefID, clean.LogQuote(user.Username()))
+			event.LoginInfo(clientIp, "webdav", user.Username(), api.UserAgent(c))
+
+			// Cache authentication to improve performance.
+			entity.CacheWebDAVUser(sid, user, generation)
+
+			// Add user to request context and return to signal successful authentication.
+			setWebDAVUser(c, user, sess)
+			return
+		}
+
+		// Re-request authentication if credentials are missing or incomplete.
+		if cacheKey == "" {
+			WebDAVAbortUnauthorized(c)
+			return
+		}
+
+		// Check request rate limit.
+		r := limiter.Login.Request(clientIp)
+
+		// Abort if request rate limit is exceeded.
+		if r.Reject() || limiter.Auth.Reject(clientIp) {
+			limiter.Abort(c)
+			return
+		}
+
+		webdavAuthMutex.Lock()
+		defer webdavAuthMutex.Unlock()
+
+		// User credentials.
+		f := form.Login{
+			Username: username,
+			Password: password,
+		}
+
+		// Name recorded in login events, sanitized as for API logins.
+		loginName := f.CleanUsername()
+
+		// Check credentials and authorization.
+		if user, provider, _, err := entity.Auth(f, nil, c); err != nil {
+			// Abort if authentication has failed.
+			message := authn.ErrInvalidCredentials.Error()
+			event.AuditErr([]string{clientIp, "webdav", "login as %s", message}, clean.LogQuote(username))
+			event.LoginError(clientIp, "webdav", loginName, api.UserAgent(c), message)
+		} else if provider.IsApplication() {
+			// App passwords are authenticated as auth tokens above.
+			event.AuditWarn([]string{clientIp, "webdav", "login as %s", "app password", status.Denied}, clean.LogQuote(username))
+			event.LoginError(clientIp, "webdav", loginName, api.UserAgent(c), authn.ErrInvalidCredentials.Error())
+		} else if user == nil {
+			// Abort if account was not found.
+			message := authn.ErrAccountNotFound.Error()
+			event.AuditErr([]string{clientIp, "webdav", "login as %s", message}, clean.LogQuote(username))
+			event.LoginError(clientIp, "webdav", loginName, api.UserAgent(c), message)
+		} else if !user.CanUseWebDAV() {
+			// Return the reserved request rate limit tokens, even if account isn't allowed to use WebDAV.
+			r.Success()
+
+			// Abort if WebDAV is disabled for this account.
+			message := authn.ErrWebDAVAccessDisabled.Error()
+			event.AuditWarn([]string{clientIp, "webdav", "login as %s", message}, clean.LogQuote(username))
+			event.LoginError(clientIp, "webdav", loginName, api.UserAgent(c), message)
+		} else if err = fs.MkdirAll(filepath.Join(conf.OriginalsPath(), user.GetUploadPath())); err != nil {
+			// Return the reserved request rate limit tokens, even if path could not be created.
+			r.Success()
+
+			// Abort if upload path could not be created.
+			message := authn.ErrFailedToCreateUploadPath.Error()
+			event.AuditWarn([]string{clientIp, "webdav", "login as %s", message}, clean.LogQuote(username))
+			event.LoginError(clientIp, "webdav", loginName, api.UserAgent(c), message)
+			WebDAVAbortServerError(c)
+			return
+		} else {
+			// Return the reserved request rate limit tokens after successful authentication.
+			r.Success()
+
+			// Log successful authentication.
+			event.AuditInfo([]string{clientIp, "webdav", "login as %s", status.Succeeded}, clean.LogQuote(username))
+			event.LoginInfo(clientIp, "webdav", loginName, api.UserAgent(c))
+
+			// Cache authentication to improve performance.
+			entity.CacheWebDAVUser(cacheKey, user, generation)
+
+			// Add user to request context and return to signal successful authentication.
+			setWebDAVUser(c, user, nil)
+			return
+		}
+
+		// Request authentication.
+		WebDAVAbortUnauthorized(c)
+	}
+}
+
+// WebDAVAbortUnauthorized aborts the request with the status unauthorized and requests authentication.
+func WebDAVAbortUnauthorized(c *gin.Context) {
+	c.Header("WWW-Authenticate", BasicAuthRealm)
+	c.AbortWithStatus(http.StatusUnauthorized)
+}
+
+// WebDAVAbortServerError aborts the request with the status internal server error.
+func WebDAVAbortServerError(c *gin.Context) {
+	c.Header("WWW-Authenticate", BasicAuthRealm)
+	c.AbortWithStatus(http.StatusInternalServerError)
+}

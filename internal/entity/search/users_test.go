@@ -1,0 +1,236 @@
+package search
+
+import (
+	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"github.com/photoprism/photoprism/internal/auth/acl"
+	"github.com/photoprism/photoprism/internal/entity"
+	"github.com/photoprism/photoprism/internal/entity/sortby"
+	"github.com/photoprism/photoprism/internal/form"
+	"github.com/photoprism/photoprism/pkg/rnd"
+)
+
+func TestUsers(t *testing.T) {
+	t.Run("Default", func(t *testing.T) {
+		if results, err := Users(form.SearchUsers{}); err != nil {
+			t.Fatal(err)
+		} else {
+			//t.Logf("users: %#v", results)
+			assert.LessOrEqual(t, 2, len(results))
+		}
+	})
+	t.Run("All", func(t *testing.T) {
+		var all entity.Users
+		var err error
+
+		if all, err = Users(form.SearchUsers{All: true}); err != nil {
+			t.Fatal(err)
+		} else if len(all) < 1 {
+			t.Errorf("expected at least one result: #%v", all)
+		} else {
+			result := all[0]
+			assert.Equal(t, -2, result.ID)
+		}
+
+		if results, filterErr := Users(form.SearchUsers{Query: "all"}); filterErr != nil {
+			t.Fatal(filterErr)
+		} else if len(results) != len(all) {
+			t.Errorf("expected %d results: #%v", len(all), results)
+		} else {
+			result := results[0]
+			assert.Equal(t, -2, result.ID)
+		}
+	})
+	t.Run("Deleted", func(t *testing.T) {
+		if results, err := Users(form.SearchUsers{Deleted: true}); err != nil {
+			t.Fatal(err)
+		} else if len(results) < 1 {
+			t.Errorf("expected at least one result: #%v", results)
+		} else {
+			result := results[0]
+			assert.Equal(t, 10000008, result.ID)
+		}
+	})
+	t.Run("DeletedQuery", func(t *testing.T) {
+		if results, err := Users(form.SearchUsers{Query: "deleted"}); err != nil {
+			t.Fatal(err)
+		} else if len(results) < 1 {
+			t.Errorf("expected at least one result: #%v", results)
+		} else {
+			result := results[0]
+			assert.Equal(t, 10000008, result.ID)
+		}
+	})
+	t.Run("DeletedFlag", func(t *testing.T) {
+		if results, err := Users(form.SearchUsers{Deleted: true}); err != nil {
+			t.Fatal(err)
+		} else if len(results) < 1 {
+			t.Errorf("expected at least one result: #%v", results)
+		} else {
+			result := results[0]
+			assert.Equal(t, 10000008, result.ID)
+		}
+
+		if results, err := Users(form.SearchUsers{Query: "deleted:true"}); err != nil {
+			t.Fatal(err)
+		} else if len(results) < 1 {
+			t.Errorf("expected at least one result: #%v", results)
+		} else {
+			result := results[0]
+			assert.Equal(t, 10000008, result.ID)
+		}
+	})
+	t.Run("Limit", func(t *testing.T) {
+		if results, err := Users(form.SearchUsers{Count: 1}); err != nil {
+			t.Fatal(err)
+		} else {
+			//t.Logf("users: %#v", results)
+			assert.LessOrEqual(t, 1, len(results))
+		}
+	})
+	t.Run("Offset", func(t *testing.T) {
+		if results, err := Users(form.SearchUsers{Offset: 1}); err != nil {
+			t.Fatal(err)
+		} else {
+			//t.Logf("users: %#v", results)
+			assert.LessOrEqual(t, 2, len(results))
+		}
+	})
+	t.Run("SearchAlice", func(t *testing.T) {
+		if results, err := Users(form.SearchUsers{Count: 100, Query: "alice"}); err != nil {
+			t.Fatal(err)
+		} else {
+			// t.Logf("users: %#v", results)
+			assert.LessOrEqual(t, 1, len(results))
+			if len(results) > 0 {
+				assert.Equal(t, 5, results[0].ID)
+				assert.Equal(t, "uqxetse3cy5eo9z2", results[0].UserUID)
+				assert.Equal(t, "alice", results[0].UserName)
+			}
+		}
+	})
+	t.Run("SortByName", func(t *testing.T) {
+		if results, err := Users(form.SearchUsers{Count: 100, Order: sortby.Name}); err != nil {
+			t.Fatal(err)
+		} else {
+			// t.Logf("users: %#v", results)
+			assert.LessOrEqual(t, 1, len(results))
+			if len(results) > 0 {
+				assert.Equal(t, "2fa", results[0].UserName)
+				assert.Equal(t, "admin", results[1].UserName)
+			}
+		}
+	})
+	t.Run("SortByDisplayName", func(t *testing.T) {
+		if results, err := Users(form.SearchUsers{Count: 100, Order: sortby.DisplayName}); err != nil {
+			t.Fatal(err)
+		} else {
+			// t.Logf("users: %#v", results)
+			assert.LessOrEqual(t, 1, len(results))
+			if len(results) > 0 {
+				assert.Equal(t, "2FA Enabled", results[0].DisplayName)
+				assert.Equal(t, "Admin", results[1].DisplayName)
+			}
+		}
+	})
+	t.Run("SortByEmail", func(t *testing.T) {
+		if results, err := Users(form.SearchUsers{Count: 100, Offset: 1, Order: sortby.Email}); err != nil {
+			t.Fatal(err)
+		} else {
+			// t.Logf("users: %#v", results)
+			assert.LessOrEqual(t, 1, len(results))
+			if len(results) > 0 {
+				assert.Equal(t, "2FA@example.com", results[0].UserEmail)
+				assert.Equal(t, "alice@example.com", results[1].UserEmail)
+			}
+		}
+	})
+	t.Run("SearchId", func(t *testing.T) {
+		if results, err := Users(form.SearchUsers{Count: 100, Query: "10000023", Order: sortby.CreatedAt}); err != nil {
+			t.Fatal(err)
+		} else {
+			// t.Logf("users: %#v", results)
+			assert.LessOrEqual(t, 1, len(results))
+			if len(results) > 0 {
+				assert.Equal(t, 10000023, results[0].ID)
+			}
+		}
+	})
+	t.Run("SearchUid", func(t *testing.T) {
+		if results, err := Users(form.SearchUsers{Count: 100, Query: "uqxqg7i1kperxvu7", Order: sortby.UpdatedAt}); err != nil {
+			t.Fatal(err)
+		} else {
+			// t.Logf("users: %#v", results)
+			assert.LessOrEqual(t, 1, len(results))
+			if len(results) > 0 {
+				assert.Equal(t, "uqxqg7i1kperxvu7", results[0].UserUID)
+			}
+		}
+	})
+	t.Run("SortByLogin", func(t *testing.T) {
+		if results, err := Users(form.SearchUsers{Count: 100, Offset: 0, Order: sortby.Login}); err != nil {
+			t.Fatal(err)
+		} else {
+			// t.Logf("users: %#v", results)
+			assert.LessOrEqual(t, 1, len(results))
+			if len(results) > 0 {
+				assert.Equal(t, "Gandalf", results[0].DisplayName)
+				assert.Equal(t, "Jane Dow", results[1].DisplayName)
+			}
+		}
+	})
+	t.Run("SortByLoginReversed", func(t *testing.T) {
+		if results, err := Users(form.SearchUsers{Count: 100, Offset: 0, Order: sortby.Login, Reverse: true}); err != nil {
+			t.Fatal(err)
+		} else {
+			// t.Logf("users: %#v", results)
+			assert.LessOrEqual(t, 1, len(results))
+			if len(results) > 0 {
+				assert.Equal(t, "2FA Enabled", results[0].DisplayName)
+				assert.Equal(t, "Not Local", results[1].DisplayName)
+			}
+		}
+	})
+	t.Run("SortByDeleted", func(t *testing.T) {
+		if results, err := Users(form.SearchUsers{Count: 100, Offset: 0, Order: sortby.Deleted, Deleted: true}); err != nil {
+			t.Fatal(err)
+		} else {
+			// t.Logf("users: %#v", results)
+			if assert.Equal(t, 1, len(results)) {
+				assert.Equal(t, "deleted", results[0].UserName)
+			}
+		}
+	})
+	t.Run("SortByDeletedReversed", func(t *testing.T) {
+		if results, err := Users(form.SearchUsers{Count: 100, Offset: 0, Order: sortby.Deleted, Reverse: true, Deleted: true}); err != nil {
+			t.Fatal(err)
+		} else {
+			// t.Logf("users: %#v", results)
+			if assert.Equal(t, 1, len(results)) {
+				assert.Equal(t, "deleted", results[0].UserName)
+			}
+		}
+	})
+}
+
+func TestUsers_Literal(t *testing.T) {
+	base := "zzl" + rnd.Base36(5)
+
+	for _, name := range []string{base + "_a", base + "Xa"} {
+		u := entity.NewUser()
+		u.UserName = name
+		u.UserRole = acl.RoleUser.String()
+		require.NoError(t, u.Create())
+		t.Cleanup(func() { _ = entity.UnscopedDb().Delete(u).Error })
+	}
+
+	result, err := Users(form.SearchUsers{Query: base + "_a", Count: 100})
+	require.NoError(t, err)
+
+	if assert.Len(t, result, 1) {
+		assert.Equal(t, base+"_a", result[0].UserName)
+	}
+}

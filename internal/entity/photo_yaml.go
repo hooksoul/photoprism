@@ -1,20 +1,35 @@
 package entity
 
 import (
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sync"
+	"time"
+	"unicode/utf8"
 
-	"github.com/photoprism/photoprism/pkg/fs"
 	"gopkg.in/yaml.v2"
+
+	"github.com/photoprism/photoprism/pkg/clean"
+	"github.com/photoprism/photoprism/pkg/fs"
+	"github.com/photoprism/photoprism/pkg/txt"
+	"github.com/photoprism/photoprism/pkg/txt/clip"
 )
 
 var photoYamlMutex = sync.Mutex{}
+
+// photoSrcSize is the size of the VARBINARY(8) photo source and type columns in bytes.
+const photoSrcSize = 8
 
 // Yaml returns photo data as YAML string.
 func (m *Photo) Yaml() ([]byte, error) {
 	// Load details if not done yet.
 	m.GetDetails()
+	m.NormalizeValues()
+
+	m.CreatedAt = m.CreatedAt.UTC().Truncate(time.Second)
+	m.UpdatedAt = m.UpdatedAt.UTC().Truncate(time.Second)
 
 	out, err := yaml.Marshal(m)
 
@@ -25,8 +40,16 @@ func (m *Photo) Yaml() ([]byte, error) {
 	return out, err
 }
 
-// SaveAsYaml saves photo data as YAML file.
+// SaveAsYaml writes the photo metadata to a YAML sidecar file with the specified filename.
 func (m *Photo) SaveAsYaml(fileName string) error {
+	if m == nil {
+		return fmt.Errorf("photo entity is nil - you may have found a bug")
+	} else if fileName == "" {
+		return fmt.Errorf("yaml filename is empty")
+	} else if m.PhotoUID == "" {
+		return fmt.Errorf("photo uid is empty")
+	}
+
 	data, err := m.Yaml()
 
 	if err != nil {
@@ -34,7 +57,7 @@ func (m *Photo) SaveAsYaml(fileName string) error {
 	}
 
 	// Make sure directory exists.
-	if err := os.MkdirAll(filepath.Dir(fileName), fs.ModeDir); err != nil {
+	if err = fs.MkdirAll(filepath.Dir(fileName)); err != nil {
 		return err
 	}
 
@@ -42,29 +65,125 @@ func (m *Photo) SaveAsYaml(fileName string) error {
 	defer photoYamlMutex.Unlock()
 
 	// Write YAML data to file.
-	if err := os.WriteFile(fileName, data, fs.ModeFile); err != nil {
+	return fs.WriteFile(fileName, data, fs.ModeFile)
+}
+
+// ErrPhotoYamlName is returned for a photo whose name cannot name a YAML sidecar file.
+var ErrPhotoYamlName = errors.New("photo name is empty or not a file name")
+
+// YamlFileName returns both the absolute file path and the relative name for the YAML sidecar file, e.g. for logging.
+// A photo whose name is empty or not a plain file name has none, as it would name the file of another photo.
+func (m *Photo) YamlFileName(originalsPath, sidecarPath string) (absolute, relative string, err error) {
+	if m == nil || m.PhotoName == "" || m.PhotoName == "." || m.PhotoName == ".." ||
+		filepath.Base(filepath.Join(m.PhotoPath, m.PhotoName)) != m.PhotoName {
+		return "", "", ErrPhotoYamlName
+	}
+
+	absolute, err = fs.FileName(filepath.Join(originalsPath, m.PhotoPath, m.PhotoName), sidecarPath, originalsPath, fs.ExtYml)
+	relative = filepath.Join(m.PhotoPath, m.PhotoName) + fs.ExtYml
+
+	return absolute, relative, err
+}
+
+// SaveSidecarYaml writes the photo metadata to a YAML sidecar file based on the specified storage paths.
+func (m *Photo) SaveSidecarYaml(originalsPath, sidecarPath string) error {
+	if m == nil {
+		return fmt.Errorf("photo entity is nil - you may have found a bug")
+	} else if m.PhotoName == "" {
+		return fmt.Errorf("photo name is empty")
+	} else if m.PhotoUID == "" {
+		return fmt.Errorf("photo uid is empty")
+	}
+
+	// Get photo YAML sidecar filename.
+	fileName, relName, err := m.YamlFileName(originalsPath, sidecarPath)
+
+	if err != nil {
+		log.Warnf("photo: %s (save %s)", err, clean.Log(relName))
 		return err
 	}
+
+	var action string
+
+	if fs.FileExists(fileName) {
+		action = "update"
+	} else {
+		action = "create"
+	}
+
+	// Write photo metadata to YAML sidecar file.
+	if err = m.SaveAsYaml(fileName); err != nil {
+		log.Warnf("photo: %s (%s %s)", err, action, clean.Log(relName))
+		return err
+	}
+
+	log.Debugf("photo: %sd sidecar file %s", action, clean.Log(relName))
 
 	return nil
 }
 
-// LoadFromYaml photo data from a YAML file.
+// LoadFromYaml restores the photo metadata from a YAML sidecar file.
 func (m *Photo) LoadFromYaml(fileName string) error {
-	data, err := os.ReadFile(fileName)
+	if m == nil {
+		return fmt.Errorf("photo entity is nil - you may have found a bug")
+	} else if fileName == "" {
+		return fmt.Errorf("yaml filename is empty")
+	}
+
+	filePath := filepath.Clean(fileName)
+
+	if _, err := fs.StatFile(filePath); err != nil {
+		return err
+	}
+
+	//nolint:gosec // G304: Path is normalized and validated above with fs.StatFile.
+	data, err := os.ReadFile(filePath)
 
 	if err != nil {
 		return err
 	}
 
-	if err := yaml.Unmarshal(data, m); err != nil {
+	if err = yaml.Unmarshal(data, m); err != nil {
 		return err
 	}
+
+	m.NormalizeValues()
+	m.clipYamlValues()
 
 	return nil
 }
 
-// YamlFileName returns the YAML file name.
-func (m *Photo) YamlFileName(originalsPath, sidecarPath string) string {
-	return fs.FileName(filepath.Join(originalsPath, m.PhotoPath, m.PhotoName), sidecarPath, originalsPath, fs.ExtYAML)
+// clipYamlValues limits restored values to the size of their columns, so a backup file cannot
+// make the photo unsavable. Types and sources longer than their column are not known ones.
+func (m *Photo) clipYamlValues() {
+	if len(m.PhotoType) > photoSrcSize {
+		m.PhotoType = MediaImage
+	}
+
+	for _, src := range []*string{&m.TakenSrc, &m.TypeSrc, &m.TitleSrc, &m.CaptionSrc, &m.PlaceSrc} {
+		if len(*src) > photoSrcSize {
+			*src = ""
+		}
+	}
+
+	for _, col := range []struct {
+		value *string
+		size  int
+		bytes bool
+	}{
+		{&m.PhotoTitle, txt.ClipLongName, false},
+		{&m.PhotoCaption, txt.ClipLongText, false},
+		{&m.UUID, 255, true},
+		{&m.OriginalName, 755, true},
+		{&m.TimeZone, 64, true},
+		{&m.PhotoExposure, 64, true},
+		{&m.CameraSerial, 160, true},
+		{&m.CreatedBy, 42, true},
+	} {
+		if col.bytes && len(*col.value) > col.size {
+			*col.value = clip.Bytes(*col.value, col.size)
+		} else if !col.bytes && utf8.RuneCountInString(*col.value) > col.size {
+			*col.value = clip.Runes(*col.value, col.size)
+		}
+	}
 }

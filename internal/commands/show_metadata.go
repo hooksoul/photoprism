@@ -4,19 +4,21 @@ import (
 	"fmt"
 	"sort"
 
-	"github.com/urfave/cli"
+	"github.com/urfave/cli/v2"
 
 	"github.com/photoprism/photoprism/internal/meta"
-	"github.com/photoprism/photoprism/pkg/report"
+	"github.com/photoprism/photoprism/pkg/txt/report"
 )
 
 // ShowMetadataCommand configures the command name, flags, and action.
-var ShowMetadataCommand = cli.Command{
-	Name:  "metadata",
-	Usage: "Displays supported metadata tags and standards",
-	Flags: append(report.CliFlags, cli.BoolFlag{
-		Name:  "short, s",
-		Usage: "hide links to documentation",
+var ShowMetadataCommand = &cli.Command{
+	Name:    "metadata",
+	Aliases: []string{"meta"},
+	Usage:   "Displays supported metadata tags and standards",
+	Flags: append(report.CliFlags, &cli.BoolFlag{
+		Name:    "short",
+		Aliases: []string{"s"},
+		Usage:   "hide links to documentation",
 	}),
 	Action: showMetadataAction,
 }
@@ -35,20 +37,36 @@ func showMetadataAction(ctx *cli.Context) error {
 	})
 
 	// Output overview of supported metadata tags.
-	format := report.CliFormat(ctx)
+	format, formatErr := report.CliFormatStrict(ctx)
+	if formatErr != nil {
+		return formatErr
+	}
+	if format == report.JSON {
+		resp := struct {
+			Items []map[string]string `json:"items"`
+			Docs  []map[string]string `json:"docs,omitempty"`
+		}{
+			Items: report.RowsToObjects(rows, cols),
+		}
+		if !ctx.Bool("short") {
+			resp.Docs = report.RowsToObjects(meta.Docs, []string{"Namespace", "Documentation"})
+		}
+		b, err := report.MarshalJSON(resp)
+		if err != nil {
+			return err
+		}
+		fmt.Println(string(b))
+		return nil
+	}
+
 	result, err := report.RenderFormat(rows, cols, format)
-
 	fmt.Println(result)
-
 	if err != nil || ctx.Bool("short") || format == report.TSV {
 		return err
 	}
-
 	// Documentation links for those who want to delve deeper.
 	result, err = report.RenderFormat(meta.Docs, []string{"Namespace", "Documentation"}, format)
-
 	fmt.Printf("## Metadata Tags by Namespace ##\n\n")
 	fmt.Println(result)
-
 	return err
 }

@@ -1,37 +1,14 @@
-/*
-
-Copyright (c) 2018 - 2023 PhotoPrism UG. All rights reserved.
-
-    This program is free software: you can redistribute it and/or modify
-    it under Version 3 of the GNU Affero General Public License (the "AGPL"):
-    <https://docs.photoprism.app/license/agpl>
-
-    This program is distributed in the hope that it will be useful,
-    but WITHOUT ANY WARRANTY; without even the implied warranty of
-    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-    GNU Affero General Public License for more details.
-
-    The AGPL is supplemented by our Trademark and Brand Guidelines,
-    which describe how our Brand Assets may be used:
-    <https://www.photoprism.app/trademark>
-
-Feel free to send an email to hello@photoprism.app if you have questions,
-want to support our work, or just want to say hello.
-
-Additional information can be found in our Developer Guide:
-<https://docs.photoprism.app/developer-guide/>
-
-*/
-
 import RestModel from "model/rest";
-import Api from "common/api";
+import $api from "common/api";
 import { DateTime } from "luxon";
-import { config } from "app/session";
-import { $gettext } from "common/vm";
+import { $config } from "app/session";
+import { $gettext } from "common/gettext";
 import * as src from "common/src";
+import typeaheadCache from "common/typeahead-cache";
 
-export let BatchSize = 48;
+export let BatchSize = 60;
 
+// Marker represents detected regions (faces or objects) within photos.
 export class Marker extends RestModel {
   getDefaults() {
     return {
@@ -39,7 +16,7 @@ export class Marker extends RestModel {
       FileUID: "",
       Thumb: "",
       Type: "",
-      Src: "",
+      Src: src.Manual,
       Name: "",
       Invalid: false,
       Review: false,
@@ -63,9 +40,15 @@ export class Marker extends RestModel {
   classes(selected) {
     let classes = ["is-marker", "uid-" + this.getId()];
 
-    if (this.Invalid) classes.push("is-invalid");
-    if (this.Review) classes.push("is-review");
-    if (selected) classes.push("is-selected");
+    if (this.Invalid) {
+      classes.push("is-invalid");
+    }
+    if (this.Review) {
+      classes.push("is-review");
+    }
+    if (selected) {
+      classes.push("is-selected");
+    }
 
     return classes;
   }
@@ -84,9 +67,9 @@ export class Marker extends RestModel {
     }
 
     if (this.Thumb) {
-      return `${config.contentUri}/t/${this.Thumb}/${config.previewToken}/${size}`;
+      return `${$config.contentUri}/t/${this.Thumb}/${$config.previewToken}/${size}`;
     } else {
-      return `${config.contentUri}/svg/portrait`;
+      return `${$config.contentUri}/svg/portrait`;
     }
   }
 
@@ -106,7 +89,7 @@ export class Marker extends RestModel {
     return this.update();
   }
 
-  rename() {
+  setName() {
     if (!this.Name || this.Name.trim() === "") {
       // Can't save an empty name.
       return Promise.resolve(this);
@@ -116,15 +99,18 @@ export class Marker extends RestModel {
 
     const payload = { SubjSrc: this.SubjSrc, Name: this.Name };
 
-    return Api.put(this.getEntityResource(), payload).then((resp) =>
-      Promise.resolve(this.setValues(resp.data))
-    );
+    return $api.put(this.getEntityResource(), payload).then((resp) => {
+      this.setValues(resp.data);
+      // Seed the shared people typeahead cache so the saved name is suggestible
+      // immediately, before the subjects WS event (which can lag a quick re-entry
+      // into the next face's name field).
+      typeaheadCache.upsertPerson({ UID: this.SubjUID, Name: this.Name });
+      return Promise.resolve(this);
+    });
   }
 
   clearSubject() {
-    return Api.delete(this.getEntityResource(this.getId()) + "/subject").then((r) =>
-      Promise.resolve(this.setValues(r.data))
-    );
+    return $api.delete(this.getEntityResource(this.getId()) + "/subject").then((r) => Promise.resolve(this.setValues(r.data)));
   }
 
   static batchSize() {

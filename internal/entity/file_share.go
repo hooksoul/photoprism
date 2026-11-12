@@ -2,27 +2,31 @@ package entity
 
 import (
 	"time"
+
+	"github.com/photoprism/photoprism/pkg/clean"
 )
 
+// Status values a file share moves through.
 const (
 	FileShareNew     = "new"
+	FileShareIgnore  = "ignore"
 	FileShareError   = "error"
 	FileShareShared  = "shared"
 	FileShareRemoved = "removed"
 )
 
-// FileShare represents a one-to-many relation between File and Account for pushing files to remote services.
+// FileShare represents remote-sharing state for a file and a single connected service account.
 type FileShare struct {
-	FileID     uint   `gorm:"primary_key;auto_increment:false"`
-	ServiceID  uint   `gorm:"primary_key;auto_increment:false"`
-	RemoteName string `gorm:"primary_key;auto_increment:false;type:VARBINARY(255)"`
-	Status     string `gorm:"type:VARBINARY(16);"`
-	Error      string `gorm:"type:VARBINARY(512);"`
-	Errors     int
-	File       *File
-	Account    *Service
-	CreatedAt  time.Time
-	UpdatedAt  time.Time
+	FileID     uint      `gorm:"primaryKey;autoIncrement:false;size:32" json:"FileID" yaml:"FileID,omitempty"`
+	ServiceID  uint      `gorm:"primaryKey;autoIncrement:false;size:32;index:idx_files_share_service_status" json:"ServiceID" yaml:"ServiceID,omitempty"`
+	RemoteName string    `gorm:"primaryKey;autoIncrement:false;type:bytes;size:1024" json:"RemoteName" yaml:"RemoteName,omitempty"`
+	Status     string    `gorm:"type:bytes;size:16;index:idx_files_share_service_status" json:"Status" yaml:"Status,omitempty"`
+	Error      string    `gorm:"type:bytes;size:512;" json:"Error,omitempty" yaml:"Error,omitempty"`
+	Errors     int       `gorm:"size:32" json:"Errors,omitempty" yaml:"Errors,omitempty"`
+	File       *File     `gorm:"-:migration" json:"File,omitempty" yaml:"-"`
+	Account    *Service  `gorm:"foreignKey:ServiceID;-:migration" json:"Account,omitempty" yaml:"-"`
+	CreatedAt  time.Time `json:"CreatedAt" yaml:"CreatedAt"`
+	UpdatedAt  time.Time `json:"UpdatedAt" yaml:"UpdatedAt"`
 }
 
 // TableName returns the entity table name.
@@ -30,7 +34,7 @@ func (FileShare) TableName() string {
 	return "files_share"
 }
 
-// NewFileShare creates a new entity.
+// NewFileShare creates a new remote-share record with status set to "new".
 func NewFileShare(fileID, accountID uint, remoteName string) *FileShare {
 	result := &FileShare{
 		FileID:     fileID,
@@ -44,13 +48,13 @@ func NewFileShare(fileID, accountID uint, remoteName string) *FileShare {
 	return result
 }
 
-// Updates multiple columns in the database.
-func (m *FileShare) Updates(values interface{}) error {
+// Updates mutates multiple columns on the existing row.
+func (m *FileShare) Updates(values any) error {
 	return UnscopedDb().Model(m).UpdateColumns(values).Error
 }
 
-// Update updates a column value in the database.
-func (m *FileShare) Update(attr string, value interface{}) error {
+// Update mutates a single column on the existing row.
+func (m *FileShare) Update(attr string, value any) error {
 	return UnscopedDb().Model(m).UpdateColumn(attr, value).Error
 }
 
@@ -71,7 +75,7 @@ func FirstOrCreateFileShare(m *FileShare) *FileShare {
 	if err := Db().Where("file_id = ? AND service_id = ? AND remote_name = ?", m.FileID, m.ServiceID, m.RemoteName).First(&result).Error; err == nil {
 		return &result
 	} else if err := m.Create(); err != nil {
-		log.Errorf("file-share: %s", err)
+		log.Errorf("file-share: %s", clean.Error(err))
 		return nil
 	}
 

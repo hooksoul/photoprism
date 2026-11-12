@@ -2,22 +2,40 @@ package entity
 
 import (
 	"fmt"
+	"testing"
 	"time"
 
 	"golang.org/x/crypto/bcrypt"
 
+	"github.com/photoprism/photoprism/pkg/authn"
 	"github.com/photoprism/photoprism/pkg/clean"
 	"github.com/photoprism/photoprism/pkg/txt"
 )
 
-var (
-	PasswordCost = 14
-)
+// PasswordCost is the bcrypt cost of new password hashes in production.
+const PasswordCost = 12
+
+// DefaultPasswordCost is the bcrypt cost new password hashes use, lowered to the minimum in test binaries.
+var DefaultPasswordCost = PasswordCost
+
+// init sets the bcrypt cost for binaries built by "go test", so tests that create accounts hash quickly.
+func init() {
+	DefaultPasswordCost = passwordCost(testing.Testing())
+}
+
+// passwordCost returns the bcrypt cost for new password hashes: the minimum in tests, PasswordCost otherwise.
+func passwordCost(test bool) int {
+	if test {
+		return bcrypt.MinCost
+	}
+
+	return PasswordCost
+}
 
 // Password represents a password hash.
 type Password struct {
-	UID       string    `gorm:"type:VARBINARY(255);primary_key;" json:"UID"`
-	Hash      string    `deepcopier:"skip" gorm:"type:VARBINARY(255);" json:"Hash"`
+	UID       string    `gorm:"type:bytes;size:255;primaryKey;" json:"UID"`
+	Hash      string    `deepcopier:"skip" gorm:"type:bytes;size:255;" json:"Hash"`
 	CreatedAt time.Time `deepcopier:"skip" json:"CreatedAt"`
 	UpdatedAt time.Time `deepcopier:"skip" json:"UpdatedAt"`
 }
@@ -46,12 +64,14 @@ func NewPassword(uid, pw string, allowHash bool) Password {
 
 // SetPassword sets a new password stored as hash.
 func (m *Password) SetPassword(pw string, allowHash bool) error {
+	// Remove leading and trailing white space.
 	pw = clean.Password(pw)
 
-	if l := len(pw); l > txt.ClipPassword {
-		return fmt.Errorf("password is too long")
-	} else if l < 1 {
-		return fmt.Errorf("password is too short")
+	// Check if password is too short or too long.
+	if len([]rune(pw)) < 1 {
+		return authn.ErrPasswordTooShort
+	} else if len(pw) > txt.ClipPassword {
+		return authn.ErrPasswordTooLong
 	}
 
 	// Check if string already is a bcrypt hash.
@@ -62,8 +82,8 @@ func (m *Password) SetPassword(pw string, allowHash bool) error {
 		}
 	}
 
-	// Generate hash from plain text string.
-	if bytes, err := bcrypt.GenerateFromPassword([]byte(pw), PasswordCost); err != nil {
+	// Generate hash from plain text string using the default password cost.
+	if bytes, err := bcrypt.GenerateFromPassword([]byte(pw), DefaultPasswordCost); err != nil {
 		return err
 	} else {
 		m.Hash = string(bytes)
@@ -71,25 +91,25 @@ func (m *Password) SetPassword(pw string, allowHash bool) error {
 	}
 }
 
-// IsValid checks if the password is correct.
-func (m *Password) IsValid(s string) bool {
-	return !m.IsWrong(s)
+// Valid checks if the password is correct.
+func (m *Password) Valid(s string) bool {
+	return !m.Invalid(s)
 }
 
-// IsWrong checks if the specified password is incorrect.
-func (m *Password) IsWrong(s string) bool {
-	if m.IsEmpty() {
-		// No password set.
+// Invalid checks if the specified password is incorrect.
+func (m *Password) Invalid(s string) bool {
+	if m.Empty() {
+		// Invalid, no password set.
 		return true
 	} else if s = clean.Password(s); s == "" {
-		// No password provided.
+		// Invalid, no password provided.
 		return true
 	} else if err := bcrypt.CompareHashAndPassword([]byte(m.Hash), []byte(s)); err != nil {
-		// Wrong password.
+		// Invalid, does not match.
 		return true
 	}
 
-	// Ok.
+	// Not invalid.
 	return false
 }
 
@@ -101,6 +121,15 @@ func (m *Password) Create() error {
 // Save updates the record in the database or inserts a new record if it does not already exist.
 func (m *Password) Save() error {
 	return Db().Save(m).Error
+}
+
+// Delete removes the password record from the database.
+func (m *Password) Delete() error {
+	if m.UID == "" {
+		return fmt.Errorf("missing password uid")
+	}
+
+	return Db().Delete(m).Error
 }
 
 // FindPassword returns an entity pointer if exists.
@@ -116,19 +145,23 @@ func FindPassword(uid string) *Password {
 
 // Cost returns the hashing cost of the currently set password.
 func (m *Password) Cost() (int, error) {
-	if m.IsEmpty() {
-		return 0, fmt.Errorf("password is empty")
+	if m.Empty() {
+		return 0, authn.ErrPasswordRequired
 	}
 
 	return bcrypt.Cost([]byte(m.Hash))
 }
 
-// IsEmpty returns true if the password is not set.
-func (m *Password) IsEmpty() bool {
+// Empty checks if a password has not been set yet.
+func (m *Password) Empty() bool {
 	return m.Hash == ""
 }
 
-// String returns the password hash.
+// String returns the BCrypt Password Hash.
 func (m *Password) String() string {
+	if m == nil {
+		return ""
+	}
+
 	return m.Hash
 }

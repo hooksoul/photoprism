@@ -2,16 +2,20 @@ package config
 
 import (
 	"reflect"
+	"strconv"
 	"strings"
 
+	"github.com/urfave/cli/v2"
+
 	"github.com/photoprism/photoprism/pkg/list"
-	"github.com/urfave/cli"
 )
 
 // CliFlag represents a command-line parameter.
 type CliFlag struct {
-	Flag cli.DocGenerationFlag
-	Tags []string
+	Flag       cli.DocGenerationFlag
+	Tags       []string
+	Secret     bool   // Secret marks the flag as carrying sensitive data.
+	DocDefault string // DocDefault contains the default value for use in docs.
 }
 
 // Skip checks if the parameter should be skipped based on a list of tags.
@@ -23,16 +27,47 @@ func (f CliFlag) Skip(tags []string) bool {
 func (f CliFlag) Fields() reflect.Value {
 	fields := reflect.ValueOf(f.Flag)
 
-	for fields.Kind() == reflect.Ptr {
+	for fields.Kind() == reflect.Pointer {
 		fields = reflect.Indirect(fields)
 	}
 
 	return fields
 }
 
-// Default returns the default value.
+// ApplyDocDefaults makes "--help" print the documented default of every flag that has one.
+//
+// Without it an option whose getter reads zero as "derive it" advertises "(default: 0)", which
+// reads as a value in force rather than the absence of one. Only the help output is affected,
+// since the generated reference already takes DocDefault ahead of the flag.
+func (f CliFlags) ApplyDocDefaults() {
+	for _, flag := range f {
+		if flag.DocDefault == "" {
+			continue
+		}
+
+		if field := flag.Fields().FieldByName("DefaultText"); field.IsValid() && field.CanSet() && field.String() == "" {
+			field.SetString(flag.DocDefault)
+		}
+	}
+}
+
+// Default returns the documented default value of the flag, never the
+// runtime value urfave/cli writes back into f.Value once an environment
+// variable or CLI argument has been applied. Secret flags collapse to
+// DocDefault (or "") regardless of any source-code default so generated
+// docs and config reports stay stable across deployments.
 func (f CliFlag) Default() string {
-	return f.Flag.GetValue()
+	if f.Secret || f.DocDefault != "" {
+		return f.DocDefault
+	}
+
+	text := f.Flag.GetDefaultText()
+
+	if unquoted, err := strconv.Unquote(text); err == nil {
+		return unquoted
+	}
+
+	return text
 }
 
 // Hidden checks if the flag is hidden.
@@ -46,37 +81,65 @@ func (f CliFlag) Hidden() bool {
 	return true
 }
 
-// EnvVar returns the flag environment variable name.
+// EnvVar returns the names of the environment variables as a comma separated string.
 func (f CliFlag) EnvVar() string {
-	field := f.Fields().FieldByName("EnvVar")
-
-	if !field.IsValid() {
-		return ""
-	}
-
-	return field.String()
+	return strings.Join(f.EnvVars(), ", ")
 }
 
-// Name returns the command flag name.
+// EnvVars returns the environment variable names as string slice.
+func (f CliFlag) EnvVars() []string {
+	field := f.Fields().FieldByName("EnvVars")
+
+	if !field.IsValid() {
+		return []string{}
+	}
+
+	if vars := field.Interface().([]string); len(vars) > 0 {
+		return vars
+	}
+
+	return []string{}
+}
+
+// Name returns the command flag names as a comma-separated string.
+func (f CliFlag) String() string {
+	return strings.Join(f.Names(), ", ")
+}
+
+// Name returns the default command flag name.
 func (f CliFlag) Name() string {
-	return f.Flag.GetName()
+	if n := f.Flag.Names(); len(n) > 0 {
+		return n[0]
+	}
+
+	return ""
+}
+
+// Names returns the command flag names as string slice.
+func (f CliFlag) Names() []string {
+	return f.Flag.Names()
 }
 
 // CommandFlag returns the full command flag based on the name.
 func (f CliFlag) CommandFlag() string {
-	n := strings.Split(f.Name(), ",")
-	return "--" + n[0]
+	n := strings.Split(f.String(), ",")
+	return "--" + strings.TrimSpace(n[0])
 }
 
 // Usage returns the command flag usage.
 func (f CliFlag) Usage() string {
-	if list.Contains(f.Tags, EnvSponsor) {
+	switch {
+	case list.Contains(f.Tags, EnvSponsor):
 		return f.Flag.GetUsage() + " *members only*"
-	} else if list.Contains(f.Tags, Essentials) {
-		return f.Flag.GetUsage() + " *essentials*"
-	} else if list.Contains(f.Tags, Plus) {
+	case list.Contains(f.Tags, Portal):
+		return f.Flag.GetUsage() + " *portal*"
+	case list.Contains(f.Tags, Pro):
+		return f.Flag.GetUsage() + " *pro*"
+	case list.Contains(f.Tags, Plus):
 		return f.Flag.GetUsage() + " *plus*"
-	} else {
+	case list.Contains(f.Tags, Essentials):
+		return f.Flag.GetUsage() + " *essentials*"
+	default:
 		return f.Flag.GetUsage()
 	}
 }

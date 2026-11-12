@@ -1,0 +1,240 @@
+package search
+
+import (
+	"strings"
+	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"github.com/photoprism/photoprism/internal/entity"
+	"github.com/photoprism/photoprism/internal/entity/sortby"
+	"github.com/photoprism/photoprism/internal/form"
+	"github.com/photoprism/photoprism/pkg/rnd"
+)
+
+func TestLabels(t *testing.T) {
+	t.Run("SearchWithQuery", func(t *testing.T) {
+		query := form.NewLabelSearch("q:C")
+		query.Count = 1005
+		query.Order = "slug"
+		result, err := Labels(query)
+
+		require.NoError(t, err)
+
+		t.Logf("results: %+v", result)
+
+		assert.LessOrEqual(t, 2, len(result))
+
+		for _, r := range result {
+			assert.IsType(t, Label{}, r)
+			assert.NotEmpty(t, r.ID)
+			assert.NotEmpty(t, r.LabelName)
+			assert.NotEmpty(t, r.LabelSlug)
+			assert.NotEmpty(t, r.CustomSlug)
+
+			if fix, ok := entity.LabelFixtures[r.LabelSlug]; ok {
+				assert.Equal(t, fix.LabelName, r.LabelName)
+				assert.Equal(t, fix.LabelSlug, r.LabelSlug)
+				assert.Equal(t, fix.CustomSlug, r.CustomSlug)
+			}
+		}
+	})
+	t.Run("SearchForCow", func(t *testing.T) {
+		query := form.NewLabelSearch("Q:cow")
+		query.Count = 1005
+		query.Order = "slug"
+		result, err := Labels(query)
+
+		require.NoError(t, err)
+
+		t.Logf("results: %+v", result)
+
+		assert.LessOrEqual(t, 1, len(result))
+
+		for _, r := range result {
+			assert.IsType(t, Label{}, r)
+			assert.NotEmpty(t, r.ID)
+			assert.NotEmpty(t, r.LabelName)
+			assert.NotEmpty(t, r.LabelSlug)
+			assert.NotEmpty(t, r.CustomSlug)
+
+			if fix, ok := entity.LabelFixtures[r.LabelSlug]; ok {
+				assert.Equal(t, fix.LabelName, r.LabelName)
+				assert.Equal(t, fix.LabelSlug, r.LabelSlug)
+				assert.Equal(t, fix.CustomSlug, r.CustomSlug)
+			}
+		}
+	})
+	t.Run("SearchForFavorites", func(t *testing.T) {
+		query := form.NewLabelSearch("Favorite:true")
+		query.Count = 15
+		result, err := Labels(query)
+
+		require.NoError(t, err)
+
+		assert.LessOrEqual(t, 2, len(result))
+
+		for _, r := range result {
+			assert.True(t, r.LabelFavorite)
+			assert.IsType(t, Label{}, r)
+			assert.NotEmpty(t, r.ID)
+			assert.NotEmpty(t, r.LabelName)
+			assert.NotEmpty(t, r.LabelSlug)
+			assert.NotEmpty(t, r.CustomSlug)
+
+			if fix, ok := entity.LabelFixtures[r.LabelSlug]; ok {
+				assert.Equal(t, fix.LabelName, r.LabelName)
+				assert.Equal(t, fix.LabelSlug, r.LabelSlug)
+				assert.Equal(t, fix.CustomSlug, r.CustomSlug)
+			}
+		}
+	})
+	t.Run("OrderCount", func(t *testing.T) {
+		query := form.NewLabelSearch("")
+		query.All = true
+		query.Order = sortby.Count
+		result, err := Labels(query)
+
+		require.NoError(t, err)
+
+		if len(result) < 2 {
+			t.Fatalf("expected multiple labels")
+		}
+
+		if result[0].PhotoCount < result[1].PhotoCount {
+			t.Fatalf("expected descending photo count")
+		}
+	})
+	t.Run("OrderSlug", func(t *testing.T) {
+		query := form.NewLabelSearch("")
+		query.All = true
+		query.Order = sortby.Slug
+		result, err := Labels(query)
+
+		require.NoError(t, err)
+
+		if len(result) < 2 {
+			t.Fatalf("expected multiple labels")
+		}
+
+		if result[0].CustomSlug > result[1].CustomSlug {
+			t.Fatalf("expected slug ascending")
+		}
+	})
+	t.Run("DefaultFilterExcludesLowPriority", func(t *testing.T) {
+		query := form.NewLabelSearch("")
+		result, err := Labels(query)
+
+		require.NoError(t, err)
+
+		for _, label := range result {
+			if !label.LabelFavorite {
+				if label.LabelPriority < 0 || label.PhotoCount <= 1 {
+					t.Fatalf("label %s should have been filtered", label.LabelSlug)
+				}
+			}
+		}
+	})
+	t.Run("SearchWithEmptyQuery", func(t *testing.T) {
+		query := form.NewLabelSearch("")
+		result, err := Labels(query)
+
+		require.NoError(t, err)
+
+		t.Log(result)
+		assert.LessOrEqual(t, 3, len(result))
+	})
+	t.Run("SearchWithInvalidQueryString", func(t *testing.T) {
+		query := form.NewLabelSearch("xxx:bla")
+		result, err := Labels(query)
+
+		assert.Error(t, err, "unknown filter")
+		assert.Empty(t, result)
+	})
+	t.Run("SearchForId", func(t *testing.T) {
+		f := form.SearchLabels{
+			Query:    "",
+			UID:      "ls6sg6b1wowuy3c4",
+			Slug:     "",
+			Name:     "",
+			All:      false,
+			Favorite: false,
+			Count:    0,
+			Offset:   0,
+			Order:    "",
+		}
+
+		result, err := Labels(f)
+
+		require.NoError(t, err)
+
+		assert.Equal(t, "cake", result[0].LabelSlug)
+	})
+	t.Run("SearchForLabelLandscape", func(t *testing.T) {
+		f := form.SearchLabels{
+			Query: "landscape",
+		}
+
+		result, err := Labels(f)
+
+		require.NoError(t, err)
+
+		assert.Equal(t, "flower", result[0].LabelSlug)
+	})
+	t.Run("SearchForHomophoneName", func(t *testing.T) {
+		_, second, _, _ := createHomophoneSearchFixtures(t)
+
+		query := form.NewLabelSearch("Q:吻")
+		query.Count = 1005
+
+		result, err := Labels(query)
+
+		require.NoError(t, err)
+
+		if len(result) != 1 {
+			t.Fatalf("expected one result, got %d", len(result))
+		}
+
+		assert.Equal(t, second.ID, result[0].ID)
+		assert.Equal(t, "吻", result[0].LabelName)
+	})
+	t.Run("NotNil", func(t *testing.T) {
+		f := form.SearchLabels{
+			Query:  "landscape",
+			Count:  100,
+			Offset: 999999,
+		}
+
+		result, err := Labels(f)
+		require.NoError(t, err)
+		assert.NotNil(t, result)
+		assert.Len(t, result, 0)
+	})
+}
+
+func TestLabels_Literal(t *testing.T) {
+	base := "zzl" + rnd.Base36(5)
+
+	// Label names cannot contain "_", which the name cleanup replaces with a space.
+	for _, name := range []string{base + " a", base + "Xa"} {
+		m := entity.NewLabel(name, 0)
+		require.NoError(t, m.Create())
+		t.Cleanup(func() { _ = entity.UnscopedDb().Delete(m).Error })
+	}
+
+	// A partial name has no exact match, so the label names are searched.
+	search := func(q string) (names []string) {
+		results, err := Labels(form.SearchLabels{Query: q, Count: 100})
+		require.NoError(t, err)
+
+		for _, r := range results {
+			names = append(names, strings.ToLower(r.LabelName))
+		}
+
+		return names
+	}
+
+	assert.Empty(t, search(base[1:]+"_a"))
+	assert.Equal(t, []string{base + " a"}, search(base[1:]+" a"))
+}

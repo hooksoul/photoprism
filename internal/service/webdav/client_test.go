@@ -1,0 +1,960 @@
+package webdav
+
+import (
+	"errors"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"testing"
+	"time"
+	"unicode/utf8"
+
+	"github.com/emersion/go-webdav"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"github.com/photoprism/photoprism/pkg/clean"
+	"github.com/photoprism/photoprism/pkg/fs"
+	"github.com/photoprism/photoprism/pkg/rnd"
+	"github.com/photoprism/photoprism/pkg/txt"
+)
+
+const (
+	testUrl  = "http://dummy-webdav/"
+	testUser = "admin"
+	testPass = "photoprism"
+)
+
+// testWebDAVEntry represents a directory entry returned by the test WebDAV server.
+type testWebDAVEntry struct {
+	Href string
+	Dir  bool
+	Size int64
+}
+
+// testWebDAVServerOptions controls quirks exposed by the local WebDAV fixture.
+type testWebDAVServerOptions struct {
+	rejectInfinity             bool
+	duplicateDepthOne          bool
+	redirectSlashlessDepthOne  bool
+	requireBasicAuthOnDepthOne bool
+	requestPathPrefix          string
+	prefixHrefs                bool
+}
+
+// testWebDAVTree defines the depth-1 PROPFIND responses returned by the test server.
+var testWebDAVTree = map[string][]testWebDAVEntry{
+	"/": {
+		{Href: "/", Dir: true},
+		{Href: "/.locks/", Dir: true},
+		{Href: "/.partial-upload", Size: 1},
+		{Href: "/Photos/", Dir: true},
+		{Href: "/Shared/", Dir: true},
+	},
+	"/.locks": {
+		{Href: "/.locks/", Dir: true},
+		{Href: "/.locks/upload.tmp", Size: 2},
+	},
+	"/Photos": {
+		{Href: "/Photos/", Dir: true},
+		{Href: "/Photos/.upload.part", Size: 3},
+		{Href: "/Photos/.staging/", Dir: true},
+		{Href: "/Photos/cover.jpg", Size: 4},
+		{Href: "/Photos/2020/", Dir: true},
+		{Href: "/Photos/2021/", Dir: true},
+	},
+	"/Photos/.staging": {
+		{Href: "/Photos/.staging/", Dir: true},
+		{Href: "/Photos/.staging/incomplete.jpg", Size: 5},
+	},
+	"/Photos/2020": {
+		{Href: "/Photos/2020/", Dir: true},
+		{Href: "/Photos/2020/03/", Dir: true},
+	},
+	"/Photos/2020/03": {
+		{Href: "/Photos/2020/03/", Dir: true},
+	},
+	"/Photos/2021": {
+		{Href: "/Photos/2021/", Dir: true},
+	},
+	"/Shared": {
+		{Href: "/Shared/", Dir: true},
+	},
+}
+
+// newTestWebDAVServer returns a minimal WebDAV endpoint for recursive listing tests.
+func newTestWebDAVServer(rejectInfinity bool) *httptest.Server {
+	return newTestWebDAVServerWithOptions(testWebDAVServerOptions{rejectInfinity: rejectInfinity})
+}
+
+// newTestWebDAVServerWithOptions returns a minimal WebDAV endpoint with optional quirks for regression coverage.
+func newTestWebDAVServerWithOptions(options testWebDAVServerOptions) *httptest.Server {
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != "PROPFIND" {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		rawPath := r.URL.Path
+
+		if prefix := strings.TrimRight(options.requestPathPrefix, "/"); prefix != "" {
+			if !strings.HasPrefix(rawPath, prefix) {
+				http.Error(w, "not found", http.StatusNotFound)
+				return
+			}
+
+			rawPath = strings.TrimPrefix(rawPath, prefix)
+
+			if rawPath == "" {
+				rawPath = "/"
+			}
+		}
+
+		requestPath := testWebDAVCollectionPath(rawPath)
+		depth := strings.ToLower(strings.TrimSpace(r.Header.Get("Depth")))
+
+		if depth == "" {
+			depth = "infinity"
+		}
+
+		if depth == "infinity" && options.rejectInfinity {
+			http.Error(w, `webdav: Depth: infinity is not supported`, http.StatusBadRequest)
+			return
+		}
+
+		var entries []testWebDAVEntry
+
+		switch depth {
+		case "1":
+			if options.redirectSlashlessDepthOne && requestPath != "/" && !strings.HasSuffix(rawPath, "/") {
+				http.Redirect(w, r, rawPath+"/", http.StatusMovedPermanently) //nolint:gosec // G710: test server
+				return
+			}
+
+			if options.requireBasicAuthOnDepthOne {
+				user, pass, ok := r.BasicAuth()
+
+				if !ok || user != testUser || pass != testPass {
+					http.Error(w, "unauthorized", http.StatusUnauthorized)
+					return
+				}
+			}
+
+			entries = testWebDAVDepthOneEntries(requestPath)
+
+			if options.duplicateDepthOne && requestPath == "/Photos" {
+				entries = append(entries,
+					testWebDAVEntry{Href: "/Photos/2020/", Dir: true},
+					testWebDAVEntry{Href: "/Photos/cover.jpg", Size: 4},
+				)
+			}
+		case "infinity":
+			entries = testWebDAVDepthInfinityEntries(requestPath)
+		default:
+			http.Error(w, "unsupported depth", http.StatusBadRequest)
+			return
+		}
+
+		if len(entries) == 0 {
+			http.Error(w, "not found", http.StatusNotFound)
+			return
+		}
+
+		// Servers return paths that include the endpoint path.
+		if prefix := strings.TrimRight(options.requestPathPrefix, "/"); prefix != "" && options.prefixHrefs {
+			prefixed := make([]testWebDAVEntry, len(entries))
+
+			for i, entry := range entries {
+				prefixed[i] = entry
+				prefixed[i].Href = prefix + entry.Href
+			}
+
+			entries = prefixed
+		}
+
+		w.Header().Set("Content-Type", "application/xml; charset=utf-8")
+		w.WriteHeader(http.StatusMultiStatus)
+		//nolint:gosec // test fixture emits locally generated WebDAV XML only
+		_, _ = w.Write([]byte(testWebDAVMultiStatus(entries)))
+	}))
+}
+
+// newSlowWebDAVServer returns a WebDAV-like server that responds after a fixed delay.
+func newSlowWebDAVServer(delay time.Duration, slowHeaders bool) *httptest.Server {
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case "MKCOL":
+			time.Sleep(delay)
+			w.WriteHeader(http.StatusCreated)
+		case http.MethodDelete:
+			time.Sleep(delay)
+			w.WriteHeader(http.StatusNoContent)
+		case "PROPFIND":
+			time.Sleep(delay)
+			w.Header().Set("Content-Type", "application/xml; charset=utf-8")
+			w.WriteHeader(http.StatusMultiStatus)
+			_, _ = io.WriteString(w, testWebDAVMultiStatus(testWebDAVDepthOneEntries("/")))
+		case http.MethodGet:
+			if slowHeaders {
+				time.Sleep(delay)
+			}
+			w.WriteHeader(http.StatusOK)
+			_, _ = io.WriteString(w, "test")
+		case http.MethodPut:
+			_, _ = io.Copy(io.Discard, r.Body)
+			_ = r.Body.Close()
+			if slowHeaders {
+				time.Sleep(delay)
+			}
+			w.WriteHeader(http.StatusCreated)
+		default:
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		}
+	}))
+}
+
+// testWebDAVCollectionPath normalizes collection paths used by the test server.
+func testWebDAVCollectionPath(value string) string {
+	if value = path.Clean("/" + strings.TrimSpace(value)); value != "." {
+		return value
+	}
+
+	return "/"
+}
+
+// testWebDAVDepthOneEntries returns the direct child entries for a collection path.
+func testWebDAVDepthOneEntries(collectionPath string) []testWebDAVEntry {
+	return testWebDAVTree[testWebDAVCollectionPath(collectionPath)]
+}
+
+// testWebDAVDepthInfinityEntries returns the full subtree for a collection path.
+func testWebDAVDepthInfinityEntries(collectionPath string) (result []testWebDAVEntry) {
+	queue := []string{testWebDAVCollectionPath(collectionPath)}
+	traversed := map[string]bool{testWebDAVCollectionPath(collectionPath): true}
+	seen := map[string]bool{}
+
+	for len(queue) > 0 {
+		current := queue[0]
+		queue = queue[1:]
+
+		for _, entry := range testWebDAVDepthOneEntries(current) {
+			entryPath := testWebDAVCollectionPath(entry.Href)
+
+			if !seen[entryPath] {
+				seen[entryPath] = true
+				result = append(result, entry)
+			}
+
+			if entry.Dir && entryPath != current && !traversed[entryPath] {
+				traversed[entryPath] = true
+				queue = append(queue, entryPath)
+			}
+		}
+	}
+
+	return result
+}
+
+// testWebDAVMultiStatus renders a simple 207 Multi-Status XML document for the test server.
+func testWebDAVMultiStatus(entries []testWebDAVEntry) string {
+	var builder strings.Builder
+
+	builder.WriteString(`<?xml version="1.0" encoding="utf-8"?>`)
+	builder.WriteString(`<D:multistatus xmlns:D="DAV:">`)
+
+	for _, entry := range entries {
+		builder.WriteString(`<D:response>`)
+		builder.WriteString(`<D:href>`)
+		builder.WriteString(entry.Href)
+		builder.WriteString(`</D:href>`)
+		builder.WriteString(`<D:propstat><D:prop><D:resourcetype>`)
+
+		if entry.Dir {
+			builder.WriteString(`<D:collection/>`)
+		}
+
+		builder.WriteString(`</D:resourcetype>`)
+		builder.WriteString(`<D:getlastmodified>Mon, 02 Jan 2006 15:04:05 GMT</D:getlastmodified>`)
+
+		if !entry.Dir {
+			builder.WriteString(`<D:getcontentlength>`)
+			builder.WriteString(strconv.FormatInt(entry.Size, 10))
+			builder.WriteString(`</D:getcontentlength>`)
+		}
+
+		builder.WriteString(`</D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat>`)
+		builder.WriteString(`</D:response>`)
+	}
+
+	builder.WriteString(`</D:multistatus>`)
+
+	return builder.String()
+}
+
+func TestClientUrl(t *testing.T) {
+	result, err := clientUrl(testUrl, testUser, testPass)
+
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	assert.Equal(t, "http://admin:photoprism@dummy-webdav/", result.String())
+}
+
+func TestNewClient(t *testing.T) {
+	t.Run("Success", func(t *testing.T) {
+		c, err := NewClient(testUrl, testUser, testPass, TimeoutLow, "")
+
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		assert.IsType(t, &Client{}, c)
+	})
+	t.Run("InvalidCIDR", func(t *testing.T) {
+		c, err := NewClient(testUrl, testUser, testPass, TimeoutLow, "not-a-cidr")
+		assert.Nil(t, c)
+		assert.Error(t, err)
+	})
+}
+
+func TestClient_Files(t *testing.T) {
+	c, err := NewClient(testUrl, testUser, testPass, TimeoutLow, "")
+
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	assert.IsType(t, &Client{}, c)
+
+	t.Run("NonRecursive", func(t *testing.T) {
+		files, err := c.Files("Photos", false)
+
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if len(files) == 0 {
+			t.Fatal("no files found")
+		}
+	})
+	t.Run("Recursive", func(t *testing.T) {
+		files, err := c.Files("Photos", true)
+
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if len(files) == 0 {
+			t.Fatal("no files found")
+		}
+	})
+}
+
+func TestClient_Directories(t *testing.T) {
+	c, err := NewClient(testUrl, testUser, testPass, TimeoutLow, "")
+
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	assert.IsType(t, &Client{}, c)
+
+	t.Run("NonRecursive", func(t *testing.T) {
+		dirs, err := c.Directories("", false, MaxRequestDuration)
+
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if len(dirs) == 0 {
+			t.Fatal("no directories found")
+		}
+
+		assert.IsType(t, fs.FileInfo{}, dirs[0])
+		assert.Equal(t, "Photos", dirs[0].Name)
+		assert.Equal(t, "/Photos", dirs[0].Abs)
+		assert.Equal(t, true, dirs[0].Dir)
+		assert.Equal(t, int64(0), dirs[0].Size)
+	})
+	t.Run("Recursive", func(t *testing.T) {
+		dirs, err := c.Directories("", true, 0)
+
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if len(dirs) < 2 {
+			t.Fatal("at least 2 directories expected")
+		}
+	})
+}
+
+func TestClient_DirectoriesDepthFallback(t *testing.T) {
+	expected := []string{"/", "/Photos", "/Photos/2020", "/Photos/2020/03", "/Photos/2021", "/Shared"}
+
+	t.Run("RecursiveFastPath", func(t *testing.T) {
+		server := newTestWebDAVServer(false)
+		t.Cleanup(server.Close)
+
+		client, err := NewClient(server.URL+"/", "", "", TimeoutLow, "")
+		require.NoError(t, err)
+
+		dirs, err := client.Directories("", true, MaxRequestDuration)
+		require.NoError(t, err)
+		assert.ElementsMatch(t, expected, dirs.Abs())
+	})
+	t.Run("DepthOneFallback", func(t *testing.T) {
+		server := newTestWebDAVServer(true)
+		t.Cleanup(server.Close)
+
+		client, err := NewClient(server.URL+"/", "", "", TimeoutLow, "")
+		require.NoError(t, err)
+
+		dirs, err := client.Directories("", true, MaxRequestDuration)
+		require.NoError(t, err)
+		assert.ElementsMatch(t, expected, dirs.Abs())
+	})
+	t.Run("DepthOneFallbackUsesCollectionPaths", func(t *testing.T) {
+		server := newTestWebDAVServerWithOptions(testWebDAVServerOptions{
+			rejectInfinity:             true,
+			redirectSlashlessDepthOne:  true,
+			requireBasicAuthOnDepthOne: true,
+		})
+		t.Cleanup(server.Close)
+
+		client, err := NewClient(server.URL+"/", testUser, testPass, TimeoutLow, "")
+		require.NoError(t, err)
+
+		dirs, err := client.Directories("", true, MaxRequestDuration)
+		require.NoError(t, err)
+		assert.ElementsMatch(t, expected, dirs.Abs())
+	})
+	t.Run("DepthOneFallbackPreservesEndpointPrefix", func(t *testing.T) {
+		server := newTestWebDAVServerWithOptions(testWebDAVServerOptions{
+			rejectInfinity:             true,
+			redirectSlashlessDepthOne:  true,
+			requireBasicAuthOnDepthOne: true,
+			requestPathPrefix:          "/dav",
+		})
+		t.Cleanup(server.Close)
+
+		client, err := NewClient(server.URL+"/dav/", testUser, testPass, TimeoutLow, "")
+		require.NoError(t, err)
+
+		dirs, err := client.Directories("", true, MaxRequestDuration)
+		require.NoError(t, err)
+		assert.ElementsMatch(t, expected, dirs.Abs())
+	})
+	t.Run("EndpointPathInHrefs", func(t *testing.T) {
+		// Paths are checked below the endpoint path, whose own names may look hidden.
+		for _, rejectInfinity := range []bool{false, true} {
+			server := newTestWebDAVServerWithOptions(testWebDAVServerOptions{
+				rejectInfinity:    rejectInfinity,
+				requestPathPrefix: "/~user/.dav",
+				prefixHrefs:       true,
+			})
+			t.Cleanup(server.Close)
+
+			client, err := NewClient(server.URL+"/~user/.dav/", "", "", TimeoutLow, "")
+			require.NoError(t, err)
+
+			dirs, err := client.Directories("", true, MaxRequestDuration)
+			require.NoError(t, err)
+			assert.ElementsMatch(t, expected, dirs.Abs(), "rejectInfinity=%t", rejectInfinity)
+
+			if !rejectInfinity {
+				files, err := client.Files("Photos", false)
+				require.NoError(t, err)
+				assert.NotEmpty(t, files)
+
+				for _, f := range files {
+					assert.True(t, strings.HasPrefix(f.Abs, "/Photos/"), f.Abs)
+				}
+			}
+		}
+	})
+}
+
+func TestClient_DirectoriesDepthFallback_DeduplicatesEntries(t *testing.T) {
+	server := newTestWebDAVServerWithOptions(testWebDAVServerOptions{
+		rejectInfinity:    true,
+		duplicateDepthOne: true,
+	})
+	t.Cleanup(server.Close)
+
+	client, err := NewClient(server.URL+"/", "", "", TimeoutLow, "")
+	require.NoError(t, err)
+
+	dirs, err := client.Directories("Photos", true, MaxRequestDuration)
+	require.NoError(t, err)
+	assert.ElementsMatch(t, []string{"/Photos", "/Photos/2020", "/Photos/2020/03", "/Photos/2021"}, dirs.Abs())
+}
+
+func TestClient_FilesExcludeHiddenEntries(t *testing.T) {
+	server := newTestWebDAVServer(false)
+	t.Cleanup(server.Close)
+
+	client, err := NewClient(server.URL+"/", "", "", TimeoutLow, "")
+	require.NoError(t, err)
+
+	t.Run("NonRecursive", func(t *testing.T) {
+		files, err := client.Files("Photos", false)
+		require.NoError(t, err)
+		require.Len(t, files, 1)
+		assert.Equal(t, "/Photos/cover.jpg", files[0].Abs)
+	})
+	t.Run("Recursive", func(t *testing.T) {
+		files, err := client.Files("", true)
+		require.NoError(t, err)
+
+		paths := files.Abs()
+		assert.Contains(t, paths, "/Photos/cover.jpg")
+		assert.NotContains(t, paths, "/.partial-upload")
+		assert.NotContains(t, paths, "/.locks/upload.tmp")
+		assert.NotContains(t, paths, "/Photos/.upload.part")
+		assert.NotContains(t, paths, "/Photos/.staging/incomplete.jpg")
+	})
+}
+
+func TestClient_OperationTimeouts(t *testing.T) {
+	server := newSlowWebDAVServer(200*time.Millisecond, false)
+	t.Cleanup(server.Close)
+
+	client, err := NewClient(server.URL+"/", "", "", TimeoutLow, "")
+	require.NoError(t, err)
+	client.timeout = 25 * time.Millisecond
+
+	t.Run("Mkdir", func(t *testing.T) {
+		err := client.Mkdir("slow-dir")
+		require.Error(t, err)
+		assert.True(t, strings.Contains(err.Error(), "Client.Timeout") || strings.Contains(err.Error(), "context deadline exceeded"))
+	})
+	t.Run("Files", func(t *testing.T) {
+		_, err := client.Files("", false)
+		require.Error(t, err)
+		assert.True(t, strings.Contains(err.Error(), "Client.Timeout") || strings.Contains(err.Error(), "context deadline exceeded"))
+	})
+	t.Run("Delete", func(t *testing.T) {
+		err := client.Delete("/slow.txt")
+		require.Error(t, err)
+		assert.True(t, strings.Contains(err.Error(), "Client.Timeout") || strings.Contains(err.Error(), "context deadline exceeded"))
+	})
+}
+
+func TestClient_TransferOperationsIgnoreServiceTimeout(t *testing.T) {
+	server := newSlowWebDAVServer(200*time.Millisecond, false)
+	t.Cleanup(server.Close)
+
+	client, err := NewClient(server.URL+"/", "", "", TimeoutLow, "")
+	require.NoError(t, err)
+	client.timeout = 25 * time.Millisecond
+
+	t.Run("Upload", func(t *testing.T) {
+		err := client.Upload(fs.Abs("testdata/example.jpg"), "slow-upload.jpg")
+		require.NoError(t, err)
+	})
+	t.Run("Download", func(t *testing.T) {
+		dest := filepath.Join(t.TempDir(), "slow.txt")
+		err := client.Download("/slow.txt", dest, false)
+		require.NoError(t, err)
+
+		//nolint:gosec // test reads back a file created in t.TempDir()
+		data, readErr := os.ReadFile(dest)
+		require.NoError(t, readErr)
+		assert.Equal(t, "test", string(data))
+	})
+}
+
+func TestClient_TransferOperationsIgnoreSlowResponseHeaders(t *testing.T) {
+	server := newSlowWebDAVServer(200*time.Millisecond, true)
+	t.Cleanup(server.Close)
+
+	client, err := NewClient(server.URL+"/", "", "", TimeoutLow, "")
+	require.NoError(t, err)
+	client.timeout = 25 * time.Millisecond
+
+	t.Run("UploadResponseHeaders", func(t *testing.T) {
+		err := client.Upload(fs.Abs("testdata/example.jpg"), "slow-upload.jpg")
+		require.NoError(t, err)
+	})
+	t.Run("DownloadResponseHeaders", func(t *testing.T) {
+		dest := filepath.Join(t.TempDir(), "slow.txt")
+		err := client.Download("/slow.txt", dest, false)
+		require.NoError(t, err)
+		assert.True(t, fs.FileExists(dest))
+	})
+}
+
+func TestClient_UploadAndDelete(t *testing.T) {
+	c, err := NewClient(testUrl, testUser, testPass, TimeoutLow, "")
+
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	assert.IsType(t, &Client{}, c)
+
+	tempName := rnd.UUID() + fs.ExtJpeg
+
+	if err := c.Upload(fs.Abs("testdata/example.jpg"), tempName); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := c.Delete(tempName); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestClient_Download(t *testing.T) {
+	c, err := NewClient(testUrl, testUser, testPass, TimeoutDefault, "")
+
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	assert.IsType(t, &Client{}, c)
+
+	files, err := c.Files("Photos", false)
+
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	tempDir := filepath.Join(os.TempDir(), rnd.UUID())
+	tempFile := tempDir + "/foo.jpg"
+
+	if len(files) == 0 {
+		t.Fatal("no files to download")
+	}
+
+	if err := c.Download(files[0].Abs, tempFile, false); err != nil {
+		t.Fatal(err)
+	}
+
+	if !fs.FileExists(tempFile) {
+		t.Fatalf("%s does not exist", tempFile)
+	}
+
+	if err := os.RemoveAll(tempDir); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestClient_DownloadDir(t *testing.T) {
+	c, err := NewClient(testUrl, testUser, testPass, TimeoutLow, "")
+
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	assert.IsType(t, &Client{}, c)
+
+	t.Run("NonRecursive", func(t *testing.T) {
+		tempDir := filepath.Join(os.TempDir(), rnd.UUID())
+
+		if err = os.RemoveAll(tempDir); err != nil {
+			t.Fatal(err)
+		}
+
+		if errs := c.DownloadDir("Photos", tempDir, false, false); len(errs) > 0 {
+			t.Fatal(errs)
+		}
+
+		if err = os.RemoveAll(tempDir); err != nil {
+			t.Fatal(err)
+		}
+	})
+	t.Run("Recursive", func(t *testing.T) {
+		tempDir := filepath.Join(os.TempDir(), rnd.UUID())
+
+		if err = os.RemoveAll(tempDir); err != nil {
+			t.Fatal(err)
+		}
+
+		if errs := c.DownloadDir("Photos", tempDir, true, false); len(errs) > 0 {
+			t.Fatal(errs)
+		}
+
+		if err = os.RemoveAll(tempDir); err != nil {
+			t.Fatal(err)
+		}
+	})
+}
+
+func TestClient_DownloadLimit(t *testing.T) {
+	const bodySize = 2048
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		//nolint:gosec // test fixture writes a locally generated payload only
+		_, _ = w.Write(make([]byte, bodySize))
+	}))
+	t.Cleanup(server.Close)
+
+	newClient := func(t *testing.T) *Client {
+		t.Helper()
+		c, err := NewClient(server.URL+"/", "", "", TimeoutLow, "")
+		require.NoError(t, err)
+		return c
+	}
+
+	t.Run("OverLimitRejected", func(t *testing.T) {
+		client := newClient(t)
+		client.SetDownloadLimit(1024)
+		dest := filepath.Join(t.TempDir(), "big.bin")
+		err := client.Download("/big.bin", dest, false)
+		require.Error(t, err)
+		// The oversized partial file must not be left behind.
+		assert.False(t, fs.FileExists(dest))
+	})
+	t.Run("UnderLimitAccepted", func(t *testing.T) {
+		client := newClient(t)
+		client.SetDownloadLimit(4096)
+		dest := filepath.Join(t.TempDir(), "ok.bin")
+		err := client.Download("/ok.bin", dest, false)
+		require.NoError(t, err)
+		info, statErr := os.Stat(dest)
+		require.NoError(t, statErr)
+		assert.Equal(t, int64(bodySize), info.Size())
+	})
+	t.Run("ZeroLimitUnbounded", func(t *testing.T) {
+		client := newClient(t)
+		client.SetDownloadLimit(-1)
+		dest := filepath.Join(t.TempDir(), "unbounded.bin")
+		err := client.Download("/unbounded.bin", dest, false)
+		require.NoError(t, err)
+		info, statErr := os.Stat(dest)
+		require.NoError(t, statErr)
+		assert.Equal(t, int64(bodySize), info.Size())
+	})
+}
+
+func TestClient_Upload(t *testing.T) {
+	var gotPath, gotUser, gotPass string
+	var gotLength int64
+	var gotBody []byte
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch path.Base(r.URL.Path) {
+		case "forbidden.yml":
+			w.WriteHeader(http.StatusForbidden)
+		case "failed.jpg":
+			w.WriteHeader(http.StatusInternalServerError)
+		case "toolarge.mp4":
+			w.WriteHeader(http.StatusRequestEntityTooLarge)
+		case "unsupported.heic":
+			w.WriteHeader(http.StatusUnsupportedMediaType)
+		case "conflict.jpg":
+			w.WriteHeader(http.StatusConflict)
+		case "unauthorized.jpg":
+			w.WriteHeader(http.StatusUnauthorized)
+		case "busy.jpg":
+			w.WriteHeader(http.StatusTooManyRequests)
+		case "full.jpg":
+			w.WriteHeader(http.StatusInsufficientStorage)
+		case "moved.jpg":
+			w.Header().Set("Location", "/dav/elsewhere.jpg")
+			w.WriteHeader(http.StatusPermanentRedirect)
+		case "redirect.jpg":
+			http.Redirect(w, r, "/dav/elsewhere.jpg", http.StatusFound)
+		case "elsewhere.jpg":
+			w.WriteHeader(http.StatusOK)
+		default:
+			gotPath, gotLength = r.URL.Path, r.ContentLength
+			gotUser, gotPass, _ = r.BasicAuth()
+			gotBody, _ = io.ReadAll(r.Body)
+			w.WriteHeader(http.StatusCreated)
+		}
+	}))
+	t.Cleanup(server.Close)
+
+	client, err := NewClient(server.URL+"/dav/", testUser, testPass, TimeoutLow, "")
+	require.NoError(t, err)
+
+	src := fs.Abs("testdata/example.jpg")
+	data, err := os.ReadFile(src) //nolint:gosec // Test reads a controlled fixture.
+	require.NoError(t, err)
+
+	t.Run("Success", func(t *testing.T) {
+		require.NoError(t, client.Upload(src, "/folder/example.jpg"))
+		assert.Equal(t, "/dav/folder/example.jpg", gotPath)
+		assert.Equal(t, int64(len(data)), gotLength)
+		assert.Equal(t, data, gotBody)
+		assert.Equal(t, testUser, gotUser)
+		assert.Equal(t, testPass, gotPass)
+	})
+	t.Run("Forbidden", func(t *testing.T) {
+		err := client.Upload(src, "folder/forbidden.yml")
+		require.Error(t, err)
+		assert.ErrorIs(t, err, ErrForbidden)
+	})
+	t.Run("ServerError", func(t *testing.T) {
+		err := client.Upload(src, "folder/failed.jpg")
+		require.Error(t, err)
+		assert.NotErrorIs(t, err, ErrForbidden)
+		assert.Contains(t, err.Error(), "500 Internal Server Error")
+	})
+	t.Run("Unavailable", func(t *testing.T) {
+		// Failures caused by the remote rather than the file are reported as unavailable.
+		for name, unavailable := range map[string]bool{"failed.jpg": true, "unauthorized.jpg": true, "busy.jpg": true,
+			"full.jpg": true, "redirect.jpg": true, "moved.jpg": true, "toolarge.mp4": false, "unsupported.heic": false, "conflict.jpg": false,
+			"forbidden.yml": false} {
+			err := client.Upload(src, "folder/"+name)
+			require.Error(t, err, name)
+			assert.Equal(t, unavailable, errors.Is(err, ErrUnavailable), name)
+		}
+		err := client.Upload(src+".missing", "folder/missing.jpg")
+		require.Error(t, err)
+		assert.NotErrorIs(t, err, ErrUnavailable)
+
+		// A connection that fails is unavailable as well.
+		closed := httptest.NewServer(http.NotFoundHandler())
+		closed.Close()
+		offline, err := NewClient(closed.URL+"/dav/", testUser, testPass, TimeoutLow, "")
+		require.NoError(t, err)
+		assert.ErrorIs(t, offline.Upload(src, "folder/offline.jpg"), ErrUnavailable)
+	})
+	t.Run("LongNameKeepsStatus", func(t *testing.T) {
+		// The name is bounded, so the reason after it survives a stored error of txt.ClipError bytes.
+		long := "folder/" + strings.Repeat("\xff", 200) + "/"
+		for name, reason := range map[string]string{"failed.jpg": "500 Internal Server Error", "forbidden.yml": "forbidden", "redirect.jpg": "redirected"} {
+			err := client.Upload(src, long+name)
+			require.Error(t, err, name)
+			assert.Contains(t, clean.ErrorBytes(err, txt.ClipError), reason, name)
+		}
+	})
+	t.Run("Redirect", func(t *testing.T) {
+		err := client.Upload(src, "folder/redirect.jpg")
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "redirected")
+	})
+	t.Run("MissingSource", func(t *testing.T) {
+		err := client.Upload(filepath.Join(t.TempDir(), "missing.jpg"), "folder/missing.jpg")
+		require.Error(t, err)
+		assert.NotErrorIs(t, err, ErrForbidden)
+	})
+}
+
+func TestClient_resolveHref(t *testing.T) {
+	t.Run("EndpointPath", func(t *testing.T) {
+		client, err := NewClient("http://127.0.0.1:1/dav/", testUser, testPass, TimeoutLow, "")
+		require.NoError(t, err)
+		href := client.resolveHref("folder/example.jpg")
+		assert.Equal(t, "/dav/folder/example.jpg", href.Path)
+		assert.Equal(t, testUser, href.User.Username())
+	})
+	t.Run("EmptyPath", func(t *testing.T) {
+		client, err := NewClient("http://127.0.0.1:1", "", "", TimeoutLow, "")
+		require.NoError(t, err)
+		href := client.resolveHref("example.jpg")
+		assert.Equal(t, "http://127.0.0.1:1/example.jpg", href.String())
+	})
+}
+
+func TestClient_CheckDownloadSize(t *testing.T) {
+	t.Run("Unlimited", func(t *testing.T) {
+		c := &Client{}
+		assert.NoError(t, c.CheckDownloadSize("/tmp/photo.jpg", 1<<40))
+	})
+	t.Run("Limit", func(t *testing.T) {
+		c := &Client{}
+		c.SetDownloadLimit(100)
+		assert.NoError(t, c.CheckDownloadSize("/tmp/photo.jpg", -1))
+		assert.NoError(t, c.CheckDownloadSize("/tmp/photo.jpg", 0))
+		assert.NoError(t, c.CheckDownloadSize("/tmp/photo.jpg", 100))
+		err := c.CheckDownloadSize("/tmp/photo.jpg", 101)
+		require.Error(t, err)
+		assert.Equal(t, "webdav: photo.jpg exceeds the maximum size of 100 bytes", err.Error())
+	})
+	t.Run("NilClient", func(t *testing.T) {
+		var c *Client
+		assert.NoError(t, c.CheckDownloadSize("/tmp/photo.jpg", 101))
+	})
+}
+
+func TestClient_LongNameKeepsReason(t *testing.T) {
+	// A long local name is bounded in these messages, so the reason after it survives a stored error.
+	client, err := NewClient("http://127.0.0.1:1/", "", "", TimeoutLow, "")
+	require.NoError(t, err)
+
+	notFolder := filepath.Join(t.TempDir(), strings.Repeat("\xff", 250))
+	require.NoError(t, os.WriteFile(notFolder, []byte("file"), fs.ModeFile))
+
+	t.Run("NotAFolder", func(t *testing.T) {
+		err := client.Download("/photo.jpg", filepath.Join(notFolder, "photo.jpg"), false)
+		require.Error(t, err)
+		assert.Contains(t, clean.ErrorBytes(err, txt.ClipError), "is not a folder")
+	})
+	t.Run("CannotCreateFolder", func(t *testing.T) {
+		err := client.Download("/photo.jpg", filepath.Join(notFolder, "sub", "photo.jpg"), false)
+		require.Error(t, err)
+		assert.Contains(t, clean.ErrorBytes(err, txt.ClipError), "not a directory")
+	})
+	t.Run("SourceNotFound", func(t *testing.T) {
+		err := client.Upload(filepath.Join(t.TempDir(), strings.Repeat("\xff", 250)), "/photo.jpg")
+		require.Error(t, err)
+		assert.Contains(t, clean.ErrorBytes(err, txt.ClipError), "not found")
+	})
+}
+
+func TestTempSink(t *testing.T) {
+	t.Run("Short", func(t *testing.T) {
+		name := tempSink("/originals/2030/photo.jpg")
+		assert.True(t, strings.HasPrefix(name, "/originals/2030/photo.jpg."), name)
+		assert.True(t, strings.HasSuffix(name, ".tmp"), name)
+	})
+	t.Run("LongNameOnARuneBoundary", func(t *testing.T) {
+		// The suffix leaves 242 bytes for the base, which ends inside a 3-byte character here.
+		base := strings.Repeat("あ", 81) + ".jpg"
+		name := tempSink(filepath.Join("/originals", base))
+		assert.LessOrEqual(t, len(filepath.Base(name)), fs.NameMaxLen)
+		assert.True(t, utf8.ValidString(name), "%q", name)
+		assert.True(t, strings.HasSuffix(name, ".tmp"), name)
+		assert.Equal(t, strings.Repeat("あ", 80), strings.SplitN(filepath.Base(name), ".", 2)[0])
+	})
+}
+
+func TestClient_DeleteHidden(t *testing.T) {
+	var deleted []string
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodDelete {
+			deleted = append(deleted, r.URL.Path)
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	t.Cleanup(server.Close)
+
+	client, err := NewClient(server.URL+"/", "", "", TimeoutLow, "")
+	require.NoError(t, err)
+
+	// Copies in folders that are hidden locally can be removed, dot-directories and unsafe paths cannot.
+	require.NoError(t, client.Delete("/@Family/x.jpg"))
+	assert.ErrorIs(t, client.Delete("/.git/config"), ErrSkipPath)
+	assert.ErrorIs(t, client.Delete("/Photos/../x.jpg"), ErrUnsafePath)
+	assert.Equal(t, []string{"/@Family/x.jpg"}, deleted)
+}
+
+func TestAppendTraversalDirs(t *testing.T) {
+	found := []webdav.FileInfo{
+		{Path: "/dav/", IsDir: true},
+		{Path: "/dav/Photos/", IsDir: true},
+		{Path: "/dav/.locks/", IsDir: true},
+		{Path: "/dav/@Family/", IsDir: true},
+		{Path: "/dav/a\\..\\..\\bob/", IsDir: true},
+		{Path: "/dav/Photos/x.jpg"},
+	}
+
+	queue := appendTraversalDirs(nil, "", "/dav/", found, map[string]bool{"": true})
+	assert.Equal(t, []string{"Photos", "@Family"}, queue)
+}

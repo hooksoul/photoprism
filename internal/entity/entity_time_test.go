@@ -4,30 +4,35 @@ import (
 	"testing"
 	"time"
 
-	"github.com/jinzhu/gorm"
 	"github.com/stretchr/testify/assert"
+
+	"github.com/photoprism/photoprism/pkg/time/tz"
 )
 
 func TestUTC(t *testing.T) {
 	t.Run("Zone", func(t *testing.T) {
 		utc := UTC()
 
-		if zone, offset := utc.Zone(); zone != time.UTC.String() {
-			t.Error("should be utc")
+		if zone, offset := utc.Zone(); zone != tz.UTC {
+			t.Error("should be UTC")
 		} else if offset != 0 {
 			t.Error("offset should be 0")
 		}
 	})
 	t.Run("RunGorm", func(t *testing.T) {
 		utc := UTC()
-		utcGorm := gorm.NowFunc()
+		utcGorm := GormConfig().NowFunc()
 
 		t.Logf("NOW: %s, %s", utc.String(), utcGorm.String())
 
-		assert.True(t, utcGorm.After(utc))
+		// GormConfig().NowFunc truncates to whole seconds, so it can trail the sub-second
+		// UTC() reading by up to a second; assert they stay within a sane window.
+		delta := utcGorm.Sub(utc)
+		assert.Greater(t, delta, -time.Second)
+		assert.Less(t, delta, time.Second)
 
-		if zone, offset := utcGorm.Zone(); zone != time.UTC.String() {
-			t.Error("gorm time should be utc")
+		if zone, offset := utcGorm.Zone(); zone != tz.UTC {
+			t.Error("gorm time should be UTC")
 		} else if offset != 0 {
 			t.Error("gorm time offset should be 0")
 		}
@@ -36,19 +41,40 @@ func TestUTC(t *testing.T) {
 	})
 }
 
-func TestTimeStamp(t *testing.T) {
+func TestNow(t *testing.T) {
 	t.Run("UTC", func(t *testing.T) {
-		if TimeStamp().Location() != time.UTC {
-			t.Fatal("timestamp zone must be utc")
+		if Now().Location() != time.UTC {
+			t.Fatal("timestamp zone must be UTC")
+		}
+	})
+	t.Run("GMT", func(t *testing.T) {
+		if location, err := time.LoadLocation("GMT"); err != nil {
+			t.Error(err)
+		} else if Now().In(location).Location().String() != "GMT" {
+			t.Fatal("timestamp zone must be GMT")
+		}
+	})
+	t.Run("EtcGmt", func(t *testing.T) {
+		if location, err := time.LoadLocation("Etc/GMT"); err != nil {
+			t.Error(err)
+		} else if Now().In(location).Location().String() != "Etc/GMT" {
+			t.Fatal("timestamp zone must be Etc/GMT")
+		}
+	})
+	t.Run("EtcGmtSix", func(t *testing.T) {
+		if location, err := time.LoadLocation("Etc/GMT+6"); err != nil {
+			t.Error(err)
+		} else if Now().In(location).Location().String() != "Etc/GMT+6" {
+			t.Fatal("timestamp zone must be Etc/GMT+6")
 		}
 	})
 	t.Run("Past", func(t *testing.T) {
-		if TimeStamp().After(time.Now().Add(time.Second)) {
+		if Now().After(time.Now().Add(time.Second)) {
 			t.Fatal("timestamp should be in the past from now")
 		}
 	})
 	t.Run("JSON", func(t *testing.T) {
-		t1 := TimeStamp().Add(time.Nanosecond * 123456)
+		t1 := Now().Add(time.Nanosecond * 123456)
 
 		if b, err := t1.MarshalJSON(); err != nil {
 			t.Fatal(err)
@@ -58,7 +84,7 @@ func TestTimeStamp(t *testing.T) {
 	})
 	t.Run("UnixMicro", func(t *testing.T) {
 		t1 := time.Date(-3000, 1, 1, 1, 1, 1, 0, time.UTC)
-		t2 := TimeStamp().Add(time.Nanosecond * 123456)
+		t2 := Now().Add(time.Nanosecond * 123456)
 		t3 := time.Date(3000, 1, 1, 1, 1, 1, 0, time.UTC)
 
 		ms1 := t1.UnixMilli()
@@ -94,20 +120,44 @@ func TestTimeStamp(t *testing.T) {
 	})
 }
 
-func TestTimePointer(t *testing.T) {
-	result := TimePointer()
+func TestTimeStamp(t *testing.T) {
+	result := TimeStamp()
 
 	if result == nil {
 		t.Fatal("result must not be nil")
 	}
 
 	if result.Location() != time.UTC {
-		t.Fatal("timestamp zone must be utc")
+		t.Fatal("timestamp zone must be UTC")
 	}
 
 	if result.After(time.Now().Add(time.Second)) {
 		t.Fatal("timestamp should be in the past from now")
 	}
+}
+
+func TestTimePointer(t *testing.T) {
+	t.Run("NonZero", func(t *testing.T) {
+		now := Now()
+		result := TimePointer(now)
+		if result == nil {
+			t.Fatal("result must not be nil")
+		}
+		assert.Equal(t, now, *result)
+	})
+	t.Run("Zero", func(t *testing.T) {
+		assert.Nil(t, TimePointer(time.Time{}))
+	})
+}
+
+func TestTime(t *testing.T) {
+	result := Time("2022-01-02T13:04:05+01:00")
+
+	if result == nil {
+		t.Fatal("result must not be nil")
+	}
+
+	assert.Equal(t, "2022-01-02T12:04:05Z", result.Format("2006-01-02T15:04:05Z07:00"))
 }
 
 func TestSeconds(t *testing.T) {

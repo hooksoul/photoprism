@@ -1,16 +1,57 @@
 package server
 
 import (
+	"strings"
+
 	"github.com/gin-gonic/gin"
 
+	"github.com/photoprism/photoprism/internal/api"
 	"github.com/photoprism/photoprism/internal/config"
-	"github.com/photoprism/photoprism/internal/server/header"
+	"github.com/photoprism/photoprism/pkg/http/header"
+	"github.com/photoprism/photoprism/pkg/http/proxy"
 )
 
-// Security adds common HTTP security headers to the response.
+// Security is a middleware that adds security-related headers to the server's response.
 var Security = func(conf *config.Config) gin.HandlerFunc {
+	proxyPathPrefix := conf.BaseUri(proxy.PathPrefix)
+	landingPath := conf.FrontendUri("")
+
 	return func(c *gin.Context) {
-		c.Writer.Header().Set(header.ContentSecurityPolicy, header.DefaultContentSecurityPolicy)
-		c.Writer.Header().Set(header.FrameOptions, header.DefaultFrameOptions)
+		if strings.HasPrefix(c.Request.URL.Path, proxyPathPrefix) {
+			return
+		}
+
+		// Only allow crawlers to index the site if it is a public demo (or if there is a public image wall):
+		// https://github.com/photoprism/photoprism/issues/669
+		//
+		// Set "X-Robots-Tag" header:
+		// https://developers.google.com/search/docs/crawling-indexing/robots-meta-tag#xrobotstag
+		if !conf.Demo() || !conf.Public() {
+			c.Header(header.RobotsTag, header.RobotsNone)
+		} else if p := c.Request.URL.Path; p != landingPath && p != landingPath+"/" {
+			// Every other route of a public demo serves the same app shell, so only
+			// the landing page should appear in search results.
+			c.Header(header.RobotsTag, header.RobotsNoIndex)
+		}
+
+		// Abort if the request must not be served through a CDN.
+		if header.AbortCdnRequest(c.Request) {
+			api.AbortNotFound(c)
+			return
+		}
+
+		// Skip browser document headers on WebDAV endpoints to avoid
+		// surprising clients with UI-centric policies.
+		if IsWebDAVPath(c.Request.URL.Path, conf.BaseUri(WebDAVOriginals), conf.BaseUri(WebDAVImport)) {
+			return
+		}
+
+		// Set "Content-Security-Policy" header:
+		// https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Content-Security-Policy
+		c.Header(header.ContentSecurityPolicy, header.DefaultContentSecurityPolicy)
+
+		// Set "X-Frame-Options" header:
+		// https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/X-Frame-Options
+		c.Header(header.XFrameOptions, header.DefaultFrameOptions)
 	}
 }

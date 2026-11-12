@@ -1,0 +1,181 @@
+package openai
+
+import (
+	"encoding/json"
+	"os"
+	"path/filepath"
+	"testing"
+)
+
+func loadTestResponse(t *testing.T, name string) *Response {
+	t.Helper()
+
+	filePath := filepath.Join("testdata", name)
+
+	data, err := os.ReadFile(filePath) // #nosec G304 test fixture path
+	if err != nil {
+		t.Fatalf("failed to read %s: %v", filePath, err)
+	}
+
+	var resp Response
+	if err := json.Unmarshal(data, &resp); err != nil {
+		t.Fatalf("failed to unmarshal %s: %v", filePath, err)
+	}
+
+	return &resp
+}
+
+func TestResponseFirstTextCaption(t *testing.T) {
+	resp := loadTestResponse(t, "caption-response.json")
+
+	if jsonPayload := resp.FirstJSON(); len(jsonPayload) != 0 {
+		t.Fatalf("expected no JSON payload, got: %s", jsonPayload)
+	}
+
+	text := resp.FirstText()
+	expected := "A bee gathers nectar from the vibrant red poppy’s center."
+	if text != expected {
+		t.Fatalf("unexpected caption text: %q", text)
+	}
+}
+
+func TestResponseFirstTextLabels(t *testing.T) {
+	resp := loadTestResponse(t, "labels-response.json")
+
+	if jsonPayload := resp.FirstJSON(); len(jsonPayload) != 0 {
+		t.Fatalf("expected no JSON payload, got: %s", jsonPayload)
+	}
+
+	text := resp.FirstText()
+	if len(text) == 0 {
+		t.Fatal("expected structured JSON string in text payload")
+	}
+	if text[0] != '{' {
+		t.Fatalf("expected JSON object in text payload, got %q", text)
+	}
+}
+
+func TestResponseFirstJSONFromStructuredPayload(t *testing.T) {
+	resp := &Response{
+		ID:    "resp_structured",
+		Model: "gpt-5-mini",
+		Output: []ResponseOutput{
+			{
+				Role: "assistant",
+				Content: []ResponseContent{
+					{
+						Type: "output_json",
+						JSON: json.RawMessage(`{"labels":[{"name":"sunset"}]}`),
+					},
+				},
+			},
+		},
+	}
+
+	jsonPayload := resp.FirstJSON()
+	if len(jsonPayload) == 0 {
+		t.Fatal("expected JSON payload, got empty result")
+	}
+
+	var decoded struct {
+		Labels []map[string]string `json:"labels"`
+	}
+	if err := json.Unmarshal(jsonPayload, &decoded); err != nil {
+		t.Fatalf("failed to decode JSON payload: %v", err)
+	}
+
+	if len(decoded.Labels) != 1 || decoded.Labels[0]["name"] != "sunset" {
+		t.Fatalf("unexpected JSON payload: %+v", decoded.Labels)
+	}
+}
+
+func TestSchemaLabelsReturnsValidJSON(t *testing.T) {
+	raw := SchemaLabels(false)
+
+	var decoded map[string]any
+	if err := json.Unmarshal(raw, &decoded); err != nil {
+		t.Fatalf("schema should be valid JSON: %v", err)
+	}
+
+	if decoded["type"] != "object" {
+		t.Fatalf("expected type object, got %v", decoded["type"])
+	}
+}
+
+func TestIsCloudUrl(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		out  bool
+	}{
+		{name: "DefaultBase", in: DefaultBaseUrl, out: true},
+		{name: "Responses", in: DefaultBaseUrl + "/responses", out: true},
+		{name: "Uppercase", in: "https://API.OpenAI.com/v1/responses", out: true},
+		{name: "OtherHost", in: "https://llm.example.com/v1/responses", out: false},
+		{name: "LocalIP", in: "http://192.0.2.10:8080/v1/responses", out: false},
+		{name: "Empty", in: "", out: false},
+		{name: "NotAUrl", in: "gpt-5-mini", out: false},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := IsCloudUrl(tc.in); got != tc.out {
+				t.Fatalf("IsCloudUrl(%q) = %v, want %v", tc.in, got, tc.out)
+			}
+		})
+	}
+}
+
+func TestIsReasoningModel(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		out  bool
+	}{
+		{name: "Default", in: DefaultModel, out: true},
+		{name: "GPT5Mini", in: "gpt-5-mini", out: true},
+		{name: "GPT5", in: "gpt-5", out: true},
+		{name: "PointRelease", in: "gpt-5.6-terra", out: true},
+		{name: "GPT6PointRelease", in: "gpt-6.1-sol", out: true},
+		{name: "Uppercase", in: "  GPT-6-LUNA ", out: true},
+		{name: "GPT4", in: "gpt-4.1-mini", out: false},
+		{name: "FamilyPrefixCollision", in: "gpt-50", out: false},
+		{name: "OpenWeight", in: "Qwen2.5-VL-7B-Instruct", out: false},
+		{name: "Empty", in: "", out: false},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := IsReasoningModel(tc.in); got != tc.out {
+				t.Fatalf("IsReasoningModel(%q) = %v, want %v", tc.in, got, tc.out)
+			}
+		})
+	}
+}
+
+func TestIsCloudModel(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		out  bool
+	}{
+		{name: "Default", in: DefaultModel, out: true},
+		{name: "GPT4o", in: "gpt-4o-mini", out: true},
+		{name: "Reasoning", in: "o3", out: true},
+		{name: "Uppercase", in: "GPT-5-MINI", out: true},
+		{name: "Whitespace", in: "  gpt-5  ", out: true},
+		{name: "OpenWeight", in: "Qwen2.5-VL-7B-Instruct", out: false},
+		{name: "FamilyPrefixCollision", in: "o11vision", out: false},
+		{name: "ReasoningVariant", in: "o4-mini", out: true},
+		{name: "Llama", in: "llama-3.2-vision", out: false},
+		{name: "Empty", in: "", out: false},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := IsCloudModel(tc.in); got != tc.out {
+				t.Fatalf("IsCloudModel(%q) = %v, want %v", tc.in, got, tc.out)
+			}
+		})
+	}
+}

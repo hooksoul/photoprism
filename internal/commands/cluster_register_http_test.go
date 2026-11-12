@@ -1,0 +1,1111 @@
+package commands
+
+import (
+	"encoding/json"
+	"flag"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync/atomic"
+	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"github.com/tidwall/gjson"
+	"github.com/urfave/cli/v2"
+	"gopkg.in/yaml.v2"
+
+	cfg "github.com/photoprism/photoprism/internal/config"
+	"github.com/photoprism/photoprism/internal/photoprism/get"
+	"github.com/photoprism/photoprism/internal/service/cluster"
+	"github.com/photoprism/photoprism/pkg/dsn"
+	"github.com/photoprism/photoprism/pkg/fs"
+)
+
+func TestClusterRegister_HTTPHappyPath(t *testing.T) {
+	// Fake Portal register endpoint
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v1/cluster/nodes/register" {
+			http.NotFound(w, r)
+			return
+		}
+		if r.Header.Get("Authorization") != "Bearer "+cluster.ExampleJoinToken {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusCreated)
+		resp := cluster.RegisterResponse{
+			Node: cluster.Node{
+				UUID:      "n1",
+				Name:      "pp-node-02",
+				Role:      cluster.RoleInstance,
+				CreatedAt: "2025-09-15T00:00:00Z",
+				UpdatedAt: "2025-09-15T00:00:00Z",
+			},
+			Database: cluster.RegisterDatabase{
+				Host:      "database",
+				Port:      3306,
+				Name:      "pp_db",
+				User:      "pp_user",
+				Password:  "pwd",
+				DSN:       "user:pwd@tcp(db:3306)/pp_db?parseTime=true",
+				RotatedAt: "2025-09-15T00:00:00Z",
+			},
+			Secrets: &cluster.RegisterSecrets{
+				ClientSecret: cluster.ExampleClientSecret,
+				RotatedAt:    "2025-09-15T00:00:00Z",
+			},
+			AlreadyRegistered:  false,
+			AlreadyProvisioned: false,
+		}
+		_ = json.NewEncoder(w).Encode(resp)
+	}))
+	defer ts.Close()
+
+	out, err := RunWithTestContext(ClusterRegisterCommand, []string{
+		"register", "--name", "pp-node-02", "--role", "instance", "--portal-url", ts.URL, "--join-token", cluster.ExampleJoinToken, "--json",
+	})
+	assert.NoError(t, err)
+	// Parse JSON
+	assert.Equal(t, "pp-node-02", gjson.Get(out, "Node.Name").String())
+	assert.Equal(t, cluster.ExampleClientSecret, gjson.Get(out, "Secrets.ClientSecret").String())
+	assert.Equal(t, "pwd", gjson.Get(out, "Database.Password").String())
+	dbDsn := gjson.Get(out, "Database.DSN").String()
+	parsed := dsn.Parse(dbDsn)
+	assert.Equal(t, "user", parsed.User)
+	assert.Equal(t, "pwd", parsed.Password)
+	assert.Equal(t, "tcp", parsed.Net)
+	assert.Equal(t, "db:3306", parsed.Server)
+	assert.Equal(t, "pp_db", parsed.Name)
+}
+
+func TestClusterRegister_HTTPIncompleteDatabase(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(cluster.RegisterResponse{
+			Node:     cluster.Node{UUID: "n1", Name: "pp-node-03", Role: cluster.RoleInstance},
+			Database: cluster.RegisterDatabase{Driver: dsn.DriverMySQL, Host: "database", Port: 3306, Name: "pp_db", User: "pp_user", Incomplete: true},
+			Secrets:  &cluster.RegisterSecrets{ClientSecret: cluster.ExampleClientSecret},
+		})
+	}))
+	defer ts.Close()
+
+	out, err := RunWithTestContext(ClusterRegisterCommand, []string{
+		"register", "--name", "pp-node-03", "--role", "instance", "--portal-url", ts.URL, "--join-token", cluster.ExampleJoinToken, "--json",
+	})
+
+	require.Error(t, err)
+	assert.Equal(t, 1, ExitCode(err))
+	assert.Contains(t, err.Error(), "could not complete database provisioning")
+	assert.Equal(t, cluster.ExampleClientSecret, gjson.Get(out, "Secrets.ClientSecret").String())
+	assert.True(t, gjson.Get(out, "Database.Incomplete").Bool())
+}
+
+func TestClusterRegister_WriteConfig_PersistsSecretFileOnly(t *testing.T) {
+	tempCfg := t.TempDir()
+	SetEnvForTest(t, "PHOTOPRISM_CONFIG_PATH", tempCfg)
+
+	conf := get.Config()
+	previousOptions := *conf.Options()
+	t.Cleanup(func() {
+		*conf.Options() = previousOptions
+	})
+
+	nodeUUID := "01987f09-193d-7d01-9f18-d8d189f0fe88"
+	clusterUUID := "4a47c940-d5de-41b3-88a2-eb816cc659ca"
+
+	jwksURL := ""
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v1/cluster/nodes/register" {
+			http.NotFound(w, r)
+			return
+		}
+		if r.Header.Get("Authorization") != "Bearer "+cluster.ExampleJoinToken {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(cluster.RegisterResponse{
+			UUID:        clusterUUID,
+			ClusterCIDR: "192.0.2.0/24, 2001:db8::/64",
+			JWKSUrl:     jwksURL,
+			Node: cluster.Node{
+				UUID:     nodeUUID,
+				Name:     "pp-node-09",
+				Role:     cluster.RoleInstance,
+				ClientID: cluster.ExampleClientID,
+			},
+			Secrets: &cluster.RegisterSecrets{
+				ClientSecret: cluster.ExampleClientSecret,
+			},
+			Database: cluster.RegisterDatabase{
+				Driver:   dsn.DriverMySQL,
+				Host:     "fd00::10",
+				Port:     3306,
+				Name:     "pp_db",
+				User:     "pp_user",
+				Password: "pwd",
+			},
+		})
+	}))
+	jwksURL = ts.URL + "/.well-known/jwks.json"
+	defer ts.Close()
+
+	_, err := RunWithTestContext(ClusterRegisterCommand, []string{
+		"register",
+		"--name", "pp-node-09",
+		"--role", "instance",
+		"--portal-url", ts.URL,
+		"--join-token", cluster.ExampleJoinToken,
+		"--write-config",
+	})
+	assert.NoError(t, err)
+
+	secretFile := conf.NodeClientSecretFile()
+	secretContent, readSecretErr := os.ReadFile(secretFile) //nolint:gosec // secretFile is created by the test config in a temp directory.
+	assert.NoError(t, readSecretErr)
+	assert.Equal(t, cluster.ExampleClientSecret, string(secretContent))
+
+	optionsContent, readOptionsErr := os.ReadFile(conf.OptionsYaml())
+	assert.NoError(t, readOptionsErr)
+
+	var persisted map[string]any
+	assert.NoError(t, yaml.Unmarshal(optionsContent, &persisted))
+
+	assert.Equal(t, clusterUUID, persisted["ClusterUUID"])
+	assert.Equal(t, "192.0.2.0/24, 2001:db8::/64", persisted["ClusterCIDR"])
+	assert.Equal(t, nodeUUID, persisted["NodeUUID"])
+	assert.Equal(t, cluster.ExampleClientID, persisted["NodeClientID"])
+	assert.Equal(t, jwksURL, persisted["JWKSUrl"])
+	assert.Equal(t, "pp_db", persisted["DatabaseName"])
+	assert.Equal(t, "[fd00::10]:3306", persisted["DatabaseServer"])
+	assert.Equal(t, "pp_user", persisted["DatabaseUser"])
+	assert.Equal(t, "pwd", persisted["DatabasePassword"])
+	_, hasInlineSecret := persisted["NodeClientSecret"]
+	assert.False(t, hasInlineSecret)
+}
+
+func TestClusterRegister_SiteURLFlag(t *testing.T) {
+	conf := get.Config()
+	prev := conf.Options().SiteUrl
+	conf.Options().SiteUrl = ""
+	defer func() { conf.Options().SiteUrl = prev }()
+
+	const site = "https://public.example.test/"
+	const advertise = "https://internal.example.test/"
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v1/cluster/nodes/register" {
+			http.NotFound(w, r)
+			return
+		}
+		if r.Header.Get("Authorization") != "Bearer "+cluster.ExampleJoinToken {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		body, _ := io.ReadAll(r.Body)
+		assert.Equal(t, site, gjson.GetBytes(body, "SiteUrl").String())
+		assert.Equal(t, advertise, gjson.GetBytes(body, "AdvertiseUrl").String())
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusCreated)
+		resp := cluster.RegisterResponse{
+			Node: cluster.Node{
+				UUID:      "n-site",
+				Name:      "neon",
+				Role:      cluster.RoleInstance,
+				CreatedAt: "2025-09-15T00:00:00Z",
+				UpdatedAt: "2025-09-15T00:00:00Z",
+				SiteUrl:   site,
+			},
+			Secrets: &cluster.RegisterSecrets{ClientSecret: cluster.ExampleClientSecret, RotatedAt: "2025-09-15T00:00:00Z"},
+		}
+		_ = json.NewEncoder(w).Encode(resp)
+	}))
+	defer ts.Close()
+
+	out, err := RunWithTestContext(ClusterRegisterCommand, []string{
+		"register",
+		"--name", "neon",
+		"--advertise-url", advertise,
+		"--site-url", site,
+		"--portal-url", ts.URL,
+		"--join-token", cluster.ExampleJoinToken,
+		"--json",
+	})
+	assert.NoError(t, err)
+	assert.Equal(t, site, gjson.Get(out, "Node.SiteUrl").String())
+}
+
+func TestClusterNodesRotate_HTTPHappyPath(t *testing.T) {
+	// Fake Portal register endpoint for rotation
+	secret := cluster.ExampleClientSecret
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v1/cluster/nodes/register" {
+			http.NotFound(w, r)
+			return
+		}
+		if r.Header.Get("Authorization") != "Bearer "+cluster.ExampleJoinToken {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		resp := cluster.RegisterResponse{
+			Node: cluster.Node{
+				UUID:      "n1",
+				Name:      "pp-node-03",
+				Role:      cluster.RoleInstance,
+				CreatedAt: "2025-09-15T00:00:00Z",
+				UpdatedAt: "2025-09-15T00:00:00Z",
+			},
+			Database: cluster.RegisterDatabase{
+				Host:      "database",
+				Port:      3306,
+				Name:      "pp_db",
+				User:      "pp_user",
+				Password:  "pwd2",
+				DSN:       "user:pwd2@tcp(db:3306)/pp_db?parseTime=true",
+				RotatedAt: "2025-09-15T00:00:00Z",
+			},
+			Secrets: &cluster.RegisterSecrets{
+				ClientSecret: secret,
+				RotatedAt:    "2025-09-15T00:00:00Z",
+			},
+			AlreadyRegistered:  true,
+			AlreadyProvisioned: false,
+		}
+		_ = json.NewEncoder(w).Encode(resp)
+	}))
+	defer ts.Close()
+
+	SetEnvForTest(t, "PHOTOPRISM_PORTAL_URL", ts.URL)
+	SetEnvForTest(t, "PHOTOPRISM_JOIN_TOKEN", cluster.ExampleJoinToken)
+	SetEnvForTest(t, "PHOTOPRISM_CLI", "noninteractive")
+	out, err := RunWithTestContext(ClusterNodesRotateCommand, []string{
+		"rotate", "--portal-url=" + ts.URL, "--join-token=" + cluster.ExampleJoinToken, "--db", "--secret", "--yes", "pp-node-03",
+	})
+	assert.NoError(t, err)
+	assert.Contains(t, out, "pp-node-03")
+	assert.Contains(t, out, "Node Client Secret")
+	assert.Contains(t, out, "DB Password")
+}
+
+func TestClusterNodesRotate_HTTPJson(t *testing.T) {
+	// Fake Portal register endpoint for rotation in JSON mode
+	secret := cluster.ExampleClientSecret
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v1/cluster/nodes/register" {
+			http.NotFound(w, r)
+			return
+		}
+		if r.Header.Get("Authorization") != "Bearer "+cluster.ExampleJoinToken {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		resp := cluster.RegisterResponse{
+			Node: cluster.Node{
+				UUID:      "n2",
+				Name:      "pp-node-04",
+				Role:      cluster.RoleInstance,
+				CreatedAt: "2025-09-15T00:00:00Z",
+				UpdatedAt: "2025-09-15T00:00:00Z",
+			},
+			Database: cluster.RegisterDatabase{
+				Host:      "database",
+				Port:      3306,
+				Name:      "pp_db",
+				User:      "pp_user",
+				Password:  "pwd3",
+				DSN:       "user:pwd3@tcp(db:3306)/pp_db?parseTime=true",
+				RotatedAt: "2025-09-15T00:00:00Z",
+			},
+			Secrets: &cluster.RegisterSecrets{
+				ClientSecret: secret,
+				RotatedAt:    "2025-09-15T00:00:00Z",
+			},
+			AlreadyRegistered:  true,
+			AlreadyProvisioned: true,
+		}
+		_ = json.NewEncoder(w).Encode(resp)
+	}))
+	defer ts.Close()
+
+	SetEnvForTest(t, "PHOTOPRISM_PORTAL_URL", ts.URL)
+	SetEnvForTest(t, "PHOTOPRISM_JOIN_TOKEN", cluster.ExampleJoinToken)
+	SetEnvForTest(t, "PHOTOPRISM_CLI", "noninteractive")
+	out, err := RunWithTestContext(ClusterNodesRotateCommand, []string{
+		"rotate", "--json", "--db", "--secret", "--yes", "pp-node-04",
+	})
+	assert.NoError(t, err)
+	assert.Equal(t, "pp-node-04", gjson.Get(out, "Node.Name").String())
+	assert.Equal(t, secret, gjson.Get(out, "Secrets.ClientSecret").String())
+	assert.Equal(t, "pwd3", gjson.Get(out, "Database.Password").String())
+	dbDsn := gjson.Get(out, "Database.DSN").String()
+	parsed := dsn.Parse(dbDsn)
+	assert.Equal(t, "user", parsed.User)
+	assert.Equal(t, "pwd3", parsed.Password)
+	assert.Equal(t, "tcp", parsed.Net)
+	assert.Equal(t, "db:3306", parsed.Server)
+	assert.Equal(t, "pp_db", parsed.Name)
+}
+
+// setClusterOptionsForTest points the shared config at a portal for one test and restores what
+// was there afterwards.
+func setClusterOptionsForTest(t *testing.T, portalUrl, clusterDomain string) {
+	t.Helper()
+
+	o := get.Config().Options()
+	prevUrl, prevDomain := o.PortalUrl, o.ClusterDomain
+
+	t.Cleanup(func() {
+		o.PortalUrl, o.ClusterDomain = prevUrl, prevDomain
+	})
+
+	o.PortalUrl, o.ClusterDomain = portalUrl, clusterDomain
+}
+
+func TestClusterNodesRotate_DBOnly_JSON(t *testing.T) {
+	// An instance rotates through the Portal, so it must not wait for a database it may not reach.
+	initCoreConfig := InitCoreConfig
+	t.Cleanup(func() { InitCoreConfig = initCoreConfig })
+	var core atomic.Bool
+	InitCoreConfig = func(ctx *cli.Context, quiet bool) (*cfg.Config, error) {
+		core.Store(true)
+		return initCoreConfig(ctx, quiet)
+	}
+	t.Cleanup(func() { assert.True(t, core.Load()) })
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v1/cluster/nodes/register" {
+			http.NotFound(w, r)
+			return
+		}
+		if r.Header.Get("Authorization") != "Bearer "+cluster.ExampleJoinToken {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		// Read payload to assert rotate flags
+		b, _ := io.ReadAll(r.Body)
+		rotate := gjson.GetBytes(b, "RotateDatabase").Bool()
+		rotateSecret := gjson.GetBytes(b, "RotateSecret").Bool()
+		// Expect DB rotation only
+		if !rotate || rotateSecret {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		resp := cluster.RegisterResponse{
+			Node: cluster.Node{
+				UUID:      "n3",
+				Name:      "pp-node-05",
+				Role:      cluster.RoleInstance,
+				CreatedAt: "2025-09-15T00:00:00Z",
+				UpdatedAt: "2025-09-15T00:00:00Z",
+			},
+			Database: cluster.RegisterDatabase{
+				Host:      "database",
+				Port:      3306,
+				Name:      "pp_db",
+				User:      "pp_user",
+				Password:  "pwd4",
+				DSN:       "pp_user:pwd4@tcp(db:3306)/pp_db?parseTime=true",
+				RotatedAt: "2025-09-15T00:00:00Z",
+			},
+			AlreadyRegistered:  true,
+			AlreadyProvisioned: true,
+		}
+		_ = json.NewEncoder(w).Encode(resp)
+	}))
+	defer ts.Close()
+
+	SetEnvForTest(t, "PHOTOPRISM_PORTAL_URL", ts.URL)
+	SetEnvForTest(t, "PHOTOPRISM_JOIN_TOKEN", cluster.ExampleJoinToken)
+	SetEnvForTest(t, "PHOTOPRISM_YES", "true")
+	out, err := RunWithTestContext(ClusterNodesRotateCommand, []string{
+		"rotate", "--json", "--db", "--yes", "pp-node-05",
+	})
+	assert.NoError(t, err)
+	assert.Equal(t, "pp-node-05", gjson.Get(out, "Node.Name").String())
+	assert.Equal(t, "pwd4", gjson.Get(out, "Database.Password").String())
+	dbDsn := gjson.Get(out, "Database.DSN").String()
+	parsed := dsn.Parse(dbDsn)
+	assert.Equal(t, "pp_user", parsed.User)
+	assert.Equal(t, "pwd4", parsed.Password)
+	assert.Equal(t, "tcp", parsed.Net)
+	assert.Equal(t, "db:3306", parsed.Server)
+	assert.Equal(t, "pp_db", parsed.Name)
+	assert.Equal(t, "", gjson.Get(out, "Secrets.ClientSecret").String())
+}
+
+func TestClusterNodesRotate_SecretOnly_JSON(t *testing.T) {
+	secret := cluster.ExampleClientSecret
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v1/cluster/nodes/register" {
+			http.NotFound(w, r)
+			return
+		}
+		if r.Header.Get("Authorization") != "Bearer "+cluster.ExampleJoinToken {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		b, _ := io.ReadAll(r.Body)
+		rotate := gjson.GetBytes(b, "RotateDatabase").Bool()
+		rotateSecret := gjson.GetBytes(b, "RotateSecret").Bool()
+		// Expect secret-only rotation
+		if rotate || !rotateSecret {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		resp := cluster.RegisterResponse{
+			Node: cluster.Node{
+				UUID:      "n4",
+				Name:      "pp-node-06",
+				Role:      cluster.RoleInstance,
+				CreatedAt: "2025-09-15T00:00:00Z",
+				UpdatedAt: "2025-09-15T00:00:00Z",
+			},
+			Database: cluster.RegisterDatabase{
+				Host:      "database",
+				Port:      3306,
+				Name:      "pp_db",
+				User:      "pp_user",
+				RotatedAt: "2025-09-15T00:00:00Z",
+			},
+			Secrets: &cluster.RegisterSecrets{
+				ClientSecret: secret,
+				RotatedAt:    "2025-09-15T00:00:00Z",
+			},
+			AlreadyRegistered:  true,
+			AlreadyProvisioned: true,
+		}
+		_ = json.NewEncoder(w).Encode(resp)
+	}))
+	defer ts.Close()
+
+	SetEnvForTest(t, "PHOTOPRISM_PORTAL_URL", ts.URL)
+	SetEnvForTest(t, "PHOTOPRISM_JOIN_TOKEN", cluster.ExampleJoinToken)
+	out, err := RunWithTestContext(ClusterNodesRotateCommand, []string{
+		"rotate", "--json", "--secret", "--yes", "pp-node-06",
+	})
+	assert.NoError(t, err)
+	assert.Equal(t, "pp-node-06", gjson.Get(out, "Node.Name").String())
+	assert.Equal(t, secret, gjson.Get(out, "Secrets.ClientSecret").String())
+	assert.Equal(t, "", gjson.Get(out, "Database.Password").String())
+}
+
+func TestPostWithBackoff(t *testing.T) {
+	t.Run("ErrorBodyLimit", func(t *testing.T) {
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte(`{"error":"invalid node name"}` + strings.Repeat(" ", 2*registerErrorBodyMax)))
+		}))
+		defer ts.Close()
+
+		err := postWithBackoff(ts.URL, "", []byte("{}"), nil)
+
+		var httpErr *httpError
+		require.ErrorAs(t, err, &httpErr)
+		assert.Equal(t, http.StatusBadRequest, httpErr.Status)
+		assert.Len(t, httpErr.Body, registerErrorBodyMax)
+		assert.True(t, strings.HasPrefix(httpErr.Body, `{"error":"invalid node name"}`))
+	})
+	t.Run("ResponseLimit", func(t *testing.T) {
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			_, _ = w.Write([]byte(`{"name":"` + strings.Repeat("a", registerResponseMax) + `"}`))
+		}))
+		defer ts.Close()
+
+		var out map[string]string
+		assert.Error(t, postWithBackoff(ts.URL, "", []byte("{}"), &out))
+	})
+	t.Run("Success", func(t *testing.T) {
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			_, _ = w.Write([]byte(`{"name":"pp-node-01"}`))
+		}))
+		defer ts.Close()
+
+		var out map[string]string
+		require.NoError(t, postWithBackoff(ts.URL, "", []byte("{}"), &out))
+		assert.Equal(t, "pp-node-01", out["name"])
+	})
+}
+
+func TestClusterRegister_HTTPUnauthorized(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+	}))
+	defer ts.Close()
+
+	_, err := RunWithTestContext(ClusterRegisterCommand, []string{
+		"register", "--name", "pp-node-unauth", "--role", "instance", "--portal-url", ts.URL, "--join-token", "wrong", "--json",
+	})
+	if ec, ok := err.(cli.ExitCoder); ok {
+		assert.Equal(t, 4, ec.ExitCode())
+	} else {
+		t.Fatalf("expected ExitCoder, got %T", err)
+	}
+}
+
+func TestClusterRegister_HTTPConflict(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusConflict)
+	}))
+	defer ts.Close()
+
+	_, err := RunWithTestContext(ClusterRegisterCommand, []string{
+		"register", "--name", "pp-node-conflict", "--role", "instance", "--portal-url", ts.URL, "--join-token", cluster.ExampleJoinToken, "--json",
+	})
+	if ec, ok := err.(cli.ExitCoder); ok {
+		assert.Equal(t, 5, ec.ExitCode())
+	} else {
+		t.Fatalf("expected ExitCoder, got %T", err)
+	}
+}
+
+func TestClusterRegister_NoDatabase(t *testing.T) {
+	// Register runs on a node that has not joined yet, so it must not need the database the Portal provides.
+	// The harness reassigns InitConfig for each run, so the test checks that the core loader was used.
+	initCoreConfig := InitCoreConfig
+	t.Cleanup(func() { InitCoreConfig = initCoreConfig })
+	var core atomic.Bool
+	InitCoreConfig = func(ctx *cli.Context, quiet bool) (*cfg.Config, error) {
+		core.Store(true)
+		return initCoreConfig(ctx, quiet)
+	}
+
+	setClusterOptionsForTest(t, cfg.DefaultPortalUrl, "cluster.dev")
+	out, err := RunWithTestContext(ClusterRegisterCommand, []string{"register", "--dry-run", "--json"})
+	require.NoError(t, err)
+	assert.True(t, core.Load())
+	assert.NotEmpty(t, gjson.Get(out, "Payload.NodeName").String())
+}
+
+func TestClusterRegister_DryRun_JSON(t *testing.T) {
+	// No server needed; dry-run avoids HTTP. The config is shared by the package, so the
+	// values are captured and put back: a portal URL left behind outranks the environment a
+	// later test sets, and that test then reaches this one's portal instead of its own server.
+	setClusterOptionsForTest(t, cfg.DefaultPortalUrl, "cluster.dev")
+	out, err := RunWithTestContext(ClusterRegisterCommand, []string{
+		"register", "--dry-run", "--json",
+	})
+	// Should not fail; output must include PortalUrl and payload
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	assert.NotEmpty(t, gjson.Get(out, "PortalUrl").String())
+	assert.Equal(t, cluster.RoleInstance, gjson.Get(out, "Payload.NodeRole").String())
+	// NodeName may be derived; ensure non-empty
+	assert.NotEmpty(t, gjson.Get(out, "Payload.NodeName").String())
+}
+
+func TestClusterRegister_DryRun_JSON_LegacyAliasAppToInstance(t *testing.T) {
+	// No server needed; dry-run avoids HTTP.
+	out, err := RunWithTestContext(ClusterRegisterCommand, []string{
+		"register", "--dry-run", "--json", "--role", "app",
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// Legacy app is accepted and canonicalized to instance.
+	assert.Equal(t, cluster.RoleInstance, gjson.Get(out, "Payload.NodeRole").String())
+}
+
+func TestClusterRegister_DryRun_Text(t *testing.T) {
+	out, err := RunWithTestContext(ClusterRegisterCommand, []string{
+		"register", "--dry-run",
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	assert.Contains(t, out, "Portal URL:")
+	assert.Contains(t, out, "Node Name:")
+}
+
+func TestClusterRegister_HTTPBadRequest(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+	}))
+	defer ts.Close()
+
+	_, err := RunWithTestContext(ClusterRegisterCommand, []string{
+		"register", "--name", "pp node invalid", "--role", "instance", "--portal-url", ts.URL, "--join-token", cluster.ExampleJoinToken, "--json",
+	})
+	if ec, ok := err.(cli.ExitCoder); ok {
+		assert.Equal(t, 2, ec.ExitCode())
+	} else {
+		t.Fatalf("expected ExitCoder, got %T", err)
+	}
+}
+
+func TestClusterRegister_HTTPRateLimitOnceThenOK(t *testing.T) {
+	calls := 0
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		if calls == 1 {
+			w.WriteHeader(http.StatusTooManyRequests)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		resp := cluster.RegisterResponse{
+			Node: cluster.Node{
+				UUID:      "n7",
+				Name:      "pp-node-rl",
+				Role:      cluster.RoleInstance,
+				CreatedAt: "2025-09-15T00:00:00Z",
+				UpdatedAt: "2025-09-15T00:00:00Z",
+			},
+			Database: cluster.RegisterDatabase{
+				Host:      "database",
+				Port:      3306,
+				Name:      "pp_db",
+				User:      "pp_user",
+				Password:  "pwdrl",
+				DSN:       "pp_user:pwdrl@tcp(db:3306)/pp_db?parseTime=true",
+				RotatedAt: "2025-09-15T00:00:00Z",
+			},
+			AlreadyRegistered:  true,
+			AlreadyProvisioned: true,
+		}
+		_ = json.NewEncoder(w).Encode(resp)
+	}))
+	defer ts.Close()
+
+	out, err := RunWithTestContext(ClusterRegisterCommand, []string{
+		"register", "--name", "pp-node-rl", "--role", "instance", "--portal-url", ts.URL, "--join-token", cluster.ExampleJoinToken, "--rotate", "--json",
+	})
+	assert.NoError(t, err)
+	assert.Equal(t, "pp-node-rl", gjson.Get(out, "Node.Name").String())
+}
+
+func TestClusterNodesRotate_HTTPUnauthorized_JSON(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+	}))
+	defer ts.Close()
+
+	_, err := RunWithTestContext(ClusterNodesRotateCommand, []string{
+		"rotate", "--json", "--portal-url=" + ts.URL, "--join-token=wrong", "--db", "--yes", "pp-node-x",
+	})
+	if ec, ok := err.(cli.ExitCoder); ok {
+		assert.Equal(t, 4, ec.ExitCode())
+	} else {
+		t.Fatalf("expected ExitCoder, got %T", err)
+	}
+}
+
+func TestClusterNodesRotate_HTTPConflict_JSON(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusConflict)
+	}))
+	defer ts.Close()
+
+	_, err := RunWithTestContext(ClusterNodesRotateCommand, []string{
+		"rotate", "--json", "--portal-url=" + ts.URL, "--join-token=" + cluster.ExampleJoinToken, "--db", "--yes", "pp-node-x",
+	})
+	if ec, ok := err.(cli.ExitCoder); ok {
+		assert.Equal(t, 5, ec.ExitCode())
+	} else {
+		t.Fatalf("expected ExitCoder, got %T", err)
+	}
+}
+
+func TestClusterNodesRotate_HTTPBadRequest_JSON(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+	}))
+	defer ts.Close()
+
+	_, err := RunWithTestContext(ClusterNodesRotateCommand, []string{
+		"rotate", "--json", "--portal-url=" + ts.URL, "--join-token=" + cluster.ExampleJoinToken, "--db", "--yes", "pp node invalid",
+	})
+	if ec, ok := err.(cli.ExitCoder); ok {
+		assert.Equal(t, 2, ec.ExitCode())
+	} else {
+		t.Fatalf("expected ExitCoder, got %T", err)
+	}
+}
+
+func TestClusterNodesRotate_HTTPRateLimitOnceThenOK_JSON(t *testing.T) {
+	calls := 0
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		if calls == 1 {
+			w.WriteHeader(http.StatusTooManyRequests)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		resp := cluster.RegisterResponse{
+			Node: cluster.Node{
+				UUID:      "n8",
+				Name:      "pp-node-rl2",
+				Role:      cluster.RoleInstance,
+				CreatedAt: "2025-09-15T00:00:00Z",
+				UpdatedAt: "2025-09-15T00:00:00Z",
+			},
+			Database: cluster.RegisterDatabase{
+				Host:      "database",
+				Port:      3306,
+				Name:      "pp_db",
+				User:      "pp_user",
+				Password:  "pwdrl2",
+				DSN:       "pp_user:pwdrl2@tcp(db:3306)/pp_db?parseTime=true",
+				RotatedAt: "2025-09-15T00:00:00Z",
+			},
+			AlreadyRegistered:  true,
+			AlreadyProvisioned: true,
+		}
+		_ = json.NewEncoder(w).Encode(resp)
+	}))
+	defer ts.Close()
+
+	out, err := RunWithTestContext(ClusterNodesRotateCommand, []string{
+		"rotate", "--json", "--portal-url=" + ts.URL, "--join-token=" + cluster.ExampleJoinToken, "--db", "--yes", "pp-node-rl2",
+	})
+	assert.NoError(t, err)
+	assert.Equal(t, "pp-node-rl2", gjson.Get(out, "Node.Name").String())
+}
+
+func TestClusterRegister_RotateDatabase_JSON(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v1/cluster/nodes/register" {
+			http.NotFound(w, r)
+			return
+		}
+		if r.Header.Get("Authorization") != "Bearer "+cluster.ExampleJoinToken {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		b, _ := io.ReadAll(r.Body)
+		if !gjson.GetBytes(b, "RotateDatabase").Bool() || gjson.GetBytes(b, "RotateSecret").Bool() {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		resp := cluster.RegisterResponse{
+			Node: cluster.Node{
+				UUID:      "n5",
+				Name:      "pp-node-07",
+				Role:      cluster.RoleInstance,
+				CreatedAt: "2025-09-15T00:00:00Z",
+				UpdatedAt: "2025-09-15T00:00:00Z",
+			},
+			Database: cluster.RegisterDatabase{
+				Host:      "database",
+				Port:      3306,
+				Name:      "pp_db",
+				User:      "pp_user",
+				Password:  "pwd7",
+				DSN:       "pp_user:pwd7@tcp(db:3306)/pp_db?parseTime=true",
+				RotatedAt: "2025-09-15T00:00:00Z",
+			},
+			AlreadyRegistered:  true,
+			AlreadyProvisioned: true,
+		}
+		_ = json.NewEncoder(w).Encode(resp)
+	}))
+	defer ts.Close()
+
+	out, err := RunWithTestContext(ClusterRegisterCommand, []string{
+		"register", "--name", "pp-node-07", "--role", "instance", "--portal-url", ts.URL, "--join-token", cluster.ExampleJoinToken, "--rotate", "--json",
+	})
+	assert.NoError(t, err)
+	assert.Equal(t, "pp-node-07", gjson.Get(out, "Node.Name").String())
+	assert.Equal(t, "pwd7", gjson.Get(out, "Database.Password").String())
+	dbDsn := gjson.Get(out, "Database.DSN").String()
+	parsed := dsn.Parse(dbDsn)
+	assert.Equal(t, "pp_user", parsed.User)
+	assert.Equal(t, "pwd7", parsed.Password)
+	assert.Equal(t, "tcp", parsed.Net)
+	assert.Equal(t, "db:3306", parsed.Server)
+	assert.Equal(t, "pp_db", parsed.Name)
+}
+
+// TestClusterRegister_WriteConfigRefusedDatabase checks the exit code when database credentials cannot be saved.
+func TestClusterRegister_WriteConfigRefusedDatabase(t *testing.T) {
+	tempCfg := t.TempDir()
+	SetEnvForTest(t, "PHOTOPRISM_CONFIG_PATH", tempCfg)
+
+	conf := get.Config()
+	previousOptions := *conf.Options()
+	t.Cleanup(func() {
+		*conf.Options() = previousOptions
+	})
+	conf.Options().OptionsYaml = filepath.Join(tempCfg, "options.yml")
+
+	var rotateRequested atomic.Bool
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		rotateRequested.Store(gjson.GetBytes(b, "RotateDatabase").Bool())
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_ = json.NewEncoder(w).Encode(cluster.RegisterResponse{
+			UUID: "4a47c940-d5de-41b3-88a2-eb816cc659ca",
+			Node: cluster.Node{UUID: "01987f09-193d-7d01-9f18-d8d189f0fe88", Name: "pp-node-10", Role: cluster.RoleInstance,
+				ClientID: cluster.ExampleClientID},
+			Database: cluster.RegisterDatabase{Driver: dsn.DriverMySQL, Host: "/run/mysqld/mysqld.sock", Port: 3306, Name: "pp_db",
+				User: "pp_user", Password: "pwd10"},
+		})
+	}))
+	defer ts.Close()
+
+	args := []string{"register", "--name", "pp-node-10", "--role", "instance", "--portal-url", ts.URL,
+		"--join-token", cluster.ExampleJoinToken, "--write-config"}
+
+	t.Run("Rotate", func(t *testing.T) {
+		out, err := RunWithTestContext(ClusterRegisterCommand, append(args, "--rotate", "--json"))
+		require.Error(t, err)
+		assert.Equal(t, 1, ExitCode(err))
+		assert.Contains(t, err.Error(), "the portal changed the database password, but the new credentials could not be saved; save the node credentials shown above")
+		assert.Equal(t, "pwd10", gjson.Get(out, "Database.Password").String())
+
+		content, readErr := os.ReadFile(conf.OptionsYaml())
+		require.NoError(t, readErr)
+
+		var persisted map[string]any
+		require.NoError(t, yaml.Unmarshal(content, &persisted))
+		assert.Equal(t, cluster.ExampleClientID, persisted["NodeClientID"])
+		assert.Equal(t, "4a47c940-d5de-41b3-88a2-eb816cc659ca", persisted["ClusterUUID"])
+		assert.NotContains(t, persisted, "DatabasePassword")
+	})
+	t.Run("AutoRotate", func(t *testing.T) {
+		// A rotation the command requests because the node has no credentials keeps exit code 0.
+		conf.Options().DatabaseDriver = dsn.DriverMySQL
+		conf.Options().DatabaseDSN = ""
+		conf.Options().DatabaseName, conf.Options().DatabaseUser, conf.Options().DatabasePassword = "", "", ""
+		require.True(t, conf.ShouldAutoRotateDatabase())
+
+		_, err := RunWithTestContext(ClusterRegisterCommand, args)
+		assert.NoError(t, err)
+		assert.True(t, rotateRequested.Load())
+	})
+}
+
+// TestClusterRegister_WriteConfigRotated checks the exit code when explicitly rotated credentials are saved.
+func TestClusterRegister_WriteConfigRotated(t *testing.T) {
+	tempCfg := t.TempDir()
+	SetEnvForTest(t, "PHOTOPRISM_CONFIG_PATH", tempCfg)
+
+	conf := get.Config()
+	previousOptions := *conf.Options()
+	t.Cleanup(func() {
+		*conf.Options() = previousOptions
+	})
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_ = json.NewEncoder(w).Encode(cluster.RegisterResponse{
+			UUID: "4a47c940-d5de-41b3-88a2-eb816cc659ca",
+			Node: cluster.Node{UUID: "01987f09-193d-7d01-9f18-d8d189f0fe88", Name: "pp-node-11", Role: cluster.RoleInstance,
+				ClientID: cluster.ExampleClientID},
+			Database: cluster.RegisterDatabase{Driver: dsn.DriverMySQL, Host: "db.local", Port: 3306, Name: "pp_db",
+				User: "pp_user", Password: "pwd11"},
+		})
+	}))
+	defer ts.Close()
+
+	args := []string{"register", "--name", "pp-node-11", "--role", "instance", "--portal-url", ts.URL,
+		"--join-token", cluster.ExampleJoinToken, "--write-config", "--rotate"}
+
+	// reset restores the options and uses a new options file.
+	reset := func(name string) {
+		*conf.Options() = previousOptions
+		conf.Options().DatabaseDSN = ""
+		conf.Options().Deprecated.DatabaseDsn = ""
+		conf.Options().OptionsYaml = filepath.Join(tempCfg, name)
+	}
+
+	t.Run("Saved", func(t *testing.T) {
+		reset("saved.yml")
+		_, err := RunWithTestContext(ClusterRegisterCommand, args)
+		require.NoError(t, err)
+
+		content, readErr := os.ReadFile(conf.OptionsYaml())
+		require.NoError(t, readErr)
+		assert.Contains(t, string(content), "pwd11")
+	})
+	t.Run("OptionsFileDSN", func(t *testing.T) {
+		// A DSN in the options file is replaced by the saved credentials.
+		reset("options-dsn.yml")
+		dsnValue := "pp_user:old_pw@tcp(db.local:3306)/pp_db?parseTime=true"
+		require.NoError(t, os.WriteFile(conf.OptionsYaml(), []byte("DatabaseDSN: "+dsnValue+"\n"), fs.ModeSecretFile))
+		conf.Options().DatabaseDSN = dsnValue
+
+		_, err := RunWithTestContext(ClusterRegisterCommand, args)
+		require.NoError(t, err)
+
+		content, readErr := os.ReadFile(conf.OptionsYaml())
+		require.NoError(t, readErr)
+		assert.NotContains(t, string(content), "DatabaseDSN")
+		assert.Contains(t, string(content), "pwd11")
+	})
+	t.Run("DSNOverride", func(t *testing.T) {
+		// A DSN from an environment variable applies again on the next start.
+		reset("override.yml")
+		t.Setenv("PHOTOPRISM_DATABASE_DSN", "pp_user:old_pw@tcp(db.local:3306)/pp_db?parseTime=true")
+
+		// The test context applies no environment variables, so the configuration gets a context that does,
+		// with its folders in the test folder.
+		dsnDir := t.TempDir()
+		dsnFlags := flag.NewFlagSet("test", flag.ContinueOnError)
+		dsnValues := map[string]string{
+			"database-dsn":   os.Getenv("PHOTOPRISM_DATABASE_DSN"),
+			"originals-path": filepath.Join(dsnDir, "originals"),
+			"storage-path":   filepath.Join(dsnDir, "storage"),
+			"config-path":    filepath.Join(dsnDir, "config"),
+			"import-path":    filepath.Join(dsnDir, "import"),
+			"cache-path":     filepath.Join(dsnDir, "cache"),
+			"assets-path":    conf.AssetsPath(),
+		}
+
+		for name := range dsnValues {
+			dsnFlags.String(name, "", "doc")
+		}
+
+		dsnCtx := cli.NewContext(cli.NewApp(), dsnFlags, nil)
+
+		for name, value := range dsnValues {
+			require.NoError(t, dsnCtx.Set(name, value))
+		}
+
+		previousInit := InitCoreConfig
+		t.Cleanup(func() { InitCoreConfig = previousInit })
+		InitCoreConfig = func(*cli.Context, bool) (*cfg.Config, error) {
+			c := cfg.NewConfig(dsnCtx)
+			c.Options().OptionsYaml = filepath.Join(tempCfg, "override.yml")
+			return c, c.InitCore()
+		}
+
+		_, err := RunWithTestContext(ClusterRegisterCommand, args)
+		require.Error(t, err)
+		assert.Equal(t, 1, ExitCode(err))
+		assert.Contains(t, err.Error(), "the portal changed the database password, but PHOTOPRISM_DATABASE_DSN sets a database dsn")
+		assert.Contains(t, err.Error(), "set the node credentials shown above there")
+	})
+	t.Run("SaveError", func(t *testing.T) {
+		// The options file cannot be written, since its name is a folder.
+		reset("folder.yml")
+		require.NoError(t, os.Mkdir(conf.OptionsYaml(), 0o700))
+
+		_, err := RunWithTestContext(ClusterRegisterCommand, args)
+		require.Error(t, err)
+		assert.Equal(t, 1, ExitCode(err))
+		assert.Contains(t, err.Error(), "the portal changed the database password, but the new credentials could not be saved (")
+	})
+}
+
+func TestClusterRegister_RotateSecret_JSON(t *testing.T) {
+	secret := cluster.ExampleClientSecret
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v1/cluster/nodes/register" {
+			http.NotFound(w, r)
+			return
+		}
+		if r.Header.Get("Authorization") != "Bearer "+cluster.ExampleJoinToken {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		b, _ := io.ReadAll(r.Body)
+		if gjson.GetBytes(b, "RotateDatabase").Bool() || !gjson.GetBytes(b, "RotateSecret").Bool() {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		resp := cluster.RegisterResponse{
+			Node: cluster.Node{
+				UUID:      "n6",
+				Name:      "pp-node-08",
+				Role:      cluster.RoleInstance,
+				CreatedAt: "2025-09-15T00:00:00Z",
+				UpdatedAt: "2025-09-15T00:00:00Z",
+			},
+			Database: cluster.RegisterDatabase{
+				Host:      "database",
+				Port:      3306,
+				Name:      "pp_db",
+				User:      "pp_user",
+				RotatedAt: "2025-09-15T00:00:00Z",
+			},
+			Secrets: &cluster.RegisterSecrets{
+				ClientSecret: secret,
+				RotatedAt:    "2025-09-15T00:00:00Z",
+			},
+			AlreadyRegistered:  true,
+			AlreadyProvisioned: true,
+		}
+		_ = json.NewEncoder(w).Encode(resp)
+	}))
+	defer ts.Close()
+
+	out, err := RunWithTestContext(ClusterRegisterCommand, []string{
+		"register", "--name", "pp-node-08", "--role", "instance", "--portal-url", ts.URL, "--join-token", cluster.ExampleJoinToken, "--rotate-secret", "--json",
+	})
+	assert.NoError(t, err)
+	assert.Equal(t, "pp-node-08", gjson.Get(out, "Node.Name").String())
+	assert.Equal(t, secret, gjson.Get(out, "Secrets.ClientSecret").String())
+	assert.Equal(t, "", gjson.Get(out, "Database.Password").String())
+}
+
+// TestClusterNodesRotate_Confirm verifies that a rotation asks for confirmation before it contacts the Portal,
+// and that the command exits with a usage error when it cannot ask.
+func TestClusterNodesRotate_Confirm(t *testing.T) {
+	var calls int
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer ts.Close()
+
+	SetEnvForTest(t, "PHOTOPRISM_PORTAL_URL", ts.URL)
+	SetEnvForTest(t, "PHOTOPRISM_JOIN_TOKEN", cluster.ExampleJoinToken)
+	t.Setenv("PHOTOPRISM_CLI", "")
+
+	t.Run("NoTerminal", func(t *testing.T) {
+		_, err := RunWithTestContext(ClusterNodesRotateCommand, []string{"rotate", "--db", "pp-node-05"})
+
+		var exit cli.ExitCoder
+		require.ErrorAs(t, err, &exit)
+		assert.Equal(t, 2, exit.ExitCode())
+		assert.Equal(t, 0, calls)
+	})
+	t.Run("AnsweredNo", func(t *testing.T) {
+		pipeResetAnswers(t, "n\n")
+
+		_, err := RunWithTestContext(ClusterNodesRotateCommand, []string{"rotate", "--db", "pp-node-05"})
+
+		assert.NoError(t, err)
+		assert.Equal(t, 0, calls)
+	})
+}
+
+func TestWarnInsecurePublicURL(t *testing.T) {
+	for u, want := range map[string]bool{
+		"https://photos.example.com":    false,
+		"http://photos.example.com":     true,
+		"http://localhost:2342":         false,
+		"http://127.0.0.2:2342":         false,
+		"http://[::1]:2342":             false,
+		"http://[0:0:0:0:0:0:0:1]:2342": false,
+		"http://[2001:db8::1]:2342":     true,
+		"://bad":                        false,
+	} {
+		assert.Equal(t, want, warnInsecurePublicURL(u), u)
+	}
+}

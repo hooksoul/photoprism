@@ -2,22 +2,28 @@ package api
 
 import (
 	"fmt"
+	"os"
+	"path"
 
 	"github.com/gin-gonic/gin"
 
-	"github.com/photoprism/photoprism/internal/get"
-	"github.com/photoprism/photoprism/internal/query"
+	"github.com/photoprism/photoprism/internal/config/ttl"
+	"github.com/photoprism/photoprism/internal/entity"
+	"github.com/photoprism/photoprism/internal/entity/query"
+	"github.com/photoprism/photoprism/internal/photoprism/get"
 	"github.com/photoprism/photoprism/internal/thumb"
+	"github.com/photoprism/photoprism/pkg/clean"
+	"github.com/photoprism/photoprism/pkg/fs"
+	"github.com/photoprism/photoprism/pkg/http/header"
+	"github.com/photoprism/photoprism/pkg/rnd"
 )
 
-// CoverMaxAge specifies the number of seconds to cache album covers.
-var CoverMaxAge thumb.MaxAge = 3600 // 1 hour
-
+// ThumbCache describes files persisted on disk for cached thumbnails and share images.
 type ThumbCache struct {
-	FileName  string
-	ShareName string
+	FileName string
 }
 
+// ByteCache wraps in-memory cached byte slices for fast responses.
 type ByteCache struct {
 	Data []byte
 }
@@ -25,6 +31,31 @@ type ByteCache struct {
 // CacheKey returns a cache key string based on namespace, uid and name.
 func CacheKey(ns, uid, name string) string {
 	return fmt.Sprintf("%s:%s:%s", ns, uid, name)
+}
+
+// coverThumbName is the cover cache key name for the assigned cover file flag.
+// No thumbnail size is named "thumb", so it cannot collide with a cached file entry.
+const coverThumbName = "thumb"
+
+// CachedCoverHasThumb reports whether a cover file has been assigned to the album or label.
+// Only a positive result is cached, as the negative path continues to a cover query anyway.
+func CachedCoverHasThumb(ns, uid string, hasThumb func(string) bool) bool {
+	cache := get.CoverCache()
+	cacheKey := CacheKey(ns, uid, coverThumbName)
+
+	if cacheData, hit := cache.Get(cacheKey); hit {
+		if result, ok := cacheData.(bool); ok && result {
+			return true
+		}
+	}
+
+	if !hasThumb(uid) {
+		return false
+	}
+
+	cache.SetDefault(cacheKey, true)
+
+	return true
 }
 
 // RemoveFromFolderCache removes an item from the folder cache e.g. after indexing.
@@ -36,7 +67,7 @@ func RemoveFromFolderCache(rootName string) {
 	cache.Delete(cacheKey)
 
 	if err := query.UpdateAlbumFolderCovers(); err != nil {
-		log.Error(err)
+		log.Errorf("covers: %s (update folders)", clean.Error(err))
 	}
 
 	log.Debugf("removed %s from cache", cacheKey)
@@ -44,7 +75,14 @@ func RemoveFromFolderCache(rootName string) {
 
 // RemoveFromAlbumCoverCache removes covers by album UID e.g. after adding or removing photos.
 func RemoveFromAlbumCoverCache(uid string) {
+	if !rnd.IsAlnum(uid) {
+		return
+	}
+
 	cache := get.CoverCache()
+
+	// Flush album cover cache.
+	cache.Delete(CacheKey(albumCover, uid, coverThumbName))
 
 	for thumbName := range thumb.Sizes {
 		cacheKey := CacheKey(albumCover, uid, string(thumbName))
@@ -54,8 +92,42 @@ func RemoveFromAlbumCoverCache(uid string) {
 		log.Debugf("removed %s from cache", cacheKey)
 	}
 
-	if err := query.UpdateAlbumCovers(); err != nil {
-		log.Error(err)
+	// Delete share preview, if exists.
+	if sharePreview := path.Join(get.Config().ThumbCachePath(), "share", uid+fs.ExtJpeg); fs.FileExists(sharePreview) {
+		_ = os.Remove(sharePreview)
+	}
+
+	album, err := query.AlbumByUID(uid)
+
+	if err != nil {
+		log.Errorf("covers: %s (find album %s)", clean.Error(err), clean.Log(uid))
+		return
+	}
+
+	// Manual covers stay untouched; we only regenerate auto-managed entries.
+	if album.ThumbSrc != entity.SrcAuto {
+		return
+	}
+
+	if err = query.UpdateAlbumCovers(album); err != nil {
+		log.Errorf("covers: %s (update album %s)", clean.Error(err), clean.Log(uid))
+	}
+}
+
+// RemoveFromLabelCoverCache removes covers by label UID e.g. after updates.
+func RemoveFromLabelCoverCache(uid string) {
+	if !rnd.IsAlnum(uid) {
+		return
+	}
+
+	cache := get.CoverCache()
+
+	cache.Delete(CacheKey(labelCover, uid, coverThumbName))
+
+	for thumbName := range thumb.Sizes {
+		cacheKey := CacheKey(labelCover, uid, string(thumbName))
+		cache.Delete(cacheKey)
+		log.Debugf("removed %s from cache", cacheKey)
 	}
 }
 
@@ -64,31 +136,28 @@ func FlushCoverCache() {
 	get.CoverCache().Flush()
 
 	if err := query.UpdateCovers(); err != nil {
-		log.Error(err)
+		log.Errorf("covers: %s (update)", clean.Error(err))
 	}
 
 	log.Debugf("albums: flushed cover cache")
 }
 
 // AddCacheHeader adds a cache control header to the response.
-func AddCacheHeader(c *gin.Context, maxAge thumb.MaxAge, public bool) {
-	if public {
-		c.Header("Cache-Control", fmt.Sprintf("public, max-age=%s, no-transform", maxAge.String()))
-	} else {
-		c.Header("Cache-Control", fmt.Sprintf("private, max-age=%s, no-transform", maxAge.String()))
-	}
+func AddCacheHeader(c *gin.Context, duration ttl.Duration, public bool) {
+	header.SetCacheControl(c, duration.Int(), public)
 }
 
 // AddCoverCacheHeader adds cover image cache control headers to the response.
 func AddCoverCacheHeader(c *gin.Context) {
-	AddCacheHeader(c, CoverMaxAge, thumb.CachePublic)
+	AddCacheHeader(c, ttl.CacheCover, thumb.CachePublic)
 }
 
 // AddImmutableCacheHeader adds cache control headers to the response for immutable content like thumbnails.
 func AddImmutableCacheHeader(c *gin.Context) {
-	if thumb.CachePublic {
-		c.Header("Cache-Control", fmt.Sprintf("public, max-age=%s, no-transform, immutable", thumb.CacheMaxAge.String()))
-	} else {
-		c.Header("Cache-Control", fmt.Sprintf("private, max-age=%s, no-transform, immutable", thumb.CacheMaxAge.String()))
-	}
+	header.SetCacheControlImmutable(c, ttl.CacheDefault.Int(), thumb.CachePublic)
+}
+
+// AddVideoCacheHeader adds video cache control headers to the response.
+func AddVideoCacheHeader(c *gin.Context, cdn bool) {
+	header.SetCacheControlImmutable(c, ttl.CacheVideo.Int(), cdn || thumb.CachePublic)
 }

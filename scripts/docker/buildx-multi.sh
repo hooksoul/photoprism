@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 
+# shellcheck disable=SC2086 # intentional word splitting for dynamic docker args
+
 # https://docs.docker.com/develop/develop-images/build_enhancements/#to-enable-buildkit-builds
 export DOCKER_BUILDKIT=1
 
@@ -11,15 +13,29 @@ fi
 NUMERIC='^[0-9]+$'
 BUILD_DATE=$(/bin/date -u +%y%m%d)
 
-# kill old multi builder if still alive.
-echo "Removing existing multibuilder..."
-docker buildx rm multibuilder 2>/dev/null
+# Use a builder name per host, so that builds started on different hosts
+# get their own buildkit container on the shared remote arm node.
+BUILDER="multibuilder-$(hostname -s)"
 
-# wait 3 seconds.
+# Remove existing multibuilder.
+echo "Removing old multibuilder..."
+docker buildx rm "$BUILDER" 2>/dev/null
 sleep 3
+echo "Done."
 
-# create new multibuilder.
-docker buildx create --name multibuilder --use  || { echo 'failed'; exit 1; }
+# Create new multibuilder and add remote host for native arm builds.
+# BUILDKIT_STEP_LOG_MAX_SIZE raised from default 2 MiB → 5 MiB so long apt-get
+# transcripts (especially on unstable Ubuntu releases) don't get truncated.
+echo "Creating new multibuilder..."
+docker buildx create --name "$BUILDER" \
+    --driver-opt env.BUILDKIT_STEP_LOG_MAX_SIZE=5242880 \
+    --driver-opt env.BUILDKIT_STEP_LOG_MAX_SPEED=10485760 \
+    --use 1>/dev/null || { echo "buildx: failed to create $BUILDER"; exit 1; }
+docker buildx create --name "$BUILDER" --append \
+    --driver-opt env.BUILDKIT_STEP_LOG_MAX_SIZE=5242880 \
+    --driver-opt env.BUILDKIT_STEP_LOG_MAX_SPEED=10485760 \
+    ssh://arm 2>/dev/null || echo 'buildx: failed to add remote host for native arm builds'
+echo "Done."
 
 echo "Starting 'photoprism/$1' multi-arch build based on docker/${1/-//}$4/Dockerfile..."
 echo "Build Arch: $2"
@@ -99,7 +115,13 @@ else
       --push .
 fi
 
+# Capture the buildx exit code so we can still run cleanup below
+# and propagate the failure to make. Without this, a failed build
+# would silently exit 0 because the trailing `echo` succeeds.
+rc=$?
+
 echo "Removing multibuilder..."
-docker buildx rm multibuilder
+docker buildx rm "$BUILDER"
 
 echo "Done."
+exit "$rc"

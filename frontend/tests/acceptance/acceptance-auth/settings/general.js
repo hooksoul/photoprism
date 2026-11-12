@@ -1,4 +1,5 @@
 import { Selector } from "testcafe";
+import { ClientFunction } from "testcafe";
 import testcafeconfig from "../../../testcafeconfig.json";
 import Menu from "../../page-model/menu";
 import Toolbar from "../../page-model/toolbar";
@@ -8,10 +9,12 @@ import Page from "../../page-model/page";
 import Photo from "../../page-model/photo";
 import PhotoEdit from "../../page-model/photo-edit";
 import Album from "../../page-model/album";
+import AlbumDialog from "../../page-model/dialog-album";
 import Settings from "../../page-model/settings";
 import Library from "../../page-model/library";
+import Notifies from "../../page-model/notifications";
 
-fixture`Test settings`.page`${testcafeconfig.url}`.beforeEach(async (t) => {
+fixture`Test general settings`.page`${testcafeconfig.url}`.beforeEach(async (t) => {
   await page.login("admin", "photoprism");
 });
 
@@ -23,68 +26,77 @@ const page = new Page();
 const photo = new Photo();
 const photoedit = new PhotoEdit();
 const album = new Album();
+const albumdialog = new AlbumDialog();
 const settings = new Settings();
 const library = new Library();
+const getPageUrl = ClientFunction(() => window.location.href);
+const notifies = new Notifies();
 
-test.meta("testID", "settings-general-001").meta({ type: "short", mode: "auth" })(
-  "Common: Disable delete",
-  async (t) => {
-    await menu.openPage("archive");
-    await photo.triggerHoverAction("nth", 0, "select");
-    await contextmenu.checkContextMenuActionAvailability("delete", true);
-    await contextmenu.clearSelection();
-    await menu.openPage("settings");
-    await t.click(settings.deleteCheckbox);
-    await menu.openPage("archive");
-    await photo.triggerHoverAction("nth", 0, "select");
+test.meta("testID", "settings-general-001").meta({ type: "short", mode: "auth" })("Common: Disable delete", async (t) => {
+  await menu.openPage("archive");
+  await toolbar.checkToolbarActionAvailability("delete-all", true);
+  await photo.triggerHoverAction("nth", 0, "select");
+  await contextmenu.checkContextMenuActionAvailability("delete", true);
+  await contextmenu.clearSelection();
+  await menu.openPage("settings");
+  await t.click(settings.deleteCheckbox);
+  await menu.openPage("archive");
+  await toolbar.checkToolbarActionAvailability("delete-all", false);
 
-    await contextmenu.checkContextMenuActionAvailability("restore", true);
-    await contextmenu.checkContextMenuActionAvailability("delete", false);
-    await contextmenu.clearSelection();
+  await photo.triggerHoverAction("nth", 0, "select");
 
-    await menu.openPage("browse");
-    await toolbar.search("stack:true");
-    await photo.triggerHoverAction("nth", 0, "select");
-    await contextmenu.triggerContextMenuAction("edit", "");
-    await t.click(photoedit.filesTab);
-    await t.click(photoedit.toggleExpandFile.nth(1));
+  await contextmenu.checkContextMenuActionAvailability("restore", true);
+  await contextmenu.checkContextMenuActionAvailability("delete", false);
+  await contextmenu.clearSelection();
 
-    await t.expect(photoedit.deleteFile.visible).notOk();
+  await menu.openPage("browse");
+  await toolbar.search("stack:true");
+  await photo.triggerHoverAction("nth", 0, "select");
+  await contextmenu.triggerContextMenuAction("edit", "");
+  await t.click(photoedit.filesTab);
+  await t.click(photoedit.toggleExpandFile.nth(1));
 
-    await t.click(photoedit.dialogClose);
-    await contextmenu.clearSelection();
-    await menu.openPage("settings");
-    await t.click(settings.deleteCheckbox);
-  }
-);
+  await t.expect(photoedit.deleteFile.visible).notOk();
 
-test.meta("testID", "settings-general-002").meta({ type: "short", mode: "auth" })(
-  "Common: Change language",
-  async (t) => {
-    await t.expect(Selector(".nav-browse").innerText).contains("Search");
+  await t.click(photoedit.dialogClose);
+  await contextmenu.clearSelection();
+  await menu.openPage("settings");
+  await t.click(settings.deleteCheckbox);
+  await menu.openPage("browse");
+  await toolbar.search("stack:true");
+  await photo.triggerHoverAction("nth", 0, "select");
+  await contextmenu.triggerContextMenuAction("edit", "");
+  await t.click(photoedit.filesTab);
+  await t.click(photoedit.toggleExpandFile.nth(1));
 
-    await menu.openPage("settings");
-    await t
-      .click(settings.languageOpenSelection)
-      .hover(Selector("div").withText("Deutsch").parent('div[role="listitem"]'))
-      .click(Selector("div").withText("Deutsch").parent('div[role="listitem"]'));
-    await t.eval(() => location.reload());
+  await t.expect(photoedit.deleteFile.visible).ok();
+});
 
-    await t.expect(Selector(".nav-browse").innerText).contains("Suche");
+test.meta("testID", "settings-general-002").meta({ type: "short", mode: "auth" })("Common: Change language", async (t) => {
+  await menu.openNav();
+  await t.expect(Selector("a.nav-browse").innerText).contains("Search");
 
-    await t
-      .click(settings.languageOpenSelection)
-      .hover(Selector("div").withText("English").parent('div[role="listitem"]'))
-      .click(Selector("div").withText("English").parent('div[role="listitem"]'));
+  await menu.openPage("settings");
+  await t
+    .click(settings.languageOpenSelection)
+    .hover(Selector("div").withText("Deutsch").parent('div[role="option"]'))
+    .click(Selector("div").withText("Deutsch").parent('div[role="option"]'));
+  await t.eval(() => location.reload());
 
-    await t.expect(Selector(".nav-browse").innerText).contains("Search");
-  }
-);
+  await t.expect(Selector("a.nav-browse").innerText).contains("Suche");
+
+  await t
+    .click(settings.languageOpenSelection)
+    .hover(Selector("div").withText("English").parent('div[role="option"]'))
+    .click(Selector("div").withText("English").parent('div[role="option"]'));
+
+  await t.expect(Selector("a.nav-browse").innerText).contains("Search");
+});
 
 test.meta("testID", "settings-general-003").meta({ type: "short", mode: "auth" })(
-  "Common: Disable pages: import, originals, logs, moments, places, library",
+  "Common: Disable pages: import, originals, logs, moments, places, library, calendar, services, account",
   async (t) => {
-    await toolbar.setFilter("view", "Cards");
+    await t.click(toolbar.cardsViewAction);
 
     await toolbar.search("Tübingen");
     await t.expect(page.cardLocation.exists).ok();
@@ -112,26 +124,52 @@ test.meta("testID", "settings-general-003").meta({ type: "short", mode: "auth" }
 
     await menu.openPage("library");
 
+    await t.expect(library.importTab.visible).ok().expect(library.logsTab.visible).ok().expect(library.indexTab.visible).ok();
+    await menu.openPage("browse");
+    await notifies.waitForPhotosToLoad(7000);
+    await photo.toggleSelectNthPhoto(0, "image");
+    await contextmenu.triggerContextMenuAction("edit");
     await t
-      .expect(library.importTab.visible)
+      .expect(photoedit.batchDialog.visible)
+      .notOk()
+      .click(photoedit.locationAction)
+      .expect(photoedit.locationSearch.visible)
       .ok()
-      .expect(library.logsTab.visible)
+      .click(photoedit.locationCancel)
+      .click(photoedit.dialogClose);
+    await photo.toggleSelectNthPhoto(1, "image");
+    await contextmenu.triggerContextMenuAction("edit");
+    await t
+      .expect(photoedit.batchDialog.visible)
       .ok()
-      .expect(library.indexTab.visible)
-      .ok();
+      .click(photoedit.locationAction)
+      .expect(photoedit.locationSearch.visible)
+      .ok()
+      .click(photoedit.locationCancel)
+      .click(photoedit.dialogClose);
+
+    await contextmenu.clearSelection();
+
+    await menu.openPage("settings");
+
+    await t.expect(settings.accountTab.visible).ok();
     await menu.checkMenuItemAvailability("originals", true);
     await menu.checkMenuItemAvailability("folders", true);
     await menu.checkMenuItemAvailability("moments", true);
     await menu.checkMenuItemAvailability("places", true);
     await menu.checkMenuItemAvailability("library", true);
+    await menu.checkMenuItemAvailability("calendar", true);
 
     await menu.openPage("settings");
     await t
       .click(settings.importCheckbox)
       .click(settings.filesCheckbox)
       .click(settings.momentsCheckbox)
+      .click(settings.calendarCheckbox)
       .click(settings.logsCheckbox)
-      .click(settings.placesCheckbox);
+      .click(settings.placesCheckbox)
+      .click(settings.accountCheckbox)
+      .click(settings.servicesCheckbox);
     await t.eval(() => location.reload());
 
     if (t.browser.platform === "mobile") {
@@ -152,41 +190,55 @@ test.meta("testID", "settings-general-003").meta({ type: "short", mode: "auth" }
     }
 
     await menu.openPage("browse");
-    await toolbar.setFilter("view", "Cards");
+    await t.click(toolbar.cardsViewAction);
 
     await t.expect(page.cardLocation.exists).notOk();
 
+    await photo.toggleSelectNthPhoto(0, "image");
+    await contextmenu.triggerContextMenuAction("edit");
+    await t.expect(photoedit.batchDialog.visible).notOk().expect(photoedit.locationAction.visible).notOk().click(photoedit.dialogClose);
+    await photo.toggleSelectNthPhoto(1, "image");
+    await contextmenu.triggerContextMenuAction("edit");
+    await t.expect(photoedit.batchDialog.visible).ok().expect(photoedit.locationAction.visible).notOk().click(photoedit.dialogClose);
+
+    await contextmenu.clearSelection();
+
     await menu.openPage("library");
 
-    await t
-      .expect(library.importTab.visible)
-      .notOk()
-      .expect(library.logsTab.visible)
-      .notOk()
-      .expect(library.indexTab.visible)
-      .ok();
+    await t.expect(library.importTab.visible).notOk().expect(library.logsTab.visible).notOk().expect(library.indexTab.visible).ok();
     await menu.checkMenuItemAvailability("originals", false);
     await menu.checkMenuItemAvailability("folders", true);
     await menu.checkMenuItemAvailability("moments", false);
+    await menu.checkMenuItemAvailability("calendar", false);
     await menu.checkMenuItemAvailability("places", false);
     await menu.checkMenuItemAvailability("library", true);
 
     await menu.openPage("settings");
+
+    await t.expect(settings.accountTab.visible).notOk().expect(settings.generalTab.visible).ok();
+
     await t
       .click(settings.importCheckbox)
       .click(settings.filesCheckbox)
       .click(settings.momentsCheckbox)
+      .click(settings.calendarCheckbox)
       .click(settings.logsCheckbox)
       .click(settings.placesCheckbox)
-      .click(settings.libraryCheckbox);
+      .click(settings.libraryCheckbox)
+      .click(settings.accountCheckbox)
+      .click(settings.servicesCheckbox);
 
     await menu.checkMenuItemAvailability("originals", false);
     await menu.checkMenuItemAvailability("folders", true);
     await menu.checkMenuItemAvailability("moments", true);
+    await menu.checkMenuItemAvailability("calendar", true);
     await menu.checkMenuItemAvailability("places", true);
     await menu.checkMenuItemAvailability("library", false);
 
+    await menu.openPage("albums");
     await menu.openPage("settings");
+
+    await t.expect(settings.accountTab.visible).ok().expect(settings.generalTab.visible).ok();
 
     if (t.browser.platform === "mobile") {
       if (await toolbar.openMobileToolbar.visible) {
@@ -222,261 +274,744 @@ test.meta("testID", "settings-general-003").meta({ type: "short", mode: "auth" }
   }
 );
 
-test.meta("testID", "settings-general-004").meta({ type: "short", mode: "auth" })(
-  "Common: Disable people and labels",
+test.meta("testID", "settings-general-004").meta({ type: "short", mode: "auth" })("Common: Disable people and labels", async (t) => {
+  //Use photo with all kinds of metadata
+  await toolbar.search("filename:Images/albums-002_3.jpg");
+  await notifies.waitForSearchToFinish(7000);
+  await t.click(toolbar.cardsViewAction);
+  await t.click(page.cardTitle.nth(0));
+  await t.click(photoedit.labelsTab);
+
+  await t.expect(photoedit.addLabel.visible).ok();
+
+  await t.click(photoedit.peopleTab);
+
+  await t.expect(Selector("div.p-faces").visible).ok();
+
+  await t.click(photoedit.dialogClose);
+
+  // Lightbox sidebar baseline: with the People feature enabled, the
+  // sidebar renders the People header and markers controls. The PR
+  // that rewrote the sidebar gated both on $config.feature("people"),
+  // so this assertion fails if the feature flag no longer propagates.
+  await photoviewer.openPhotoViewer("nth", 0);
+  await photoviewer.openSidebar();
+  await t.expect(Selector(".p-lightbox-sidebar .text-subtitle-2").withText("People").exists).ok();
+  // Admin (Edit on) sees the pencil "Edit" button. The pencil carries both
+  // `.meta-markers-toggle` (visibility-toggle role, shared with the eye) and
+  // `.meta-faces-edit` (edit-mode discriminator); `markersEditToggle` is the
+  // compound selector that only matches the pencil variant.
+  await t.expect(photoviewer.markersEditToggle.exists).ok();
+  await t.expect(photoviewer.sidebarLabels.exists).ok();
+  await photoviewer.triggerPhotoViewerAction("close-button");
+
+  await photo.toggleSelectNthPhoto(0, "image");
+  await t.click(toolbar.searchClearAction);
+  await notifies.waitForSearchToFinish(7000);
+  await photo.toggleSelectNthPhoto(1, "image");
+  await contextmenu.triggerContextMenuAction("edit");
+
+  await t.expect(photoedit.batchDialog.visible).ok();
+  await t.expect(photoedit.batchLabels.visible).ok();
+
+  await t.click(photoedit.dialogClose);
+  await contextmenu.clearSelection();
+
+  await menu.checkMenuItemAvailability("people", true);
+  await menu.checkMenuItemAvailability("labels", true);
+  await menu.openPage("settings");
+  await t.click(settings.peopleCheckbox).click(settings.labelsCheckbox);
+  await t.eval(() => location.reload());
+  await menu.openPage("browse");
+  //Use photo with all kinds of metadata
+  await toolbar.search("filename:Images/albums-002_3.jpg");
+  await notifies.waitForSearchToFinish(7000);
+  await t.click(toolbar.cardsViewAction);
+  await t.click(page.cardTitle.nth(0));
+  await t.click(photoedit.labelsTab);
+
+  await t.expect(photoedit.addLabel.exists).notOk();
+
+  await t.click(photoedit.peopleTab);
+
+  await t.expect(Selector("div.p-faces ").exists).notOk();
+
+  await t.click(photoedit.dialogClose);
+
+  // With People disabled the lightbox sidebar must hide the entire
+  // People section and the face-marker toggle/add controls, even for
+  // an admin on a photo that has markers in the fixtures.
+  await photoviewer.openPhotoViewer("nth", 0);
+  await photoviewer.openSidebar();
+  await t.expect(Selector(".p-lightbox-sidebar .text-subtitle-2").withText("People").exists).notOk();
+  await t.expect(photoviewer.markersVisibilityToggle.exists).notOk();
+  await t.expect(photoviewer.markersEditToggle.exists).notOk();
+  await t.expect(photoviewer.sidebarLabels.exists).notOk();
+  await photoviewer.triggerPhotoViewerAction("close-button");
+
+  await photo.toggleSelectNthPhoto(0, "image");
+  await t.click(toolbar.searchClearAction);
+  await notifies.waitForSearchToFinish(7000);
+  await photo.toggleSelectNthPhoto(1, "image");
+  await contextmenu.triggerContextMenuAction("edit");
+
+  await t.expect(photoedit.batchDialog.visible).ok();
+  await t.expect(photoedit.batchLabels.exists).notOk();
+
+  await t.click(photoedit.dialogClose);
+  await contextmenu.clearSelection();
+
+  await menu.checkMenuItemAvailability("people", false);
+  await menu.checkMenuItemAvailability("labels", false);
+
+  await menu.openPage("settings");
+  await t.click(settings.peopleCheckbox).click(settings.labelsCheckbox);
+  await menu.openPage("browse");
+
+  await menu.checkMenuItemAvailability("people", true);
+  await menu.checkMenuItemAvailability("labels", true);
+});
+
+test.meta("testID", "settings-general-005").meta({ type: "short", mode: "auth" })("Common: Disable private, archive and quality filter", async (t) => {
+  await menu.checkMenuItemAvailability("archive", true);
+  await menu.checkMenuItemAvailability("review", true);
+  await menu.checkMenuItemAvailability("private", true);
+
+  await menu.openPage("browse");
+  await t.eval(() => location.reload());
+  await toolbar.search("photo:true stack:true");
+
+  await photo.triggerHoverAction("nth", 0, "select");
+
+  await contextmenu.checkContextMenuActionAvailability("archive", true);
+  await contextmenu.checkContextMenuActionAvailability("private", true);
+
+  await contextmenu.triggerContextMenuAction("edit", "");
+  await t.click(photoedit.infoTab);
+
+  await photoedit.checkFieldDisabled(photoedit.privateInput, false);
+
+  await t.click(photoedit.dialogClose);
+  await contextmenu.clearSelection();
+  await toolbar.search("Viewpoint / Mexico / 2017");
+
+  await photo.checkPhotoVisibility("pqmxlr7188hz4bih", false);
+
+  await toolbar.search("Truck / Vancouver / 2019");
+
+  await photo.checkPhotoVisibility("pqmxlr0kg161o9ek", false);
+
+  await toolbar.search("Archive / 2020");
+
+  await photo.checkPhotoVisibility("pqnah1k2frui6p63", false);
+
+  await t.navigateTo("/library/archive");
+  await toolbar.checkToolbarActionAvailability("delete-all", true);
+
+  await menu.openPage("settings");
+  await t.click(settings.archiveCheckbox).click(settings.privateCheckbox).click(Selector(settings.libraryTab)).click(settings.reviewCheckbox);
+
+  await menu.checkMenuItemAvailability("archive", false);
+  await menu.checkMenuItemAvailability("review", false);
+  await menu.checkMenuItemAvailability("private", false);
+  await menu.openPage("browse");
+  await t.eval(() => location.reload());
+
+  await toolbar.search("photo:true");
+  await photo.triggerHoverAction("nth", 0, "select");
+
+  await contextmenu.checkContextMenuActionAvailability("archive", false);
+  await contextmenu.checkContextMenuActionAvailability("private", false);
+
+  await contextmenu.triggerContextMenuAction("edit", "");
+  await t.click(photoedit.infoTab);
+
+  //await photoedit.checkFieldDisabled(photoedit.privateInput, true);
+
+  await t.click(photoedit.dialogClose);
+  await contextmenu.clearSelection();
+  await toolbar.search("Viewpoint / Mexico / 2017");
+
+  await photo.checkPhotoVisibility("pqmxlr7188hz4bih", true);
+
+  await toolbar.search("Truck / Vancouver / 2019");
+
+  await photo.checkPhotoVisibility("pqmxlr0kg161o9ek", false);
+
+  await toolbar.search("Archive / 2020");
+
+  await photo.checkPhotoVisibility("pqnah1k2frui6p63", true);
+
+  await t.navigateTo("/library/archive");
+  await toolbar.checkToolbarActionAvailability("delete-all", false);
+
+  await menu.openPage("settings");
+  await t.click(settings.privateCheckbox).click(settings.archiveCheckbox).click(Selector(settings.libraryTab)).click(settings.reviewCheckbox);
+
+  await menu.checkMenuItemAvailability("archive", true);
+  await menu.checkMenuItemAvailability("review", true);
+  await menu.checkMenuItemAvailability("private", true);
+});
+
+test.meta("testID", "settings-general-006").meta({ type: "short", mode: "auth" })("Common: Disable upload, download, edit and share", async (t) => {
+  await toolbar.checkToolbarActionAvailability("upload", true);
+
+  await toolbar.search("photo:true stack:true");
+  await photo.triggerHoverAction("nth", 0, "select");
+
+  await contextmenu.checkContextMenuActionAvailability("download", true);
+  await contextmenu.checkContextMenuActionAvailability("share", true);
+  await contextmenu.checkContextMenuActionAvailability("edit", true);
+
+  await contextmenu.triggerContextMenuAction("edit", "");
+
+  await t.expect(photoedit.batchDialog.visible).notOk();
+
+  await photoedit.checkAllDetailsFieldsDisabled(false);
+  await t.expect(photoedit.infoTab.visible).ok();
+  await t.click(photoedit.filesTab);
+
+  await t
+    .expect(photoedit.downloadFile.nth(0).visible)
+    .ok()
+    .click(photoedit.toggleExpandFile.nth(1))
+    .expect(photoedit.downloadFile.nth(0).visible)
+    .ok()
+    .expect(photoedit.deleteFile.visible)
+    .ok()
+    .click(photoedit.dialogClose);
+
+  await photo.triggerHoverAction("nth", 1, "select");
+  await contextmenu.triggerContextMenuAction("edit", "");
+
+  await t.expect(photoedit.batchDialog.visible).ok();
+  await t.click(photoedit.dialogClose);
+
+  await contextmenu.clearSelection();
+  //Use photo with all kinds of metadata
+  await toolbar.search("filename:Images/albums-002_3.jpg");
+  await notifies.waitForSearchToFinish(7000);
+  await photoviewer.openPhotoViewer("nth", 0);
+
+  await photoviewer.checkPhotoViewerActionAvailability("download", true);
+  await photoviewer.checkPhotoViewerActionAvailability("edit-button", true);
+
+  // Baseline sidebar assertion: with Edit enabled, every editable row
+  // surfaces its editor / dialog when clicked.
+  await photoviewer.openSidebar();
+  await photoviewer.assertSidebarIsEditable();
+
+  await photoviewer.triggerPhotoViewerAction("close-button");
+  await t.expect(Selector("div.p-lightbox__pswp").visible).notOk();
+
+  await menu.openPage("albums");
+  await album.toggleSelectNthAlbum(0, "all");
+  await contextmenu.checkContextMenuActionAvailability("download", true);
+  await contextmenu.triggerContextMenuAction("clear");
+  await album.openNthAlbum(0);
+  await toolbar.checkToolbarActionAvailability("download", true);
+
+  await menu.openPage("settings");
+
+  await t.click(settings.uploadCheckbox).click(settings.downloadCheckbox).click(settings.editCheckbox).click(settings.shareCheckbox);
+  await t.eval(() => location.reload());
+  await t.navigateTo("/library/calendar");
+
+  await toolbar.checkToolbarActionAvailability("upload", false);
+  await album.checkHoverActionAvailability("nth", 2, "share", false);
+
+  await album.triggerHoverAction("nth", 0, "select");
+
+  await contextmenu.checkContextMenuActionAvailability("edit", true);
+  await contextmenu.checkContextMenuActionAvailability("download", false);
+  await contextmenu.checkContextMenuActionAvailability("share", false);
+
+  await contextmenu.clearSelection();
+  await album.openNthAlbum(0);
+
+  await toolbar.checkToolbarActionAvailability("upload", false);
+  await toolbar.checkToolbarActionAvailability("download", false);
+  await toolbar.checkToolbarActionAvailability("share", false);
+  await toolbar.checkToolbarActionAvailability("edit", true);
+
+  await t.navigateTo("/library/folders");
+
+  await toolbar.checkToolbarActionAvailability("upload", false);
+  await album.checkHoverActionAvailability("nth", 0, "share", false);
+
+  await album.triggerHoverAction("nth", 0, "select");
+
+  await contextmenu.checkContextMenuActionAvailability("edit", true);
+  await contextmenu.checkContextMenuActionAvailability("download", false);
+  await contextmenu.checkContextMenuActionAvailability("share", false);
+
+  await contextmenu.clearSelection();
+  await album.openNthAlbum(0);
+
+  await toolbar.checkToolbarActionAvailability("upload", false);
+  await toolbar.checkToolbarActionAvailability("download", false);
+  await toolbar.checkToolbarActionAvailability("share", false);
+  await toolbar.checkToolbarActionAvailability("edit", true);
+
+  await t.navigateTo("/library/albums");
+
+  await toolbar.checkToolbarActionAvailability("upload", false);
+  await album.checkHoverActionAvailability("nth", 0, "share", false);
+
+  await album.triggerHoverAction("nth", 0, "select");
+
+  await contextmenu.checkContextMenuActionAvailability("edit", true);
+  await contextmenu.checkContextMenuActionAvailability("delete", true);
+  await contextmenu.checkContextMenuActionAvailability("download", false);
+  await contextmenu.checkContextMenuActionAvailability("share", false);
+
+  await contextmenu.clearSelection();
+  await album.openNthAlbum(0);
+
+  await toolbar.checkToolbarActionAvailability("upload", false);
+  await toolbar.checkToolbarActionAvailability("download", false);
+  await toolbar.checkToolbarActionAvailability("share", false);
+  await toolbar.checkToolbarActionAvailability("edit", true);
+
+  await t.navigateTo("/library/browse");
+
+  await toolbar.checkToolbarActionAvailability("upload", false);
+
+  await toolbar.search("photo:true stack:true");
+  await photo.triggerHoverAction("nth", 0, "select");
+
+  await contextmenu.checkContextMenuActionAvailability("download", false);
+  await contextmenu.checkContextMenuActionAvailability("share", false);
+  await contextmenu.checkContextMenuActionAvailability("edit", false);
+
+  await contextmenu.clearSelection();
+  await t.click(toolbar.cardsViewAction);
+
+  //Use photo with all kinds of metadata
+  await toolbar.search("filename:Images/albums-002_3.jpg");
+  await notifies.waitForSearchToFinish(7000);
+  await photoviewer.openPhotoViewer("nth", 0);
+  await photoviewer.checkPhotoViewerActionAvailability("download", false);
+  await photoviewer.checkPhotoViewerActionAvailability("edit-button", false);
+
+  await photoviewer.openSidebar();
+  // The anchored photo populates every row, so the default flags all assert presence:
+  // Title, Caption, People, Albums and Labels must render without an editing affordance.
+  await photoviewer.assertSidebarIsReadOnly();
+  await photoviewer.triggerPhotoViewerAction("close-button");
+  await t.expect(Selector("div.p-lightbox__pswp").visible).notOk();
+
+  // Positive control for the eye toggle — search a photo with markers (the People
+  // section only renders the eye when people.length > 0 for non-editable users).
+  // `markersVisibilityToggle` resolves to the eye here because the pencil branch
+  // doesn't render for non-editable sessions.
+  await toolbar.search("Filmpreis");
+  await photoviewer.openPhotoViewer("nth", 0);
+  await photoviewer.openSidebar();
+  await t.expect(photoviewer.markersVisibilityToggle.visible).ok();
+  await t.expect(photoviewer.markersEditToggle.exists).notOk();
+  await photoviewer.triggerPhotoViewerAction("close-button");
+  await t.expect(Selector("div.p-lightbox__pswp").visible).notOk();
+
+  await menu.openPage("settings");
+  await t.click(settings.uploadCheckbox).click(settings.downloadCheckbox).click(settings.editCheckbox).click(settings.shareCheckbox);
+  await t.navigateTo("/library/browse");
+  await photo.triggerHoverAction("nth", 0, "select");
+  await photo.triggerHoverAction("nth", 1, "select");
+  await contextmenu.triggerContextMenuAction("edit", "");
+
+  await t.expect(photoedit.batchDialog.visible).notOk();
+  await t.click(photoedit.dialogClose);
+
+  await contextmenu.clearSelection();
+  await menu.openPage("settings");
+  await t.click(settings.batchCheckbox);
+});
+
+test.meta("testID", "settings-general-007").meta({ type: "short", mode: "auth" })("Common: Configure start page", async (t) => {
+  await t.expect(getPageUrl()).contains("browse");
+
+  await menu.openPage("settings");
+  await t
+    .click(settings.startpageOpenSelection)
+    .hover(Selector("div").withText("Places").parent('div[role="option"]'))
+    .click(Selector("div").withText("Places").parent('div[role="option"]'));
+  await page.logout();
+  await page.login("admin", "photoprism");
+  await t.expect(getPageUrl()).contains("places");
+  await menu.openPage("settings");
+  await t.click(settings.placesCheckbox);
+  await page.logout();
+  await page.login("admin", "photoprism");
+  await t.expect(getPageUrl()).contains("browse");
+  await menu.openPage("settings");
+  await t.click(settings.placesCheckbox);
+  await page.logout();
+  await page.login("admin", "photoprism");
+  await t.expect(getPageUrl()).contains("places");
+  await page.logout();
+  await page.login("admin", "photoprism");
+  await t.expect(getPageUrl()).contains("places");
+  await menu.openPage("settings");
+  await t
+    .click(settings.startpageOpenSelection)
+    .hover(Selector("div").withText("Albums").parent('div[role="option"]'))
+    .click(Selector("div").withText("Albums").parent('div[role="option"]'));
+  await page.logout();
+  await page.login("admin", "photoprism");
+  await t.expect(getPageUrl()).contains("albums");
+  await menu.openPage("settings");
+  await t
+    .click(settings.startpageOpenSelection)
+    .hover(Selector("div").withText("Default").parent('div[role="option"]'))
+    .click(Selector("div").withText("Default").parent('div[role="option"]'));
+  await page.logout();
+  await page.login("admin", "photoprism");
+  await t.expect(getPageUrl()).contains("browse");
+});
+
+test.meta("testID", "settings-general-008").meta({ type: "short", mode: "auth" })(
+  "Common: Disable albums, favorites, folders, and media",
   async (t) => {
-    await toolbar.setFilter("view", "Cards");
-    await t.click(page.cardTitle.nth(0));
-    await t.click(photoedit.labelsTab);
-
-    await t.expect(photoedit.addLabel.visible).ok();
-
-    await t.click(photoedit.peopleTab);
-
-    await t.expect(Selector("div.p-faces").visible).ok();
-
-    await t.click(photoedit.dialogClose);
-    await menu.checkMenuItemAvailability("people", true);
-    await menu.checkMenuItemAvailability("labels", true);
-    await menu.openPage("settings");
-    await t.click(settings.peopleCheckbox).click(settings.labelsCheckbox);
-    await t.eval(() => location.reload());
-    await menu.openPage("browse");
-    await toolbar.setFilter("view", "Cards");
-    await t.click(page.cardTitle.nth(0));
-    await t.click(photoedit.labelsTab);
-
-    await t.expect(photoedit.addLabel.exists).notOk();
-
-    await t.click(photoedit.peopleTab);
-
-    await t.expect(Selector("div.p-faces ").exists).notOk();
-
-    await t.click(photoedit.dialogClose);
-
-    await menu.checkMenuItemAvailability("people", false);
-    await menu.checkMenuItemAvailability("labels", false);
-
-    await menu.openPage("settings");
-    await t.click(settings.peopleCheckbox).click(settings.labelsCheckbox);
-
-    await menu.checkMenuItemAvailability("people", true);
-    await menu.checkMenuItemAvailability("labels", true);
-  }
-);
-
-test.meta("testID", "settings-general-005").meta({ type: "short", mode: "auth" })(
-  "Common: Disable private, archive and quality filter",
-  async (t) => {
-    await menu.checkMenuItemAvailability("archive", true);
-    await menu.checkMenuItemAvailability("review", true);
-    await menu.checkMenuItemAvailability("private", true);
-
-    await menu.openPage("browse");
-    await t.eval(() => location.reload());
-    await toolbar.search("photo:true stack:true");
-
-    await photo.triggerHoverAction("nth", 0, "select");
-
-    await contextmenu.checkContextMenuActionAvailability("archive", true);
-    await contextmenu.checkContextMenuActionAvailability("private", true);
-
-    await contextmenu.triggerContextMenuAction("edit", "");
-    await t.click(photoedit.infoTab);
-
-    await photoedit.checkFieldDisabled(photoedit.privateInput, false);
-
-    await t.click(photoedit.dialogClose);
-    await contextmenu.clearSelection();
-    await toolbar.search("Viewpoint / Mexico / 2017");
-
-    await photo.checkPhotoVisibility("pqmxlr7188hz4bih", false);
-
-    await toolbar.search("Truck / Vancouver / 2019");
-
-    await photo.checkPhotoVisibility("pqmxlr0kg161o9ek", false);
-
-    await toolbar.search("Archive / 2020");
-
-    await photo.checkPhotoVisibility("pqnah1k2frui6p63", false);
+    await menu.checkMenuItemAvailability("albums", true);
+    await menu.checkMenuItemAvailability("favorites", true);
+    await menu.checkMenuItemAvailability("folders", true);
+    await menu.checkMenuItemAvailability("media", true);
 
     await menu.openPage("settings");
     await t
-      .click(settings.archiveCheckbox)
-      .click(settings.privateCheckbox)
-      .click(Selector(settings.libraryTab))
-      .click(settings.reviewCheckbox);
-
-    await menu.checkMenuItemAvailability("archive", false);
-    await menu.checkMenuItemAvailability("review", false);
-    await menu.checkMenuItemAvailability("private", false);
-    await menu.openPage("browse");
+      .click(settings.albumsCheckbox)
+      .click(settings.favoritesCheckbox)
+      .click(settings.foldersCheckbox)
+      .click(settings.videosCheckbox);
     await t.eval(() => location.reload());
 
-    await toolbar.search("photo:true");
-    await photo.triggerHoverAction("nth", 0, "select");
-
-    await contextmenu.checkContextMenuActionAvailability("archive", false);
-    await contextmenu.checkContextMenuActionAvailability("private", false);
-
-    await contextmenu.triggerContextMenuAction("edit", "");
-    await t.click(photoedit.infoTab);
-
-    //await photoedit.checkFieldDisabled(photoedit.privateInput, true);
-
-    await t.click(photoedit.dialogClose);
-    await contextmenu.clearSelection();
-    await toolbar.search("Viewpoint / Mexico / 2017");
-
-    await photo.checkPhotoVisibility("pqmxlr7188hz4bih", true);
-
-    await toolbar.search("Truck / Vancouver / 2019");
-
-    await photo.checkPhotoVisibility("pqmxlr0kg161o9ek", false);
-
-    await toolbar.search("Archive / 2020");
-
-    await photo.checkPhotoVisibility("pqnah1k2frui6p63", true);
+    await menu.checkMenuItemAvailability("albums", false);
+    await menu.checkMenuItemAvailability("favorites", false);
+    await menu.checkMenuItemAvailability("folders", false);
+    await menu.checkMenuItemAvailability("media", false);
 
     await menu.openPage("settings");
     await t
-      .click(settings.privateCheckbox)
-      .click(settings.archiveCheckbox)
-      .click(Selector(settings.libraryTab))
-      .click(settings.reviewCheckbox);
+      .click(settings.albumsCheckbox)
+      .click(settings.favoritesCheckbox)
+      .click(settings.foldersCheckbox)
+      .click(settings.videosCheckbox);
 
-    await menu.checkMenuItemAvailability("archive", true);
-    await menu.checkMenuItemAvailability("review", true);
-    await menu.checkMenuItemAvailability("private", true);
+    await menu.checkMenuItemAvailability("albums", true);
+    await menu.checkMenuItemAvailability("favorites", true);
+    await menu.checkMenuItemAvailability("folders", true);
+    await menu.checkMenuItemAvailability("media", true);
   }
 );
 
-test.meta("testID", "settings-general-006").meta({ type: "short", mode: "auth" })(
-  "Common: Disable upload, download, edit and share",
-  async (t) => {
-    await toolbar.checkToolbarActionAvailability("upload", true);
 
+test.meta("testID", "settings-general-009").meta({ type: "short", mode: "auth" })(
+  "Common: Disable album downloads only - file downloads still work",
+  async (t) => {
+    await menu.openPage("albums");
+    await notifies.waitForAlbumsToLoad(7000);
+
+    await album.toggleSelectNthAlbum(0, "all");
+    await contextmenu.checkContextMenuActionAvailability("download", true);
+    await contextmenu.clearSelection();
+
+    await album.openNthAlbum(0);
+    await toolbar.checkToolbarActionAvailability("download", true);
+
+    await t.navigateTo("/library/browse");
     await toolbar.search("photo:true stack:true");
     await photo.triggerHoverAction("nth", 0, "select");
 
     await contextmenu.checkContextMenuActionAvailability("download", true);
-    await contextmenu.checkContextMenuActionAvailability("share", true);
-    await contextmenu.checkContextMenuActionAvailability("edit", true);
-
-    await contextmenu.triggerContextMenuAction("edit", "");
-
-    await photoedit.checkAllDetailsFieldsDisabled(false);
-    await t.expect(photoedit.infoTab.visible).ok();
-    await t.click(photoedit.filesTab);
-
-    await t
-      .expect(photoedit.downloadFile.nth(0).visible)
-      .ok()
-      .click(photoedit.toggleExpandFile.nth(1))
-      .expect(photoedit.downloadFile.nth(1).visible)
-      .ok()
-      .expect(photoedit.deleteFile.visible)
-      .ok()
-      .click(photoedit.dialogClose);
-
     await contextmenu.clearSelection();
+
     await toolbar.search("photo:true");
     await photoviewer.openPhotoViewer("nth", 0);
-
     await photoviewer.checkPhotoViewerActionAvailability("download", true);
-
-    await photoviewer.triggerPhotoViewerAction("close");
-    await menu.openPage("settings");
-
-    await t
-      .click(settings.uploadCheckbox)
-      .click(settings.downloadCheckbox)
-      .click(settings.editCheckbox)
-      .click(settings.shareCheckbox);
-    await t.eval(() => location.reload());
-    await t.navigateTo("/library/calendar");
-
-    await toolbar.checkToolbarActionAvailability("upload", false);
-    await album.checkHoverActionAvailability("nth", 2, "share", false);
-
-    await album.triggerHoverAction("nth", 0, "select");
-
-    await contextmenu.checkContextMenuActionAvailability("edit", true);
-    await contextmenu.checkContextMenuActionAvailability("download", false);
-    await contextmenu.checkContextMenuActionAvailability("share", false);
-
-    await contextmenu.clearSelection();
-    await album.openNthAlbum(0);
-
-    await toolbar.checkToolbarActionAvailability("upload", false);
-    await toolbar.checkToolbarActionAvailability("download", false);
-    await toolbar.checkToolbarActionAvailability("share", false);
-    await toolbar.checkToolbarActionAvailability("edit", true);
-
-    await t.navigateTo("/library/folders");
-
-    await toolbar.checkToolbarActionAvailability("upload", false);
-    await album.checkHoverActionAvailability("nth", 0, "share", false);
-
-    await album.triggerHoverAction("nth", 0, "select");
-
-    await contextmenu.checkContextMenuActionAvailability("edit", true);
-    await contextmenu.checkContextMenuActionAvailability("download", false);
-    await contextmenu.checkContextMenuActionAvailability("share", false);
-
-    await contextmenu.clearSelection();
-    await album.openNthAlbum(0);
-
-    await toolbar.checkToolbarActionAvailability("upload", false);
-    await toolbar.checkToolbarActionAvailability("download", false);
-    await toolbar.checkToolbarActionAvailability("share", false);
-    await toolbar.checkToolbarActionAvailability("edit", true);
-
-    await t.navigateTo("/library/albums");
-
-    await toolbar.checkToolbarActionAvailability("upload", false);
-    await album.checkHoverActionAvailability("nth", 0, "share", false);
-
-    await album.triggerHoverAction("nth", 0, "select");
-
-    await contextmenu.checkContextMenuActionAvailability("edit", true);
-    await contextmenu.checkContextMenuActionAvailability("delete", true);
-    await contextmenu.checkContextMenuActionAvailability("download", false);
-    await contextmenu.checkContextMenuActionAvailability("share", false);
-
-    await contextmenu.clearSelection();
-    await album.openNthAlbum(0);
-
-    await toolbar.checkToolbarActionAvailability("upload", false);
-    await toolbar.checkToolbarActionAvailability("download", false);
-    await toolbar.checkToolbarActionAvailability("share", false);
-    await toolbar.checkToolbarActionAvailability("edit", true);
-
-    await t.navigateTo("/library/browse");
-
-    await toolbar.checkToolbarActionAvailability("upload", false);
+    await photoviewer.triggerPhotoViewerAction("close-button");
+    await t.expect(Selector("div.p-lightbox__pswp").visible).notOk();
 
     await toolbar.search("photo:true stack:true");
     await photo.triggerHoverAction("nth", 0, "select");
-
-    await contextmenu.checkContextMenuActionAvailability("download", false);
-    await contextmenu.checkContextMenuActionAvailability("share", false);
-    await contextmenu.checkContextMenuActionAvailability("edit", false);
-
+    await contextmenu.triggerContextMenuAction("edit", "");
+    await t.click(photoedit.filesTab);
+    await t.expect(photoedit.downloadFile.nth(0).visible).ok();
+    await t.click(photoedit.dialogClose);
     await contextmenu.clearSelection();
-    await toolbar.setFilter("view", "Cards");
+
+    await menu.openPage("settings");
+    await t.click(Selector(settings.collectionsTab));
+    await t.wait(500);
+    await t.click(settings.albumDownloadDisabledCheckbox);
+    await t.wait(500);
+
+    await menu.openPage("albums");
+    await notifies.waitForAlbumsToLoad(7000);
+
+    await album.toggleSelectNthAlbum(0, "all");
+    await contextmenu.checkContextMenuActionAvailability("download", false);
+    await contextmenu.clearSelection();
+
+    await album.openNthAlbum(0);
+    await toolbar.checkToolbarActionAvailability("download", false);
+
+    await t.navigateTo("/library/browse");
+    await toolbar.search("photo:true stack:true");
+    await photo.triggerHoverAction("nth", 0, "select");
+
+    await contextmenu.checkContextMenuActionAvailability("download", true);
+
+    await photo.triggerHoverAction("nth", 1, "select");
+    await contextmenu.checkContextMenuActionAvailability("download", true);
+    await contextmenu.clearSelection();
 
     await toolbar.search("photo:true");
     await photoviewer.openPhotoViewer("nth", 0);
-    await photoviewer.checkPhotoViewerActionAvailability("download", false);
-    await photoviewer.checkPhotoViewerActionAvailability("edit", false);
-    await photoviewer.triggerPhotoViewerAction("close");
+    await photoviewer.checkPhotoViewerActionAvailability("download", true);
+    await photoviewer.triggerPhotoViewerAction("close-button");
+    await t.expect(Selector("div.p-lightbox__pswp").visible).notOk();
+
+    await toolbar.search("photo:true stack:true");
+    await photo.triggerHoverAction("nth", 0, "select");
+    await contextmenu.triggerContextMenuAction("edit", "");
+    await t.click(photoedit.filesTab);
+    await t.expect(photoedit.downloadFile.nth(0).visible).ok();
+    await t.click(photoedit.dialogClose);
+    await contextmenu.clearSelection();
 
     await menu.openPage("settings");
-    await t
-      .click(settings.uploadCheckbox)
-      .click(settings.downloadCheckbox)
-      .click(settings.editCheckbox)
-      .click(settings.shareCheckbox);
+    await t.click(Selector(settings.collectionsTab));
+    await t.wait(500);
+    await t.click(settings.albumDownloadDisabledCheckbox);
+    await t.wait(500);
+
+    await menu.openPage("albums");
+    await notifies.waitForAlbumsToLoad(7000);
+    await album.toggleSelectNthAlbum(0, "all");
+    await contextmenu.checkContextMenuActionAvailability("download", true);
+    await contextmenu.clearSelection();
+  }
+);
+
+test.meta("testID", "settings-general-011").meta({ type: "short", mode: "auth" })(
+  "Common: Change file download name setting and verify persistence",
+  async (t) => {
+    await menu.openPage("settings");
+    await t.click(Selector(settings.libraryTab));
+    await t.wait(500);
+
+    await t.click(settings.downloadNameSelect);
+    await t.click(Selector(".v-list-item").withText("Original Name"));
+    await t.wait(500);
+
+    await t.expect(Selector(".input-download-name .v-field__input").innerText).contains("Original");
+
+    await t.eval(() => location.reload());
+    await t.click(Selector(settings.libraryTab));
+    await t.wait(500);
+    await t.expect(Selector(".input-download-name .v-field__input").innerText).contains("Original");
+
+    await t.click(settings.downloadNameSelect);
+    await t.click(Selector(".v-list-item").withText("Share Friendly"));
+    await t.wait(500);
+
+    await t.expect(Selector(".input-download-name .v-field__input").innerText).contains("Share");
+
+    await t.click(settings.downloadNameSelect);
+    await t.click(Selector(".v-list-item").withText("Current Name"));
+    await t.wait(500);
+
+    await t.expect(Selector(".input-download-name .v-field__input").innerText).contains("Current");
+  }
+);
+
+test.meta("testID", "settings-general-012").meta({ type: "short", mode: "auth" })(
+  "Common: Change album download name setting and verify persistence",
+  async (t) => {
+    await menu.openPage("settings");
+    await t.click(Selector(settings.collectionsTab));
+    await t.wait(500);
+
+    await t.click(settings.albumDownloadNameSelect);
+    await t.click(Selector(".v-list-item").withText("Original Name"));
+    await t.wait(500);
+
+    await t.expect(Selector(".input-album-download-name .v-field__input").innerText).contains("Original");
+
+    await t.eval(() => location.reload());
+    await t.click(Selector(settings.collectionsTab));
+    await t.wait(500);
+    await t.expect(Selector(".input-album-download-name .v-field__input").innerText).contains("Original");
+
+    await t.click(settings.albumDownloadNameSelect);
+    await t.click(Selector(".v-list-item").withText("Share Friendly"));
+    await t.wait(500);
+
+    await t.expect(Selector(".input-album-download-name .v-field__input").innerText).contains("Share");
+
+    await t.click(settings.albumDownloadNameSelect);
+    await t.click(Selector(".v-list-item").withText("Current Name"));
+    await t.wait(500);
+
+    await t.expect(Selector(".input-album-download-name .v-field__input").innerText).contains("Current");
+  }
+);
+
+test.meta("testID", "settings-general-013").meta({ type: "short", mode: "auth" })(
+  "Common: Default album sort order is applied to newly created albums",
+  async (t) => {
+    await menu.openPage("settings");
+    await t.click(Selector(settings.collectionsTab));
+    await t.wait(500);
+
+    await t.click(settings.albumOrderSelect);
+    await t.click(Selector(".v-list-item").withText("Oldest First"));
+    await t.wait(500);
+    await t.expect(Selector(".input-album-order .v-field__input").innerText).contains("Oldest");
+
+    await menu.openPage("albums");
+    await notifies.waitForAlbumsToLoad(7000);
+    const initialAlbumCount = await album.getAlbumCount("all");
+
+    await toolbar.triggerToolbarAction("add");
+    await t.wait(1000);
+
+    const albumCountAfterCreate = await album.getAlbumCount("all");
+    await t.expect(albumCountAfterCreate).eql(initialAlbumCount + 1);
+
+    const newAlbumUid = await album.getNthAlbumUid("all", 0);
+
+    await album.openAlbumWithUid(newAlbumUid);
+    await t.wait(500);
+
+    await toolbar.triggerToolbarAction("edit");
+    await t.wait(500);
+
+    await t.expect(albumdialog.sortOrderValue.innerText).contains("Oldest");
+
+    await t.click(albumdialog.dialogCancel);
+    await t.wait(300);
+
+    await toolbar.triggerToolbarAction("delete");
+    await t.wait(500);
+
+    await menu.openPage("settings");
+    await t.click(Selector(settings.collectionsTab));
+    await t.wait(500);
+
+    await t.click(settings.albumOrderSelect);
+    await t.click(Selector(".v-list-item").withText("Newest First"));
+    await t.wait(500);
+    await t.expect(Selector(".input-album-order .v-field__input").innerText).contains("Newest");
+  }
+);
+
+test.meta("testID", "settings-general-014").meta({ type: "short", mode: "auth" })(
+  "Common: Change default album order settings and verify persistence",
+  async (t) => {
+    await menu.openPage("settings");
+    await t.click(Selector(settings.collectionsTab));
+    await t.wait(500);
+
+    await t.click(settings.albumOrderSelect);
+    await t.click(Selector(".v-list-item").withText("Oldest First"));
+    await t.wait(500);
+    await t.expect(Selector(".input-album-order .v-field__input").innerText).contains("Oldest");
+
+    await t.click(settings.folderOrderSelect);
+    await t.click(Selector(".v-list-item").withText("File Name"));
+    await t.wait(500);
+    await t.expect(Selector(".input-folder-order .v-field__input").innerText).contains("File Name");
+
+    await t.eval(() => location.reload());
+    await t.click(Selector(settings.collectionsTab));
+    await t.wait(500);
+    await t.expect(Selector(".input-album-order .v-field__input").innerText).contains("Oldest");
+    await t.expect(Selector(".input-folder-order .v-field__input").innerText).contains("File Name");
+
+    await t.click(settings.albumOrderSelect);
+    await t.click(Selector(".v-list-item").withText("Newest First"));
+    await t.wait(500);
+
+    await t.click(settings.folderOrderSelect);
+    await t.click(Selector(".v-list-item").withText("Newest First"));
+    await t.wait(500);
+
+    await t.expect(Selector(".input-album-order .v-field__input").innerText).contains("Newest");
+    await t.expect(Selector(".input-folder-order .v-field__input").innerText).contains("Newest");
+  }
+);
+
+test.meta("testID", "settings-general-015").meta({ type: "short", mode: "auth" })(
+  "Common: Toggle accessibility settings and verify persistence",
+  async (t) => {
+    const hasReduceMotionClass = ClientFunction(() => document.documentElement.classList.contains("reduce-motion"));
+    const reloadPage = ClientFunction(() => window.location.reload());
+    const setNoReloadSentinel = ClientFunction(() => {
+      window.__ppNoReload = true;
+    });
+    const noReloadSentinel = ClientFunction(() => window.__ppNoReload === true);
+
+    await menu.openPage("settings");
+    await t.click(Selector(settings.generalTab));
+    await t.wait(500);
+
+    // A window sentinel detects an unexpected full-page reload: the live toggles below
+    // (Reduce Motion, Open on Hover) must NOT reload, so the sentinel must survive them.
+    await setNoReloadSentinel();
+
+    // Reduce Motion applies a live <html> class without reloading the page.
+    await t.expect(Selector(".input-reduce-motion input").checked).notOk();
+    await t.expect(hasReduceMotionClass()).notOk();
+    await t.click(settings.reduceMotionCheckbox);
+    await t.wait(500);
+    await t.expect(Selector(".input-reduce-motion input").checked).ok();
+    await t.expect(hasReduceMotionClass()).ok();
+    await t.expect(noReloadSentinel()).ok();
+
+    // Open on Hover persists as a plain preference (unchecking the default).
+    await t.click(settings.openOnHoverCheckbox);
+    await t.wait(500);
+    await t.expect(Selector(".input-open-on-hover input").checked).notOk();
+    await t.expect(noReloadSentinel()).ok();
+
+    // An explicit reload clears the sentinel; the settings must persist across it.
+    await reloadPage();
+    await t.expect(noReloadSentinel()).notOk();
+    await t.click(Selector(settings.generalTab));
+    await t.wait(500);
+    await t.expect(Selector(".input-reduce-motion input").checked).ok();
+    await t.expect(hasReduceMotionClass()).ok();
+    await t.expect(Selector(".input-open-on-hover input").checked).notOk();
+
+    // Restore defaults so the shared fixture state is left unchanged.
+    await t.click(settings.reduceMotionCheckbox);
+    await t.wait(500);
+    await t.click(settings.openOnHoverCheckbox);
+    await t.wait(500);
+    await t.expect(Selector(".input-reduce-motion input").checked).notOk();
+    await t.expect(hasReduceMotionClass()).notOk();
+    await t.expect(Selector(".input-open-on-hover input").checked).ok();
+  }
+);
+
+test.meta("testID", "settings-general-016").meta({ type: "short", mode: "auth" })(
+  "Common: Save Export independently of Download and verify persistence",
+  async (t) => {
+    await menu.openPage("settings");
+    const exportInput = Selector(".input-export input[type='checkbox']");
+    const downloadInput = Selector(".input-download input[type='checkbox']");
+    const initialExport = await exportInput.checked;
+    const initialDownload = await downloadInput.checked;
+
+    for (const enabled of [!initialExport, initialExport]) {
+      await t.click(settings.exportCheckbox);
+      await t.expect(exportInput.checked).eql(enabled);
+      await t.expect(Selector(".p-notify__text").withText("Changes successfully saved").visible).ok();
+      await t.eval(() => location.reload());
+      await t.expect(exportInput.checked).eql(enabled);
+      await t.expect(downloadInput.checked).eql(initialDownload);
+    }
   }
 );

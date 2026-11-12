@@ -1,0 +1,329 @@
+package query
+
+import (
+	"errors"
+	"fmt"
+	"time"
+
+	"github.com/dustin/go-humanize/english"
+	"gorm.io/gorm"
+
+	"github.com/photoprism/photoprism/internal/entity"
+	"github.com/photoprism/photoprism/internal/mutex"
+	"github.com/photoprism/photoprism/pkg/dsn"
+)
+
+// PhotoByID returns a Photo based on the ID.
+func PhotoByID(photoID uint64) (photo entity.Photo, err error) {
+	if err = UnscopedDb().Where("id = ?", photoID).
+		Preload("Labels", func(db *gorm.DB) *gorm.DB {
+			return db.Order("photos_labels.uncertainty ASC, photos_labels.label_id DESC")
+		}).
+		Preload("Labels.Label", "deleted_at IS NULL").
+		Preload("Camera", "deleted_at IS NULL").
+		Preload("Lens", "deleted_at IS NULL").
+		Preload("Details").
+		Preload("Place").
+		Preload("Cell").
+		Preload("Cell.Place").
+		First(&photo).Error; err != nil {
+		return photo, err
+	}
+
+	return photo, nil
+}
+
+// PhotoByUID returns a Photo based on the UID.
+func PhotoByUID(photoUID string) (photo entity.Photo, err error) {
+	if err = UnscopedDb().Where("photo_uid = ?", photoUID).
+		Preload("Labels", func(db *gorm.DB) *gorm.DB {
+			return db.Order("photos_labels.uncertainty ASC, photos_labels.label_id DESC")
+		}).
+		Preload("Labels.Label", "deleted_at IS NULL").
+		Preload("Camera", "deleted_at IS NULL").
+		Preload("Lens", "deleted_at IS NULL").
+		Preload("Details").
+		Preload("Place").
+		Preload("Cell").
+		Preload("Cell.Place").
+		First(&photo).Error; err != nil {
+		return photo, err
+	}
+
+	return photo, nil
+}
+
+// PhotoPreloadByUID returns a Photo based on the UID with all dependencies preloaded.
+func PhotoPreloadByUID(photoUID string) (photo entity.Photo, err error) {
+	if err = preloadPhotoAssociations(UnscopedDb().Where("photo_uid = ?", photoUID)).
+		First(&photo).Error; err != nil {
+		return photo, err
+	}
+
+	photo.PreloadMany()
+
+	return photo, nil
+}
+
+// PhotoPreloadByUIDs returns photos for the provided UIDs with supporting associations preloaded.
+// The call de-duplicates the UID list so callers can forward selection arrays directly without
+// incurring redundant queries.
+func PhotoPreloadByUIDs(photoUIDs []string) (entity.Photos, error) {
+	uids := uniqueUIDs(photoUIDs)
+	photos := entity.Photos{}
+
+	if len(uids) == 0 {
+		return photos, nil
+	}
+
+	if err := preloadPhotoAssociations(UnscopedDb().Where("photo_uid IN (?)", uids)).
+		Find(&photos).Error; err != nil {
+		return photos, err
+	}
+
+	for _, photo := range photos {
+		if photo == nil {
+			continue
+		}
+		photo.PreloadMany()
+	}
+
+	return photos, nil
+}
+
+// preloadPhotoAssociations applies the eager-load scope that keeps PhotoPreload helpers consistent.
+// Preloads of an unscoped query are unscoped too, so they exclude soft-deleted rows themselves.
+func preloadPhotoAssociations(db *gorm.DB) *gorm.DB {
+	return db.
+		Preload("Labels", func(db *gorm.DB) *gorm.DB {
+			return db.Order("photos_labels.uncertainty ASC, photos_labels.label_id DESC")
+		}).
+		Preload("Labels.Label", "deleted_at IS NULL").
+		Preload("Camera", "deleted_at IS NULL").
+		Preload("Lens", "deleted_at IS NULL").
+		Preload("Details").
+		Preload("Place").
+		Preload("Cell").
+		Preload("Cell.Place")
+}
+
+// uniqueUIDs normalizes and de-duplicates selection lists so callers can reuse them as-is.
+func uniqueUIDs(uids []string) []string {
+	if len(uids) == 0 {
+		return nil
+	}
+
+	result := make([]string, 0, len(uids))
+	seen := make(map[string]struct{}, len(uids))
+
+	for _, uid := range uids {
+		if uid == "" {
+			continue
+		}
+		if _, ok := seen[uid]; ok {
+			continue
+		}
+		seen[uid] = struct{}{}
+		result = append(result, uid)
+	}
+
+	return result
+}
+
+// MissingPhotos returns active and archived photo entities without existing files, excluding removed photos.
+func MissingPhotos(limit int, offset int) (entities entity.Photos, err error) {
+	err = UnscopedDb().
+		Select("photos.*").
+		Where("id NOT IN (SELECT photo_id FROM files WHERE file_missing = FALSE AND file_root = '/' AND deleted_at IS NULL)").
+		Where("deleted_at IS NULL OR photo_quality > -1").
+		Order("photos.id").
+		Limit(limit).Offset(offset).Find(&entities).Error
+
+	return entities, err
+}
+
+// ArchivedPhotos finds and returns archived photos.
+func ArchivedPhotos(limit int, offset int) (entities entity.Photos, err error) {
+	err = UnscopedDb().
+		Select("photos.*").
+		Where("photos.photo_quality > -1").
+		Where("photos.deleted_at IS NOT NULL").
+		Order("photos.id").
+		Limit(limit).Offset(offset).Find(&entities).Error
+
+	return entities, err
+}
+
+// ArchivedPhoto returns the current row of the photo with the given ID if it is archived and not removed,
+// using the same condition as ArchivedPhotos, or nil if it is not.
+func ArchivedPhoto(id uint) (*entity.Photo, error) {
+	result := &entity.Photo{}
+
+	if err := UnscopedDb().
+		Where("id = ? AND photo_quality > -1 AND deleted_at IS NOT NULL", id).
+		First(result).Error; errors.Is(err, gorm.ErrRecordNotFound) {
+		return nil, nil
+	} else if err != nil {
+		return nil, err
+	}
+
+	return result, nil
+}
+
+// PhotosMetadataUpdate returns photos selected for metadata maintenance.
+func PhotosMetadataUpdate(limit, offset int, delay, interval time.Duration) (photos entity.Photos, err error) {
+	err = Db().
+		Preload("Labels", func(db *gorm.DB) *gorm.DB {
+			return db.Order("photos_labels.uncertainty ASC, photos_labels.label_id DESC")
+		}).
+		Preload("Labels.Label", "deleted_at IS NULL").
+		Preload("Camera", "deleted_at IS NULL").
+		Preload("Lens", "deleted_at IS NULL").
+		Preload("Details").
+		Preload("Place").
+		Preload("Cell").
+		Preload("Cell.Place").
+		Where("checked_at IS NULL OR checked_at < ?", time.Now().Add(-1*interval)).
+		Where("updated_at < ?", time.Now().Add(-1*delay)).
+		Order("photos.ID ASC").Limit(limit).Offset(offset).Find(&photos).Error
+
+	return photos, err
+}
+
+// OrphanPhotos finds orphan index entries that may be removed.
+func OrphanPhotos() (photos entity.Photos, err error) {
+	err = UnscopedDb().
+		Raw(`SELECT * FROM photos WHERE 
+			deleted_at IS NOT NULL 
+			AND photo_quality = -1 
+			AND id NOT IN (SELECT photo_id FROM files WHERE files.deleted_at IS NULL)`).
+		Find(&photos).Error
+
+	return photos, err
+}
+
+// FixPrimaries tries to set a primary file for photos that have none.
+func FixPrimaries() error {
+	mutex.Index.Lock()
+	defer mutex.Index.Unlock()
+
+	start := time.Now()
+
+	var photos entity.Photos
+
+	// Remove primary file flag from broken, missing, or deleted files so a photo whose primary is no
+	// longer valid is treated as having none and gets a present file promoted below.
+	if err := UnscopedDb().Table(entity.File{}.TableName()).
+		Where("(file_error <> '' OR file_missing = TRUE OR deleted_at IS NOT NULL) AND file_primary <> FALSE").
+		UpdateColumn("file_primary", false).Error; err != nil {
+		return err
+	}
+
+	// Find photos without primary file.
+	if err := UnscopedDb().
+		Raw(`SELECT * FROM photos 
+			WHERE deleted_at IS NULL 
+			AND id NOT IN (SELECT photo_id FROM files WHERE file_primary = TRUE)`).
+		Find(&photos).Error; err != nil {
+		return err
+	}
+
+	if len(photos) == 0 {
+		log.Debugf("index: found no photos without primary file [%s]", time.Since(start))
+		return nil
+	}
+
+	// Try to find matching primary files.
+	for _, p := range photos {
+		log.Debugf("index: searching primary file for %s", p.PhotoUID)
+
+		if err := p.SetPrimary(""); err != nil {
+			log.Infof("index: %s", err)
+		}
+	}
+
+	log.Debugf("index: updated primary files [%s]", time.Since(start))
+
+	return nil
+}
+
+// FlagHiddenPhotos sets the quality score of active photos without valid primary file to -1.
+// Archived photos keep their score, since -1 marks an archived photo as removed.
+func FlagHiddenPhotos() (err error) {
+	mutex.Index.Lock()
+	defer mutex.Index.Unlock()
+
+	// Start time for logs.
+	start := time.Now()
+
+	// Number of updated records.
+	affected := 0
+
+	ids := Db().Select("id").
+		Where("id NOT IN (SELECT photo_id FROM files WHERE file_primary = TRUE AND file_missing = FALSE AND file_error = '' AND deleted_at IS NULL) AND photo_quality > -1 AND deleted_at IS NULL").
+		Table(entity.Photo{}.TableName())
+	if result := UnscopedDb().Table(entity.Photo{}.TableName()).
+		Where("id IN (?) AND photo_quality > -1", ids).
+		UpdateColumn("photo_quality", -1); result.Error != nil {
+		// Failed to flag all hidden photos.
+		log.Warnf("index: failed to flag photos as hidden")
+		return fmt.Errorf("%s while flagging hidden photos", result.Error)
+	} else {
+		affected = int(result.RowsAffected)
+	}
+
+	// Log number of affected rows, if any.
+	if affected > 0 {
+		log.Infof("index: flagged %s as hidden [%s]", english.Plural(affected, "photo", "photos"), time.Since(start))
+	}
+
+	return nil
+}
+
+// photoPathMaxDates returns the maximum TakenAtLocal DATE for each PhotoPath as a map.
+// Paths whose maximum is NULL are omitted rather than mapped to a placeholder, so callers
+// skip them instead of stamping a date that was never indexed.
+func photoPathMaxDates() (photoPathDates map[string]time.Time, err error) {
+	photoPathDates = make(map[string]time.Time)
+	type pathMaxDate struct {
+		PhotoPath string
+		TakenMax  *string
+	}
+	var pathDates []pathMaxDate
+	// Get all the paths and dates.
+	if err = entity.Db().Raw(`SELECT photo_path, MAX(DATE(taken_at_local)) AS taken_max
+	 			FROM photos WHERE taken_src IN ('meta', 'modified') AND photos.photo_quality >= 3 AND photos.deleted_at IS NULL
+	 			GROUP BY photo_path`).Scan(&pathDates).Error; err != nil {
+		log.Errorf("photo: get photo dates (%v)", err)
+		return photoPathDates, err
+	}
+	var takenMax time.Time
+	for _, photoPath := range pathDates {
+		// Null max dates are not to be written to database.
+		if photoPath.TakenMax != nil {
+			var parseFormat string
+			switch entity.DbDialect() {
+			case dsn.DialectSQLite:
+				parseFormat = "2006-01-02"
+			case dsn.DialectMySQL, dsn.DialectPostgreSQL:
+				parseFormat = time.RFC3339
+			default:
+				log.Errorf("photo: dialect %s is not supported", entity.DbDialect())
+				return photoPathDates, fmt.Errorf("photo: dialect %s is not supported", entity.DbDialect())
+			}
+			// Parsed into its own error, because err is the named return: assigning to it here
+			// aborts the caller's whole date refresh on a row this loop deliberately skips.
+			parsed, parseErr := time.Parse(parseFormat, *photoPath.TakenMax)
+
+			if parseErr != nil {
+				log.Errorf("photo: get photo dates unable to parse %s (%v)", *photoPath.TakenMax, parseErr)
+				// Don't abort, as the MAX(DATE(taken_at_local)) has already forced the data into a date within Go's limitations, so this shouldn't happen.
+				continue
+			}
+
+			takenMax = parsed
+			photoPathDates[photoPath.PhotoPath] = takenMax
+		}
+	}
+	return photoPathDates, err
+}

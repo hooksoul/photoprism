@@ -1,0 +1,139 @@
+package commands
+
+import (
+	"fmt"
+
+	"github.com/dustin/go-humanize/english"
+	"github.com/urfave/cli/v2"
+
+	"github.com/photoprism/photoprism/internal/auth/oauth"
+	"github.com/photoprism/photoprism/internal/config"
+	"github.com/photoprism/photoprism/internal/entity"
+	"github.com/photoprism/photoprism/internal/form"
+	"github.com/photoprism/photoprism/pkg/clean"
+	"github.com/photoprism/photoprism/pkg/txt/report"
+)
+
+// ClientsModCommand configures the command name, flags, and action.
+var ClientsModCommand = &cli.Command{
+	Name:      "mod",
+	Usage:     "Updates client application settings",
+	ArgsUsage: "[client id | node uuid]",
+	Flags:     ClientModFlags,
+	Action:    clientsModAction,
+}
+
+// clientsModAction updates client application settings.
+func clientsModAction(ctx *cli.Context) error {
+	return CallWithDependencies(ctx, func(conf *config.Config) error {
+		conf.MigrateDb(false, nil)
+
+		frm := form.ModClientFromCli(ctx)
+
+		// Client UID or node UUID provided?
+		id := clean.UID(ctx.Args().First())
+
+		if id == "" {
+			log.Infof("no valid client id specified")
+			return ShowUsageError(ctx)
+		}
+
+		// Reject flags placed after the client id; the stdlib flag parser
+		// would silently drop them and report "client updated" with no changes.
+		if err := RejectTrailingFlags(ctx); err != nil {
+			return err
+		}
+
+		// Find client record.
+		client := entity.FindClient(id)
+
+		if client == nil {
+			return fmt.Errorf("client %s not found", clean.Log(id))
+		}
+
+		// App clients keep their type, role and lack of a secret; callbacks can only be set on them.
+		if err := oauth.ValidateClientChange(client, frm, oauth.ClientChange{
+			Method:    ctx.IsSet("method"),
+			Role:      ctx.IsSet("role"),
+			NewSecret: ctx.Bool("regenerate"),
+		}); err != nil {
+			return err
+		}
+
+		// Check if the client exists but has been deleted.
+		if client.Deleted() {
+			if restore, err := ConfirmRestore(ctx.Bool("restore"), fmt.Sprintf("Restore client %s", client.String()), "--restore"); err != nil {
+				return err
+			} else if !restore {
+				return fmt.Errorf("client %s has been deleted", clean.Log(id))
+			}
+
+			if err := client.Restore(); err != nil {
+				return err
+			}
+
+			log.Infof("client %s has been restored", client.String())
+
+			if !client.IsApp() && !ctx.Bool("regenerate") && frm.Secret() == "" {
+				log.Warnf("client %s has no secret, use --regenerate to create one", client.String())
+			}
+		}
+
+		// Update client from form values.
+		prevRole, prevScope := client.ClientRole, client.AuthScope
+		client.SetFormValues(frm)
+
+		if ctx.IsSet("enable") || ctx.IsSet("disable") {
+			client.AuthEnabled = frm.AuthEnabled
+			log.Infof("disabled client authentication")
+		}
+
+		if client.AuthEnabled {
+			log.Infof("client authentication is enabled")
+		} else {
+			log.Warnf("client authentication is disabled")
+		}
+
+		// Update client record if valid.
+		if err := client.Validate(); err != nil {
+			return fmt.Errorf("invalid values: %s", err)
+		} else if err = client.Save(); err != nil {
+			return err
+		} else {
+			log.Infof("client %s has been updated", clean.LogQuote(client.ClientName))
+		}
+
+		// Revoke issued tokens if the role or scope of a client that is not an app client has changed.
+		if revoked := client.RevokeChangedAccess(prevRole, prevScope); revoked > 0 {
+			log.Infof("revoked %s after the role or scope changed", english.Plural(revoked, "session", "sessions"))
+		}
+
+		// Change client secret if requested.
+		var secret, message string
+		var err error
+
+		if ctx.IsSet("regenerate") && ctx.Bool("regenerate") {
+			if secret, err = client.NewSecret(); err != nil {
+				return fmt.Errorf("failed to regenerate client secret: %s", err)
+			}
+
+			message = fmt.Sprintf(ClientSecretInfo, "FOLLOWING RANDOMLY GENERATED")
+		} else if secret = frm.Secret(); secret == "" {
+			log.Debugf("client secret remains unchanged")
+		} else if err = client.SetSecret(secret); err != nil {
+			return fmt.Errorf("failed to set client secret: %s", err)
+		} else {
+			message = fmt.Sprintf(ClientSecretInfo, "NEW")
+		}
+
+		// Show new client secret.
+		if secret != "" && err == nil {
+			client.RevokeSessions(nil)
+			fmt.Println(message)
+			result := report.Credentials("Client ID", client.ClientUID, "Client Secret", secret)
+			fmt.Printf("\n%s\n", result)
+		}
+
+		return nil
+	})
+}

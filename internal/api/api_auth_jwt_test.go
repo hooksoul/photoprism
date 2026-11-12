@@ -1,0 +1,806 @@
+package api
+
+import (
+	"context"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/gin-gonic/gin"
+	sdkmcp "github.com/modelcontextprotocol/go-sdk/mcp"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"golang.org/x/time/rate"
+
+	"github.com/photoprism/photoprism/internal/auth/acl"
+	clusterjwt "github.com/photoprism/photoprism/internal/auth/jwt"
+	"github.com/photoprism/photoprism/internal/config"
+	"github.com/photoprism/photoprism/internal/entity"
+	"github.com/photoprism/photoprism/internal/mcp"
+	"github.com/photoprism/photoprism/internal/photoprism/get"
+	"github.com/photoprism/photoprism/internal/server/limiter"
+	"github.com/photoprism/photoprism/pkg/authn"
+	"github.com/photoprism/photoprism/pkg/clean"
+	"github.com/photoprism/photoprism/pkg/http/header"
+	"github.com/photoprism/photoprism/pkg/rnd"
+)
+
+func TestAuthAnyJWT(t *testing.T) {
+	t.Run("ClusterScope", func(t *testing.T) {
+		fx := newPortalJWTFixture(t, "cluster-jwt-success")
+		spec := fx.defaultClaimsSpec()
+		token := fx.issue(t, spec)
+
+		gin.SetMode(gin.TestMode)
+		w := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(w)
+		req, _ := http.NewRequest(http.MethodGet, "/api/v1/cluster/theme", nil)
+		req.Header.Set("Authorization", "Bearer "+token)
+		req.Header.Set(header.UserAgent, "PhotoPrism Portal/1.0")
+		req.RemoteAddr = "192.0.2.10:12345"
+		c.Request = req
+		resetPortalPeers(t)
+
+		session := authAnyJWT(c, "192.0.2.10", token, acl.ResourceCluster, nil)
+		require.NotNil(t, session)
+		_, found := portalPeers.Get("192.0.2.10")
+		assert.True(t, found)
+		assert.Equal(t, http.StatusOK, session.HttpStatus())
+		assert.Empty(t, session.ClientUID)
+		assert.Equal(t, spec.Subject, session.GetClientName())
+		assert.Contains(t, session.AuthScope, "cluster")
+		assert.Equal(t, spec.Issuer, session.AuthIssuer)
+		assert.Equal(t, authn.MethodJWT.String(), session.AuthMethod)
+		assert.Equal(t, authn.ProviderAccessToken.String(), session.AuthProvider)
+		assert.Equal(t, authn.GrantJwtBearer.String(), session.GrantType)
+		assert.Equal(t, "192.0.2.10", session.ClientIP)
+		assert.Equal(t, "PhotoPrism Portal/1.0", session.UserAgent)
+		assert.Equal(t, token, session.AuthToken())
+		assert.True(t, strings.HasPrefix(session.AuthID, "jwt"))
+		assert.Equal(t, session.AuthID, session.RefID)
+		assert.True(t, rnd.IsRefID(session.RefID))
+		assert.True(t, session.SessExpires > session.CreatedAt.Unix())
+		assert.GreaterOrEqual(t, session.LastActive, session.CreatedAt.Unix())
+		assert.True(t, session.GetUser().IsUnknown())
+		assert.Equal(t, acl.RolePortal, session.GetClientRole())
+		assert.Empty(t, session.PreviewToken)
+	})
+	t.Run("FilesScopeTokens", func(t *testing.T) {
+		fx := newPortalJWTFixture(t, "cluster-jwt-files")
+		spec := fx.defaultClaimsSpec()
+		spec.Scope = []string{"cluster", "files"}
+		token := fx.issue(t, spec)
+
+		origScope := fx.nodeConf.Options().JWTScope
+		fx.nodeConf.Options().JWTScope = "cluster vision metrics files"
+		get.SetConfig(fx.nodeConf)
+		t.Cleanup(func() {
+			fx.nodeConf.Options().JWTScope = origScope
+			get.SetConfig(fx.nodeConf)
+		})
+
+		gin.SetMode(gin.TestMode)
+		w := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(w)
+		req, _ := http.NewRequest(http.MethodGet, "/api/v1/cluster/theme", nil)
+		req.Header.Set("Authorization", "Bearer "+token)
+		req.Header.Set(header.UserAgent, "PhotoPrism Portal/1.0")
+		req.RemoteAddr = "192.0.2.50:4567"
+		c.Request = req
+
+		session := authAnyJWT(c, "192.0.2.50", token, acl.ResourceFiles, acl.Permissions{acl.AccessLibrary})
+		require.NotNil(t, session)
+		assert.Equal(t, http.StatusOK, session.HttpStatus())
+		assert.Empty(t, session.PreviewToken)
+		cfg := fx.nodeConf.ClientSession(session)
+		// A cluster session has no preview token of its own, so it receives neither token.
+		assert.Empty(t, cfg.PreviewToken)
+		assert.Empty(t, cfg.DownloadToken)
+		assert.True(t, session.SessExpires > session.CreatedAt.Unix())
+		assert.True(t, session.LastActive >= session.CreatedAt.Unix())
+	})
+	t.Run("ConfigScopePortalRole", func(t *testing.T) {
+		fx := newPortalJWTFixture(t, "cluster-jwt-config")
+		spec := fx.defaultClaimsSpec()
+		spec.Scope = []string{"cluster", "config"}
+		token := fx.issue(t, spec)
+
+		origScope := fx.nodeConf.Options().JWTScope
+		fx.nodeConf.Options().JWTScope = "cluster config"
+		get.SetConfig(fx.nodeConf)
+		t.Cleanup(func() {
+			fx.nodeConf.Options().JWTScope = origScope
+			get.SetConfig(fx.nodeConf)
+		})
+
+		gin.SetMode(gin.TestMode)
+		w := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(w)
+		req, _ := http.NewRequest(http.MethodGet, "/api/v1/config", nil)
+		req.Header.Set("Authorization", "Bearer "+token)
+		req.Header.Set(header.UserAgent, "PhotoPrism Portal/1.0")
+		req.RemoteAddr = "192.0.2.51:1234"
+		c.Request = req
+
+		session := authAnyJWT(c, "192.0.2.51", token, acl.ResourceConfig, acl.Permissions{acl.ActionView})
+		require.NotNil(t, session)
+		assert.Equal(t, http.StatusOK, session.HttpStatus())
+		assert.Equal(t, acl.RolePortal, session.GetClientRole())
+		assert.True(t, session.Valid())
+
+		cfg := fx.nodeConf.ClientSession(session)
+		require.NotNil(t, cfg)
+		assert.Equal(t, string(config.ClientUser), cfg.Mode)
+	})
+	t.Run("ClusterCIDRAllowed", func(t *testing.T) {
+		fx := newPortalJWTFixture(t, "cluster-jwt-cidr-allow")
+		spec := fx.defaultClaimsSpec()
+		token := fx.issue(t, spec)
+
+		origCIDR := fx.nodeConf.Options().ClusterCIDR
+		fx.nodeConf.Options().ClusterCIDR = "192.0.2.0/24"
+		get.SetConfig(fx.nodeConf)
+		t.Cleanup(func() {
+			fx.nodeConf.Options().ClusterCIDR = origCIDR
+			get.SetConfig(fx.nodeConf)
+		})
+
+		gin.SetMode(gin.TestMode)
+		w := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(w)
+		req, _ := http.NewRequest(http.MethodGet, "/api/v1/cluster/theme", nil)
+		req.Header.Set("Authorization", "Bearer "+token)
+		req.RemoteAddr = "192.0.2.10:2222"
+		c.Request = req
+
+		session := authAnyJWT(c, "192.0.2.10", token, acl.ResourceCluster, nil)
+		require.NotNil(t, session)
+		assert.Empty(t, session.ClientUID)
+		assert.Equal(t, spec.Subject, session.GetClientName())
+	})
+	t.Run("ClusterCIDRBlocked", func(t *testing.T) {
+		fx := newPortalJWTFixture(t, "cluster-jwt-cidr-block")
+		spec := fx.defaultClaimsSpec()
+		token := fx.issue(t, spec)
+
+		origCIDR := fx.nodeConf.Options().ClusterCIDR
+		fx.nodeConf.Options().ClusterCIDR = "192.0.2.0/24"
+		get.SetConfig(fx.nodeConf)
+		t.Cleanup(func() {
+			fx.nodeConf.Options().ClusterCIDR = origCIDR
+			get.SetConfig(fx.nodeConf)
+		})
+
+		gin.SetMode(gin.TestMode)
+		w := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(w)
+		req, _ := http.NewRequest(http.MethodGet, "/api/v1/cluster/theme", nil)
+		req.Header.Set("Authorization", "Bearer "+token)
+		req.RemoteAddr = "203.0.113.10:2222"
+		c.Request = req
+
+		assert.Nil(t, authAnyJWT(c, "203.0.113.10", token, acl.ResourceCluster, nil))
+	})
+	t.Run("JWTScopeDefaultRejectsOtherResources", func(t *testing.T) {
+		fx := newPortalJWTFixture(t, "cluster-jwt-scope-default-reject")
+		spec := fx.defaultClaimsSpec()
+		spec.Scope = []string{"photos"}
+		token := fx.issue(t, spec)
+
+		gin.SetMode(gin.TestMode)
+		w := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(w)
+		req, _ := http.NewRequest(http.MethodGet, "/api/v1/photos", nil)
+		req.Header.Set("Authorization", "Bearer "+token)
+		req.RemoteAddr = "192.0.2.60:1001"
+		c.Request = req
+
+		assert.Nil(t, authAnyJWT(c, "192.0.2.60", token, acl.ResourcePhotos, nil))
+	})
+	t.Run("JWTScopeAllowed", func(t *testing.T) {
+		fx := newPortalJWTFixture(t, "cluster-jwt-scope-allow")
+		token := fx.issue(t, fx.defaultClaimsSpec())
+
+		orig := fx.nodeConf.Options().JWTScope
+		fx.nodeConf.Options().JWTScope = "cluster vision"
+		get.SetConfig(fx.nodeConf)
+		t.Cleanup(func() {
+			fx.nodeConf.Options().JWTScope = orig
+			get.SetConfig(fx.nodeConf)
+		})
+
+		gin.SetMode(gin.TestMode)
+		w := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(w)
+		req, _ := http.NewRequest(http.MethodGet, "/api/v1/cluster/theme", nil)
+		req.Header.Set("Authorization", "Bearer "+token)
+		req.RemoteAddr = "192.0.2.30:1001"
+		c.Request = req
+
+		sess := authAnyJWT(c, "192.0.2.30", token, acl.ResourceCluster, nil)
+		require.NotNil(t, sess)
+	})
+	t.Run("JWTScopeAllowsSuperset", func(t *testing.T) {
+		fx := newPortalJWTFixture(t, "cluster-jwt-scope-reject")
+		token := fx.issue(t, fx.defaultClaimsSpec())
+
+		orig := fx.nodeConf.Options().JWTScope
+		fx.nodeConf.Options().JWTScope = "cluster"
+		get.SetConfig(fx.nodeConf)
+		t.Cleanup(func() {
+			fx.nodeConf.Options().JWTScope = orig
+			get.SetConfig(fx.nodeConf)
+		})
+
+		gin.SetMode(gin.TestMode)
+		w := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(w)
+		req, _ := http.NewRequest(http.MethodGet, "/api/v1/cluster/theme", nil)
+		req.Header.Set("Authorization", "Bearer "+token)
+		req.RemoteAddr = "192.0.2.40:1001"
+		c.Request = req
+
+		sess := authAnyJWT(c, "192.0.2.40", token, acl.ResourceCluster, nil)
+		require.NotNil(t, sess)
+	})
+	t.Run("JWTScopeCustomResource", func(t *testing.T) {
+		fx := newPortalJWTFixture(t, "cluster-jwt-scope-custom")
+		spec := fx.defaultClaimsSpec()
+		spec.Scope = []string{"photos"}
+		token := fx.issue(t, spec)
+
+		origScope := fx.nodeConf.Options().JWTScope
+		fx.nodeConf.Options().JWTScope = "photos"
+		get.SetConfig(fx.nodeConf)
+		t.Cleanup(func() {
+			fx.nodeConf.Options().JWTScope = origScope
+			get.SetConfig(fx.nodeConf)
+		})
+
+		gin.SetMode(gin.TestMode)
+		w := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(w)
+		req, _ := http.NewRequest(http.MethodGet, "/api/v1/photos", nil)
+		req.Header.Set("Authorization", "Bearer "+token)
+		req.RemoteAddr = "192.0.2.50:2001"
+		c.Request = req
+
+		_, verifyErr := get.VerifyJWT(c.Request.Context(), token, clusterjwt.ExpectedClaims{
+			Issuer:   fmt.Sprintf("portal:%s", fx.clusterUUID),
+			Audience: fmt.Sprintf("node:%s", fx.nodeUUID),
+			Scope:    []string{"photos"},
+			JWKSURL:  fx.nodeConf.JWKSUrl(),
+		})
+		require.NoError(t, verifyErr)
+
+		sess := authAnyJWT(c, "192.0.2.50", token, acl.ResourcePhotos, nil)
+		require.NotNil(t, sess)
+	})
+	t.Run("VisionScope", func(t *testing.T) {
+		fx := newPortalJWTFixture(t, "cluster-jwt-vision")
+		spec := fx.defaultClaimsSpec()
+		spec.Scope = []string{"vision"}
+		token := fx.issue(t, spec)
+
+		gin.SetMode(gin.TestMode)
+		w := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(w)
+		req, _ := http.NewRequest(http.MethodGet, "/api/v1/vision/status", nil)
+		req.Header.Set("Authorization", "Bearer "+token)
+		req.RemoteAddr = "198.18.0.5:8080"
+		c.Request = req
+
+		session := authAnyJWT(c, "198.18.0.5", token, acl.ResourceVision, nil)
+		require.NotNil(t, session)
+		assert.Equal(t, http.StatusOK, session.HttpStatus())
+		assert.Contains(t, session.AuthScope, "vision")
+		assert.Equal(t, spec.Issuer, session.AuthIssuer)
+	})
+	t.Run("RejectsMalformedOrUnknown", func(t *testing.T) {
+		fx := newPortalJWTFixture(t, "cluster-jwt-invalid")
+		gin.SetMode(gin.TestMode)
+		w := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(w)
+		req, _ := http.NewRequest(http.MethodGet, "/api/v1/cluster/theme", nil)
+		req.Header.Set("Authorization", "Bearer invalid-token-without-dots")
+		req.RemoteAddr = "192.0.2.10:12345"
+		c.Request = req
+
+		assert.Nil(t, authAnyJWT(c, "192.0.2.10", "invalid-token-without-dots", acl.ResourceCluster, nil))
+
+		// Ensure we also bail out when JWKS URL is not configured.
+		fx.nodeConf.SetJWKSUrl("")
+		get.SetConfig(fx.nodeConf)
+		assert.Nil(t, authAnyJWT(c, "192.0.2.10", "", acl.ResourceCluster, nil))
+	})
+	t.Run("NoIssuerMatch", func(t *testing.T) {
+		fx := newPortalJWTFixture(t, "cluster-jwt-no-issuer")
+		spec := fx.defaultClaimsSpec()
+		token := fx.issue(t, spec)
+
+		// Remove all issuer candidates.
+		origPortal := fx.nodeConf.Options().PortalUrl
+		origSite := fx.nodeConf.Options().SiteUrl
+		origClusterUUID := fx.nodeConf.Options().ClusterUUID
+		fx.nodeConf.Options().PortalUrl = ""
+		fx.nodeConf.Options().SiteUrl = ""
+		fx.nodeConf.Options().ClusterUUID = ""
+		get.SetConfig(fx.nodeConf)
+		t.Cleanup(func() {
+			fx.nodeConf.Options().PortalUrl = origPortal
+			fx.nodeConf.Options().SiteUrl = origSite
+			fx.nodeConf.Options().ClusterUUID = origClusterUUID
+			get.SetConfig(fx.nodeConf)
+		})
+
+		gin.SetMode(gin.TestMode)
+		w := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(w)
+		req, _ := http.NewRequest(http.MethodGet, "/api/v1/cluster/theme", nil)
+		req.Header.Set("Authorization", "Bearer "+token)
+		req.RemoteAddr = "203.0.113.5:2222"
+		c.Request = req
+
+		assert.Nil(t, authAnyJWT(c, "203.0.113.5", token, acl.ResourceCluster, nil))
+	})
+	t.Run("UnsupportedResource", func(t *testing.T) {
+		fx := newPortalJWTFixture(t, "cluster-jwt-unsupported")
+		token := fx.issue(t, fx.defaultClaimsSpec())
+
+		gin.SetMode(gin.TestMode)
+		w := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(w)
+		req, _ := http.NewRequest(http.MethodGet, "/api/v1/cluster/theme", nil)
+		req.Header.Set("Authorization", "Bearer "+token)
+		req.RemoteAddr = "198.51.100.7:9999"
+		c.Request = req
+
+		assert.Nil(t, authAnyJWT(c, "198.51.100.7", token, acl.ResourcePhotos, nil))
+	})
+}
+
+func TestJwtIssuerCandidates(t *testing.T) {
+	t.Run("IncludesAllSources", func(t *testing.T) {
+		conf := config.NewConfig(config.CliTestContext())
+		conf.Options().ClusterUUID = "11111111-1111-4111-8111-111111111111"
+		conf.Options().PortalUrl = "https://portal.example.test/"
+		conf.Options().SiteUrl = "https://site.example.test/base/"
+
+		orig := get.Config()
+		get.SetConfig(conf)
+		t.Cleanup(func() { get.SetConfig(orig) })
+
+		cands := jwtIssuerCandidates(conf)
+		assert.Equal(t, []string{
+			"portal:11111111-1111-4111-8111-111111111111",
+			"https://portal.example.test",
+			"https://site.example.test/base",
+		}, cands)
+	})
+	t.Run("DefaultsToLocalhost", func(t *testing.T) {
+		conf := config.NewConfig(config.CliTestContext())
+		conf.Options().ClusterUUID = ""
+		conf.Options().PortalUrl = ""
+		conf.Options().SiteUrl = ""
+
+		assert.Equal(t, []string{"http://localhost:2342"}, jwtIssuerCandidates(conf))
+	})
+}
+
+func TestShouldAttemptJWT(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	req, _ := http.NewRequest(http.MethodGet, "/ping", nil)
+	c.Request = req
+
+	assert.True(t, shouldAttemptJWT(c, "a.b.c"))
+	assert.False(t, shouldAttemptJWT(nil, "a.b.c"))
+	assert.False(t, shouldAttemptJWT(c, "invalidtoken"))
+	assert.False(t, shouldAttemptJWT(c, ""))
+}
+
+func TestInstanceAllowsJWT(t *testing.T) {
+	fx := newPortalJWTFixture(t, "node-allows")
+	conf := fx.nodeConf
+
+	assert.True(t, shouldAllowJWT(conf, "192.0.2.9"))
+
+	origCIDR := conf.Options().ClusterCIDR
+	conf.Options().ClusterCIDR = "192.0.2.0/24"
+	assert.True(t, shouldAllowJWT(conf, "192.0.2.25"))
+	assert.False(t, shouldAllowJWT(conf, "203.0.113.1"))
+	conf.Options().ClusterCIDR = "198.51.100.0/24, 192.0.2.0/24"
+	assert.True(t, shouldAllowJWT(conf, "192.0.2.25"))
+	assert.False(t, shouldAllowJWT(conf, "203.0.113.1"))
+	conf.Options().ClusterCIDR = "192.0.2.0/24,garbage"
+	assert.False(t, shouldAllowJWT(conf, "192.0.2.25"))
+	conf.Options().ClusterCIDR = origCIDR
+
+	origJWKS := conf.JWKSUrl()
+	conf.SetJWKSUrl("")
+	assert.False(t, shouldAllowJWT(conf, "192.0.2.25"))
+	conf.SetJWKSUrl(origJWKS)
+
+	assert.False(t, shouldAllowJWT(nil, "192.0.2.25"))
+}
+
+func TestExpectedClaimsFor(t *testing.T) {
+	fx := newPortalJWTFixture(t, "expected-claims")
+
+	claims := expectedClaimsFor(fx.nodeConf, "cluster")
+	assert.Equal(t, fmt.Sprintf("node:%s", fx.nodeUUID), claims.Audience)
+	assert.Equal(t, []string{"cluster"}, claims.Scope)
+	assert.Equal(t, fx.nodeConf.JWKSUrl(), claims.JWKSURL)
+
+	noScope := expectedClaimsFor(fx.nodeConf, "")
+	assert.Nil(t, noScope.Scope)
+}
+
+func TestVerifyTokenFromPortal(t *testing.T) {
+	fx := newPortalJWTFixture(t, "verify-token")
+	spec := fx.defaultClaimsSpec()
+	token := fx.issue(t, spec)
+	expected := expectedClaimsFor(fx.nodeConf, clean.Scope("cluster"))
+
+	t.Run("Success", func(t *testing.T) {
+		claims, unverified := verifyTokenFromPortal(context.Background(), token, expected, []string{"wrong", spec.Issuer})
+		require.NotNil(t, claims)
+		assert.False(t, unverified)
+		assert.Equal(t, spec.Issuer, claims.Issuer)
+		assert.Equal(t, spec.Subject, claims.Subject)
+	})
+	t.Run("WrongIssuer", func(t *testing.T) {
+		claims, unverified := verifyTokenFromPortal(context.Background(), token, expected, []string{"wrong"})
+		assert.Nil(t, claims)
+		assert.False(t, unverified, "signature verified")
+	})
+	t.Run("NoIssuers", func(t *testing.T) {
+		claims, unverified := verifyTokenFromPortal(context.Background(), token, expected, nil)
+		assert.Nil(t, claims)
+		assert.False(t, unverified)
+	})
+	t.Run("MissingScope", func(t *testing.T) {
+		clusterOnly := spec
+		clusterOnly.Scope = []string{"cluster"}
+		claims, unverified := verifyTokenFromPortal(context.Background(), fx.issue(t, clusterOnly), expectedClaimsFor(fx.nodeConf, clean.Scope("vision")), []string{spec.Issuer})
+		assert.Nil(t, claims)
+		assert.False(t, unverified, "signature verified")
+	})
+	t.Run("InvalidSignature", func(t *testing.T) {
+		parts := strings.Split(token, ".")
+		require.Len(t, parts, 3)
+		parts[2] = strings.Repeat("A", len(parts[2]))
+		claims, unverified := verifyTokenFromPortal(context.Background(), strings.Join(parts, "."), expected, []string{"wrong", spec.Issuer})
+		assert.Nil(t, claims)
+		assert.True(t, unverified)
+	})
+	t.Run("Malformed", func(t *testing.T) {
+		claims, unverified := verifyTokenFromPortal(context.Background(), "a.b.c", expected, []string{spec.Issuer})
+		assert.Nil(t, claims)
+		assert.True(t, unverified)
+	})
+	t.Run("UnknownKey", func(t *testing.T) {
+		otherConf := config.NewMinimalTestConfig(t.TempDir())
+		enablePortalAPIs(t, otherConf)
+		otherConf.Options().ClusterUUID = fx.clusterUUID
+		mgr, err := clusterjwt.NewManager(otherConf)
+		require.NoError(t, err)
+		_, err = mgr.EnsureActiveKey()
+		require.NoError(t, err)
+		get.SetConfig(fx.nodeConf)
+
+		other, err := clusterjwt.NewIssuer(mgr).Issue(spec)
+		require.NoError(t, err)
+		claims, unverified := verifyTokenFromPortal(context.Background(), other, expected, []string{"wrong", spec.Issuer})
+		assert.Nil(t, claims)
+		assert.True(t, unverified)
+
+		// Within the forced refresh interval, the key set is not fetched again and the token is not counted.
+		claims, unverified = verifyTokenFromPortal(context.Background(), other, expected, []string{spec.Issuer})
+		assert.Nil(t, claims)
+		assert.False(t, unverified)
+	})
+	t.Run("KeysUnavailable", func(t *testing.T) {
+		// A token that cannot be checked because the key set cannot be fetched is not reported.
+		unavailable := newPortalJWTFixture(t, "verify-token-unavailable")
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusServiceUnavailable)
+		}))
+		t.Cleanup(srv.Close)
+		unavailable.nodeConf.SetJWKSUrl(srv.URL + "/.well-known/jwks.json")
+		get.SetConfig(unavailable.nodeConf)
+
+		unavailableSpec := unavailable.defaultClaimsSpec()
+		claims, unverified := verifyTokenFromPortal(context.Background(), unavailable.issue(t, unavailableSpec), expectedClaimsFor(unavailable.nodeConf, clean.Scope("cluster")), []string{unavailableSpec.Issuer})
+		assert.Nil(t, claims)
+		assert.False(t, unverified)
+	})
+}
+
+// TestAuthAnyJWTLimit checks that only tokens whose signature cannot be verified count against the rate limit.
+func TestAuthAnyJWTLimit(t *testing.T) {
+	fx := newPortalJWTFixture(t, "jwt-limit")
+	spec := fx.defaultClaimsSpec()
+
+	origLimit := limiter.Auth
+	t.Cleanup(func() { limiter.Auth = origLimit })
+
+	// Returns the HTTP status of a cluster authorization with the specified token and client address.
+	authCluster := func(token, clientIP string) int {
+		gin.SetMode(gin.TestMode)
+		c, _ := gin.CreateTestContext(httptest.NewRecorder())
+		req, _ := http.NewRequest(http.MethodGet, "/api/v1/cluster/theme", nil)
+		req.Header.Set("Authorization", "Bearer "+token)
+		req.RemoteAddr = clientIP + ":12345"
+		c.Request = req
+
+		if s := authAnyJWT(c, clientIP, token, acl.ResourceCluster, nil); s != nil {
+			return s.HttpStatus()
+		}
+
+		return http.StatusUnauthorized
+	}
+
+	t.Run("Unverified", func(t *testing.T) {
+		limiter.Auth = limiter.NewLimit(rate.Every(24*time.Hour), 3)
+		parts := strings.Split(fx.issue(t, spec), ".")
+		parts[2] = strings.Repeat("A", len(parts[2]))
+		invalidSignature := strings.Join(parts, ".")
+		for range 3 {
+			assert.False(t, limiter.Auth.Reject("192.0.2.21"))
+			assert.Equal(t, http.StatusUnauthorized, authCluster(invalidSignature, "192.0.2.21"))
+		}
+		assert.True(t, limiter.Auth.Reject("192.0.2.21"))
+	})
+	t.Run("Verified", func(t *testing.T) {
+		// A genuine token that is refused because of its claims or scope is not counted.
+		limiter.Auth = limiter.NewLimit(rate.Every(24*time.Hour), 3)
+		visionOnly := spec
+		visionOnly.Scope = []string{"vision"}
+		wrongAudience := spec
+		wrongAudience.Audience = "node:" + rnd.UUID()
+		for range 5 {
+			assert.Equal(t, http.StatusUnauthorized, authCluster(fx.issue(t, visionOnly), "192.0.2.22"))
+			assert.Equal(t, http.StatusUnauthorized, authCluster(fx.issue(t, wrongAudience), "192.0.2.22"))
+		}
+		assert.False(t, limiter.Auth.Reject("192.0.2.22"))
+		assert.Equal(t, http.StatusOK, authCluster(fx.issue(t, spec), "192.0.2.22"))
+		assert.False(t, limiter.Auth.Reject("192.0.2.22"))
+	})
+	t.Run("OverLimit", func(t *testing.T) {
+		// A client over the limit is neither verified nor counted further.
+		limiter.Auth = limiter.NewLimit(rate.Every(24*time.Hour), 3)
+		parts := strings.Split(fx.issue(t, spec), ".")
+		parts[2] = strings.Repeat("A", len(parts[2]))
+		invalidSignature := strings.Join(parts, ".")
+		for range 3 {
+			authCluster(invalidSignature, "192.0.2.23")
+		}
+		require.True(t, limiter.Auth.Reject("192.0.2.23"))
+		assert.Equal(t, http.StatusUnauthorized, authCluster(fx.issue(t, spec), "192.0.2.23"))
+		assert.Equal(t, http.StatusUnauthorized, authCluster(invalidSignature, "192.0.2.23"))
+		assert.Greater(t, limiter.Auth.IP("192.0.2.23").Tokens(), -0.5)
+
+		gin.SetMode(gin.TestMode)
+		c, _ := gin.CreateTestContext(httptest.NewRecorder())
+		req, _ := http.NewRequest(http.MethodGet, "/api/v1/cluster/theme", nil)
+		req.Header.Set("Authorization", "Bearer "+fx.issue(t, spec))
+		req.RemoteAddr = "192.0.2.23:12345"
+		c.Request = req
+		assert.Equal(t, http.StatusTooManyRequests, AuthAny(c, acl.ResourceCluster, acl.Permissions{acl.ActionView}).HttpStatus())
+	})
+}
+
+func TestAuthAnyJWT_UsersManageScope(t *testing.T) {
+	// A Portal cluster JWT scoped for user management authenticates as a service
+	// principal with no end-user identity. UpdateUser authorizes exactly this
+	// condition (GrantJwtBearer + users-manage scope) so the Portal can sync
+	// cluster user state, bypassing the per-user owner check a user-less token
+	// can never satisfy.
+	fx := newPortalJWTFixture(t, "users-jwt-manage")
+	spec := fx.defaultClaimsSpec()
+	spec.Scope = []string{"cluster", "users"}
+	token := fx.issue(t, spec)
+
+	origScope := fx.nodeConf.Options().JWTScope
+	fx.nodeConf.Options().JWTScope = "cluster vision metrics users"
+	get.SetConfig(fx.nodeConf)
+	t.Cleanup(func() {
+		fx.nodeConf.Options().JWTScope = origScope
+		get.SetConfig(fx.nodeConf)
+	})
+
+	gin.SetMode(gin.TestMode)
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	req, _ := http.NewRequest(http.MethodPut, "/api/v1/users/uqxetse3cy5eo9z2", nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.RemoteAddr = "192.0.2.10:12345"
+	c.Request = req
+
+	s := authAnyJWT(c, "192.0.2.10", token, acl.ResourceUsers, acl.Permissions{acl.ActionManage, acl.AccessOwn, acl.ActionUpdate, acl.ActionUpdateOwn})
+	require.NotNil(t, s)
+	assert.Equal(t, http.StatusOK, s.HttpStatus())
+	// No end-user identity (the per-user owner check in UpdateUser would 403)...
+	assert.True(t, s.GetUser().IsUnknown())
+	// ...but it is a manage-scoped cluster JWT, so UpdateUser treats it as admin.
+	assert.Equal(t, authn.GrantJwtBearer.String(), s.GrantType)
+	assert.True(t, s.ValidateScope(acl.ResourceUsers, acl.Permissions{acl.ActionManage}))
+}
+
+func TestDownloadSessionPortalJWT(t *testing.T) {
+	fx := newPortalJWTFixture(t, "download")
+	origScope := fx.nodeConf.Options().JWTScope
+	fx.nodeConf.Options().JWTScope = "cluster vision files"
+	fx.nodeConf.Options().ClusterCIDR = "192.0.2.0/24"
+	get.SetConfig(fx.nodeConf)
+	t.Cleanup(func() {
+		fx.nodeConf.Options().JWTScope = origScope
+		get.SetConfig(fx.nodeConf)
+	})
+
+	jwtDownloadCtx := func(token string) *gin.Context {
+		w := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(w)
+		req := httptest.NewRequest(http.MethodGet, "/api/v1/dl/x", nil)
+		req.Header.Set("Authorization", "Bearer "+token)
+		req.RemoteAddr = "192.0.2.50:4567"
+		c.Request = req
+		return c
+	}
+
+	t.Run("AllFilesScopeResolvesPortalSession", func(t *testing.T) {
+		spec := fx.defaultClaimsSpec()
+		spec.Scope = []string{"files"}
+		got := DownloadSession(jwtDownloadCtx(fx.issue(t, spec)))
+		require.NotNil(t, got)
+		assert.Equal(t, acl.RolePortal, got.GetClientRole())
+	})
+	t.Run("NarrowScopeDenied", func(t *testing.T) {
+		// A cluster JWT without access to all files cannot authorize a download via the header.
+		spec := fx.defaultClaimsSpec()
+		spec.Scope = []string{"cluster", "config"}
+		assert.Nil(t, DownloadSession(jwtDownloadCtx(fx.issue(t, spec))))
+	})
+	t.Run("WriteScopeDenied", func(t *testing.T) {
+		// A scope limited to write operations does not include downloads.
+		spec := fx.defaultClaimsSpec()
+		spec.Scope = []string{"files", "write"}
+		assert.Nil(t, DownloadSession(jwtDownloadCtx(fx.issue(t, spec))))
+	})
+}
+
+// TestAuthAccess_PortalJWT checks that AuthAccess authorizes a cluster JWT session by its scope, as Auth does.
+func TestAuthAccess_PortalJWT(t *testing.T) {
+	fx := newPortalJWTFixture(t, "auth-access")
+	origScope := fx.nodeConf.Options().JWTScope
+	fx.nodeConf.Options().JWTScope = "cluster files"
+	get.SetConfig(fx.nodeConf)
+	t.Cleanup(func() {
+		fx.nodeConf.Options().JWTScope = origScope
+		get.SetConfig(fx.nodeConf)
+	})
+
+	authAccess := func(scope ...string) *entity.Session {
+		spec := fx.defaultClaimsSpec()
+		spec.Scope = scope
+		gin.SetMode(gin.TestMode)
+		c, _ := gin.CreateTestContext(httptest.NewRecorder())
+		req := httptest.NewRequest(http.MethodGet, "/api/v1/folders/originals", nil)
+		req.Header.Set("Authorization", "Bearer "+fx.issue(t, spec))
+		req.RemoteAddr = "192.0.2.60:4567"
+		c.Request = req
+
+		return AuthAccess(c, acl.ResourceFiles, acl.ActionSearch, acl.Permissions{acl.AccessAll})
+	}
+
+	t.Run("Success", func(t *testing.T) {
+		s := authAccess("files")
+		assert.Equal(t, http.StatusOK, s.HttpStatus())
+		assert.Equal(t, acl.RolePortal, s.GetClientRole())
+	})
+	t.Run("OtherResource", func(t *testing.T) {
+		assert.True(t, authAccess("cluster").Invalid())
+	})
+}
+
+func TestAuthAnyJWT_SessionScopeWithinAllowList(t *testing.T) {
+	// Building the library server registers the tool declarations that mcp.AuthorizeTool reads.
+	mcp.NewLibraryServer(&sdkmcp.Implementation{Name: "photoprism", Version: "test"}, "ce", mcp.Options{})
+
+	authorize := func(t *testing.T, allowList string, resource acl.Resource, perms acl.Permissions, tokenScope ...string) *entity.Session {
+		t.Helper()
+		fx := newPortalJWTFixture(t, "jwt-scope-within")
+		spec := fx.defaultClaimsSpec()
+		spec.Scope = tokenScope
+		token := fx.issue(t, spec)
+
+		origScope := fx.nodeConf.Options().JWTScope
+		fx.nodeConf.Options().JWTScope = allowList
+		get.SetConfig(fx.nodeConf)
+		t.Cleanup(func() {
+			fx.nodeConf.Options().JWTScope = origScope
+			get.SetConfig(fx.nodeConf)
+		})
+
+		gin.SetMode(gin.TestMode)
+		c, _ := gin.CreateTestContext(httptest.NewRecorder())
+		req, _ := http.NewRequest(http.MethodPost, "/api/v1/mcp", nil)
+		req.Header.Set("Authorization", "Bearer "+token)
+		req.RemoteAddr = "192.0.2.70:1001"
+		c.Request = req
+
+		sess := authAnyJWT(c, "192.0.2.70", token, resource, perms)
+		require.NotNil(t, sess)
+		return sess
+	}
+
+	t.Run("DefaultAllowList", func(t *testing.T) {
+		sess := authorize(t, config.DefaultJWTAllowedScopes, acl.ResourceMCP, acl.Permissions{acl.ActionView}, "mcp", "photos", "albums")
+		assert.False(t, sess.ValidateScope(acl.ResourcePhotos, acl.Permissions{acl.ActionSearch}))
+
+		for _, tool := range []string{"search_media", "list_collections"} {
+			decision, _ := mcp.AuthorizeTool(sess, tool)
+			assert.Equal(t, mcp.ToolMissingScope, decision, tool)
+		}
+	})
+	t.Run("ReadAllowList", func(t *testing.T) {
+		sess := authorize(t, "read", acl.ResourceMCP, acl.Permissions{acl.ActionView}, "mcp")
+		assert.False(t, sess.ValidateScope(acl.ResourcePhotos, acl.Permissions{acl.ActionSearch}))
+		assert.True(t, sess.ValidateScope(acl.ResourceMCP, acl.Permissions{acl.ActionView}))
+		assert.False(t, sess.ValidateScope(acl.ResourceMCP, acl.Permissions{acl.ActionUpdate}))
+	})
+	t.Run("WildcardAllowList", func(t *testing.T) {
+		sess := authorize(t, "*", acl.ResourceMCP, acl.Permissions{acl.ActionView}, "mcp", "photos")
+		assert.True(t, sess.ValidateScope(acl.ResourcePhotos, acl.Permissions{acl.ActionSearch}))
+		assert.False(t, sess.ValidateScope(acl.ResourceAlbums, acl.Permissions{acl.ActionSearch}))
+	})
+	t.Run("WildcardToken", func(t *testing.T) {
+		sess := authorize(t, config.DefaultJWTAllowedScopes, acl.ResourceMCP, acl.Permissions{acl.ActionView}, "*", "mcp")
+		assert.True(t, sess.ValidateScope(acl.ResourceMCP, acl.Permissions{acl.ActionView}))
+		assert.True(t, sess.ValidateScope(acl.ResourceUsers, acl.Permissions{acl.ActionManage}))
+		assert.False(t, sess.ValidateScope(acl.ResourcePhotos, acl.Permissions{acl.ActionSearch}))
+	})
+	t.Run("WriteAllowList", func(t *testing.T) {
+		sess := authorize(t, "users write", acl.ResourceUsers, acl.Permissions{acl.ActionManage}, "users")
+		assert.True(t, sess.ValidateScope(acl.ResourceUsers, acl.Permissions{acl.ActionManage}))
+		assert.False(t, sess.ValidateScope(acl.ResourceUsers, acl.Permissions{acl.ActionView}))
+		assert.False(t, sess.ValidateScope(acl.ResourceMCP, acl.Permissions{acl.ActionUpdate}))
+	})
+	t.Run("ReadToken", func(t *testing.T) {
+		sess := authorize(t, config.DefaultJWTAllowedScopes, acl.ResourceMCP, acl.Permissions{acl.ActionView}, "read", "mcp")
+		assert.True(t, sess.ValidateScope(acl.ResourceMCP, acl.Permissions{acl.ActionView}))
+		assert.False(t, sess.ValidateScope(acl.ResourceMCP, acl.Permissions{acl.ActionUpdate}))
+		assert.False(t, sess.ValidateScope(acl.ResourcePhotos, acl.Permissions{acl.ActionView}))
+	})
+	t.Run("AllowListIncludesResources", func(t *testing.T) {
+		sess := authorize(t, "cluster mcp photos albums", acl.ResourceMCP, acl.Permissions{acl.ActionView}, "mcp", "photos", "albums")
+		assert.True(t, sess.ValidateScope(acl.ResourcePhotos, acl.Permissions{acl.ActionSearch}))
+
+		for _, tool := range []string{"search_media", "list_collections"} {
+			decision, _ := mcp.AuthorizeTool(sess, tool)
+			assert.Equal(t, mcp.ToolAllowed, decision, tool)
+		}
+	})
+}
+
+func TestJwtSessionScope(t *testing.T) {
+	t.Run("Success", func(t *testing.T) {
+		scope, ok := jwtSessionScope(acl.ScopeAttr("mcp photos albums"), acl.ScopeAttr(config.DefaultJWTAllowedScopes))
+		assert.True(t, ok)
+		assert.Equal(t, "mcp", scope)
+	})
+	t.Run("NoSharedResource", func(t *testing.T) {
+		scope, ok := jwtSessionScope(acl.ScopeAttr("photos"), acl.ScopeAttr("mcp"))
+		assert.False(t, ok)
+		assert.Empty(t, scope)
+	})
+	t.Run("EmptyToken", func(t *testing.T) {
+		_, ok := jwtSessionScope(acl.ScopeAttr(""), acl.ScopeAttr("mcp"))
+		assert.False(t, ok)
+	})
+}

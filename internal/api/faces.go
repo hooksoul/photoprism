@@ -5,31 +5,38 @@ import (
 
 	"github.com/gin-gonic/gin"
 
-	"github.com/photoprism/photoprism/internal/acl"
+	"github.com/photoprism/photoprism/internal/auth/acl"
 	"github.com/photoprism/photoprism/internal/entity"
+	"github.com/photoprism/photoprism/internal/entity/search"
 	"github.com/photoprism/photoprism/internal/event"
 	"github.com/photoprism/photoprism/internal/form"
-	"github.com/photoprism/photoprism/internal/i18n"
-	"github.com/photoprism/photoprism/internal/search"
 	"github.com/photoprism/photoprism/pkg/clean"
+	"github.com/photoprism/photoprism/pkg/i18n"
 	"github.com/photoprism/photoprism/pkg/txt"
 )
 
 // GetFace returns a face as JSON.
 //
-// GET /api/v1/faces/:id
+//	@Summary	returns a face as JSON
+//	@Id			GetFace
+//	@Tags		Faces
+//	@Produce	json
+//	@Success	200				{object}	entity.Face
+//	@Failure	401,403,404,429	{object}	i18n.Response
+//	@Param		id				path		string	true	"face id"
+//	@Router		/api/v1/faces/{id} [get]
 func GetFace(router *gin.RouterGroup) {
 	router.GET("/faces/:id", func(c *gin.Context) {
 		s := Auth(c, acl.ResourcePeople, acl.ActionView)
 
-		// Abort if permission was not granted.
+		// Abort if permission is not granted.
 		if s.Abort(c) {
 			return
 		}
 
 		f := form.SearchFaces{UID: c.Param("id"), Markers: true}
 
-		if results, err := search.Faces(f); err != nil || len(results) < 1 {
+		if results, err := search.UserFaces(f, s); err != nil || len(results) < 1 {
 			Abort(c, http.StatusNotFound, i18n.ErrFaceNotFound)
 			return
 		} else {
@@ -40,20 +47,43 @@ func GetFace(router *gin.RouterGroup) {
 
 // UpdateFace updates face properties.
 //
-// PUT /api/v1/faces/:id
+//	@Summary	updates face properties
+//	@Id			UpdateFace
+//	@Tags		Faces
+//	@Accept		json
+//	@Produce	json
+//	@Success	200								{object}	entity.Face
+//	@Failure	400,401,403,404,409,413,429,500	{object}	i18n.Response
+//	@Param		id								path		string		true	"face id"
+//	@Param		face							body		form.Face	true	"properties to be updated"
+//	@Router		/api/v1/faces/{id} [put]
 func UpdateFace(router *gin.RouterGroup) {
 	router.PUT("/faces/:id", func(c *gin.Context) {
 		s := Auth(c, acl.ResourcePeople, acl.ActionUpdate)
 
-		// Abort if permission was not granted.
+		// Abort if permission is not granted.
 		if s.Abort(c) {
 			return
 		}
 
-		var f form.Face
+		// Hiding a cluster and naming one both write what a migration's finalize replaces, and
+		// a subject written mid-run also rolls that finalize back.
+		if faceMigrationRunning(c) {
+			return
+		}
 
-		if err := c.BindJSON(&f); err != nil {
-			AbortBadRequest(c)
+		var frm form.Face
+
+		// Assign and validate request form values.
+		LimitRequestBodyBytes(c, MaxMutationRequestBytes)
+
+		if err := c.BindJSON(&frm); err != nil {
+			if IsRequestBodyTooLarge(err) {
+				AbortRequestTooLarge(c, i18n.ErrBadRequest)
+				return
+			}
+
+			AbortBadRequest(c, err)
 			return
 		}
 
@@ -65,18 +95,33 @@ func UpdateFace(router *gin.RouterGroup) {
 			return
 		}
 
+		// Resolve the person before any write, so a rejected request changes nothing. A person the
+		// session may not see is answered like an unknown one, as the subject handlers do.
+		subjUid := ""
+
+		if frm.SubjUID != "" {
+			subj := FindSubjectForSession(frm.SubjUID, s)
+
+			if subj == nil || !subj.IsPerson() {
+				Abort(c, http.StatusNotFound, i18n.ErrSubjectNotFound)
+				return
+			}
+
+			subjUid = subj.SubjUID
+		}
+
 		// Change visibility?
-		if !f.FaceHidden && f.FaceHidden == m.FaceHidden {
+		if !frm.FaceHidden && frm.FaceHidden == m.FaceHidden {
 			// Do nothing.
-		} else if err := m.Update("FaceHidden", f.FaceHidden); err != nil {
+		} else if err := m.Update("FaceHidden", frm.FaceHidden); err != nil {
 			c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{"error": txt.UpperFirst(err.Error())})
 			return
 		}
 
 		// Change subject?
-		if f.SubjUID == "" {
+		if subjUid == "" {
 			// Do nothing.
-		} else if err := m.SetSubjectUID(f.SubjUID); err != nil {
+		} else if err := m.SetSubjectUID(subjUid); err != nil {
 			c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{"error": txt.UpperFirst(err.Error())})
 			return
 		}

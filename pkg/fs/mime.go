@@ -1,74 +1,154 @@
 package fs
 
 import (
+	"bytes"
+	"errors"
 	"path/filepath"
 	"strings"
 
 	"github.com/gabriel-vasile/mimetype"
+
+	"github.com/photoprism/photoprism/pkg/http/header"
 )
 
 const (
+	// MimeTypeUnknown represents an unknown mime type.
 	MimeTypeUnknown = ""
-	MimeTypeJPEG    = "image/jpeg"
-	MimeTypeJPEGXL  = "image/jxl"
-	MimeTypePNG     = "image/png"
-	MimeTypeAPNG    = "image/vnd.mozilla.apng"
-	MimeTypeGIF     = "image/gif"
-	MimeTypeBMP     = "image/bmp"
-	MimeTypeTIFF    = "image/tiff"
-	MimeTypeDNG     = "image/dng"
-	MimeTypeAVIF    = "image/avif"
-	MimeTypeAVIFS   = "image/avif-sequence"
-	MimeTypeHEIC    = "image/heic"
-	MimeTypeHEICS   = "image/heic-sequence"
-	MimeTypeWebP    = "image/webp"
-	MimeTypeMP4     = "video/mp4"
-	MimeTypeMOV     = "video/quicktime"
-	MimeTypeSVG     = "image/svg+xml"
-	MimeTypeAI      = "application/vnd.adobe.illustrator"
-	MimeTypePS      = "application/ps"
-	MimeTypeEPS     = "image/eps"
-	MimeTypeXML     = "text/xml"
-	MimeTypeJSON    = "application/json"
 )
 
-// MimeType returns the mime type of a file, or an empty string if it could not be detected.
-func MimeType(filename string) (mimeType string) {
+// init registers the BigTIFF signature, which the content detector does not know.
+func init() {
+	mimetype.Lookup(header.ContentTypeBinary).Extend(isBigTiff, header.ContentTypeTiff, ".tif")
+}
+
+// isBigTiff reports whether the data starts with a BigTIFF header, which uses 64-bit offsets.
+func isBigTiff(raw []byte, _ uint32) bool {
+	return bytes.HasPrefix(raw, []byte{'I', 'I', 0x2B, 0x00, 0x08, 0x00, 0x00, 0x00}) ||
+		bytes.HasPrefix(raw, []byte{'M', 'M', 0x00, 0x2B, 0x00, 0x08, 0x00, 0x00})
+}
+
+// DetectMimeType returns the MIME type of the specified file,
+// or an error if the type could not be detected.
+//
+// The IANA and IETF use the term "media type", and consider the term "MIME type" to be obsolete,
+// since media types have become used in contexts unrelated to email, such as HTTP:
+// https://en.wikipedia.org/wiki/Media_type#Structure
+func DetectMimeType(filename string) (mimeType string, err error) {
+	// Abort if no filename was specified.
 	if filename == "" {
-		return MimeTypeUnknown
+		return MimeTypeUnknown, errors.New("missing filename")
 	}
 
-	// Workaround for types that cannot be reliably detected.
-	switch Extensions[strings.ToLower(filepath.Ext(filename))] {
-	case ImageDNG:
-		return MimeTypeDNG
-	case ImageAVIF:
-		return MimeTypeAVIF
-	case ImageAVIFS:
-		return MimeTypeAVIFS
-	case ImageHEIC:
-		return MimeTypeHEIC
-	case ImageHEICS:
-		return MimeTypeHEICS
-	case VideoMP4:
-		return MimeTypeMP4
-	case VideoMOV:
-		return MimeTypeMOV
-	case VectorSVG:
-		return MimeTypeSVG
+	// Detect file type based on the filename extension.
+	fileType := Extensions[strings.ToLower(filepath.Ext(filename))]
+
+	// Determine mime type based on the extension for the following
+	// formats, which otherwise cannot be reliably distinguished:
+	switch fileType {
+	// MPEG-2 Transport Stream
+	case VideoM2TS, VideoAVCHD:
+		return header.ContentTypeM2TS, nil
+	// Apple QuickTime Container
+	case VideoMov:
+		return header.ContentTypeMov, nil
+	// MPEG-4 AVC Video
+	case VideoAvc:
+		return header.ContentTypeMp4Avc, nil
+	// MPEG-4 HEVC Video
+	case VideoHvc:
+		return header.ContentTypeMp4Hvc, nil
+	// MPEG-4 HEVC Bitstream
+	case VideoHev:
+		return header.ContentTypeMp4Hev, nil
+	// Adobe Digital Negative
+	case ImageDng:
+		return header.ContentTypeDng, nil
+	// Adobe Photoshop Document
+	case ImagePsd:
+		return header.ContentTypePsd, nil
+	// Adobe Illustrator
 	case VectorAI:
-		return MimeTypeAI
+		return header.ContentTypeAI, nil
+	// Adobe PostScript
 	case VectorPS:
-		return MimeTypePS
+		return header.ContentTypePS, nil
+	// Adobe Embedded PostScript
 	case VectorEPS:
-		return MimeTypeEPS
+		return header.ContentTypeEPS, nil
+	// Scalable Vector Graphics
+	case VectorSVG:
+		return header.ContentTypeSVG, nil
 	}
 
-	if t, err := mimetype.DetectFile(filename); err != nil {
-		return MimeTypeUnknown
-	} else {
-		mimeType, _, _ = strings.Cut(t.String(), ";")
+	// Use "gabriel-vasile/mimetype" to automatically detect the MIME type.
+	detectedType, err := mimetype.DetectFile(filename)
+
+	// Check if type could be successfully detected.
+	if err == nil {
+		if detectedType != nil {
+			mimeType = detectedType.String()
+		}
+	} else if e := err.Error(); strings.HasSuffix(e, ErrPermissionDenied.Error()) {
+		return MimeTypeUnknown, ErrPermissionDenied
+	} else if strings.Contains(e, EOF.Error()) {
+		return MimeTypeUnknown, ErrUnexpectedEOF
 	}
 
+	// Treat "application/octet-stream" as unknown.
+	if mimeType == header.ContentTypeBinary {
+		mimeType = MimeTypeUnknown
+	}
+
+	// If it could be detected, try to determine mime type from extension:
+	if mimeType == MimeTypeUnknown {
+		switch fileType {
+		// MPEG-4 Multimedia Container
+		case VideoMp4:
+			return header.ContentTypeMp4, nil
+		// AV1 Image File
+		case ImageAvif:
+			return header.ContentTypeAvif, nil
+		// AV1 Image File Sequence
+		case ImageAvifS:
+			return header.ContentTypeAvifS, nil
+		// High Efficiency Image Container
+		case ImageHeic, ImageHeif:
+			return header.ContentTypeHeic, nil
+		// High Efficiency Image Container Sequence
+		case ImageHeicS:
+			return header.ContentTypeHeicS, nil
+		// ZIP Archive File:
+		case ArchiveZip:
+			return header.ContentTypeZip, nil
+		}
+	}
+
+	return mimeType, err
+}
+
+// MimeType returns the MIME type of the specified file,
+// or an empty string if the type could not be detected.
+func MimeType(filename string) (mimeType string) {
+	mimeType, _ = DetectMimeType(filename)
 	return mimeType
+}
+
+// BaseType returns the media type string without any optional parameters.
+func BaseType(mimeType string) string {
+	if mimeType == "" {
+		return ""
+	}
+
+	mimeType, _, _ = strings.Cut(mimeType, ";")
+
+	return strings.ToLower(mimeType)
+}
+
+// SameType tests if the specified mime types are matching, except for any optional parameters.
+func SameType(mime1, mime2 string) bool {
+	if mime1 == mime2 {
+		return true
+	}
+
+	return BaseType(mime1) == BaseType(mime2)
 }

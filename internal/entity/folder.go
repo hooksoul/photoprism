@@ -1,40 +1,43 @@
 package entity
 
 import (
-	"os"
 	"path"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/jinzhu/gorm"
 	"github.com/ulule/deepcopier"
+	"gorm.io/gorm"
 
+	"github.com/photoprism/photoprism/internal/entity/sortby"
 	"github.com/photoprism/photoprism/internal/form"
 	"github.com/photoprism/photoprism/pkg/clean"
 	"github.com/photoprism/photoprism/pkg/rnd"
-	"github.com/photoprism/photoprism/pkg/sortby"
 	"github.com/photoprism/photoprism/pkg/txt"
 )
 
+// FolderUID is the prefix of folder UIDs.
+const FolderUID = byte('d')
+
 var folderMutex = sync.Mutex{}
 
+// Folders represents a list of folders.
 type Folders []Folder
 
 // Folder represents a file system directory.
 type Folder struct {
-	Path              string     `gorm:"type:VARBINARY(1024);unique_index:idx_folders_path_root;" json:"Path" yaml:"Path"`
-	Root              string     `gorm:"type:VARBINARY(16);default:'';unique_index:idx_folders_path_root;" json:"Root" yaml:"Root,omitempty"`
-	FolderUID         string     `gorm:"type:VARBINARY(42);primary_key;" json:"UID,omitempty" yaml:"UID,omitempty"`
-	FolderType        string     `gorm:"type:VARBINARY(16);" json:"Type" yaml:"Type,omitempty"`
-	FolderTitle       string     `gorm:"type:VARCHAR(200);" json:"Title" yaml:"Title,omitempty"`
-	FolderCategory    string     `gorm:"type:VARCHAR(100);index;" json:"Category" yaml:"Category,omitempty"`
-	FolderDescription string     `gorm:"type:VARCHAR(2048);" json:"Description,omitempty" yaml:"Description,omitempty"`
-	FolderOrder       string     `gorm:"type:VARBINARY(32);" json:"Order" yaml:"Order,omitempty"`
-	FolderCountry     string     `gorm:"type:VARBINARY(2);index:idx_folders_country_year_month;default:'zz'" json:"Country" yaml:"Country,omitempty"`
-	FolderYear        int        `gorm:"index:idx_folders_country_year_month;" json:"Year" yaml:"Year,omitempty"`
-	FolderMonth       int        `gorm:"index:idx_folders_country_year_month;" json:"Month" yaml:"Month,omitempty"`
-	FolderDay         int        `json:"Day" yaml:"Day,omitempty"`
+	Path              string     `gorm:"type:bytes;size:1024;uniqueIndex:idx_folders_path_root;" json:"Path" yaml:"Path"`
+	Root              string     `gorm:"type:bytes;size:16;default:'';uniqueIndex:idx_folders_path_root;" json:"Root" yaml:"Root,omitempty"`
+	FolderUID         string     `gorm:"type:bytes;size:42;primaryKey;" json:"UID,omitempty" yaml:"UID,omitempty"`
+	FolderType        string     `gorm:"type:bytes;size:16;" json:"Type" yaml:"Type,omitempty"`
+	FolderTitle       string     `gorm:"size:200;" json:"Title" yaml:"Title,omitempty"`
+	FolderCategory    string     `gorm:"size:100;index;" json:"Category" yaml:"Category,omitempty"`
+	FolderDescription string     `gorm:"size:2048;" json:"Description,omitempty" yaml:"Description,omitempty"`
+	FolderOrder       string     `gorm:"type:bytes;size:32;" json:"Order" yaml:"Order,omitempty"`
+	FolderCountry     string     `gorm:"type:bytes;size:2;index:idx_folders_country_year_month;default:'zz'" json:"Country" yaml:"Country,omitempty"`
+	FolderYear        int        `gorm:"index:idx_folders_country_year_month;size:32;" json:"Year" yaml:"Year,omitempty"`
+	FolderMonth       int        `gorm:"index:idx_folders_country_year_month;size:32;" json:"Month" yaml:"Month,omitempty"`
+	FolderDay         int        `gorm:"size:32" json:"Day" yaml:"Day,omitempty"`
 	FolderFavorite    bool       `json:"Favorite" yaml:"Favorite,omitempty"`
 	FolderPrivate     bool       `json:"Private" yaml:"Private,omitempty"`
 	FolderIgnore      bool       `json:"Ignore" yaml:"Ignore,omitempty"`
@@ -42,9 +45,9 @@ type Folder struct {
 	FileCount         int        `gorm:"-" json:"FileCount" yaml:"-"`
 	CreatedAt         time.Time  `json:"-" yaml:"-"`
 	UpdatedAt         time.Time  `json:"-" yaml:"-"`
-	ModifiedAt        time.Time  `json:"ModifiedAt,omitempty" yaml:"-"`
-	PublishedAt       *time.Time `sql:"index" json:"PublishedAt,omitempty" yaml:"PublishedAt,omitempty"`
-	DeletedAt         *time.Time `sql:"index" json:"-"`
+	ModifiedAt        time.Time  `json:"ModifiedAt" yaml:"-"`
+	PublishedAt       *time.Time `gorm:"index" json:"PublishedAt,omitempty" yaml:"PublishedAt,omitempty"`
+	DeletedAt         DeletedAt  `gorm:"index" json:"-" yaml:"DeletedAt,omitempty"`
 }
 
 // TableName returns the entity table name.
@@ -53,23 +56,29 @@ func (Folder) TableName() string {
 }
 
 // BeforeCreate creates a random UID if needed before inserting a new row to the database.
-func (m *Folder) BeforeCreate(scope *gorm.Scope) error {
-	if rnd.IsUnique(m.FolderUID, 'd') {
+func (m *Folder) BeforeCreate(tx *gorm.DB) error {
+	if rnd.IsUnique(m.FolderUID, FolderUID) {
 		return nil
 	}
 
-	return scope.SetColumn("FolderUID", rnd.GenerateUID('d'))
+	tx.Statement.SetColumn("FolderUID", rnd.GenerateUID(FolderUID))
+
+	return nil
 }
 
 // NewFolder creates a new file system directory entity.
-func NewFolder(root, pathName string, modTime time.Time) Folder {
-	now := TimeStamp()
+func NewFolder(root, dir string, modTime time.Time) Folder {
+	now := Now()
 
-	pathName = strings.Trim(pathName, string(os.PathSeparator))
+	dir = clean.SlashPath(dir)
 
-	if pathName == RootPath {
-		pathName = ""
+	if dir == RootPath {
+		dir = ""
 	}
+
+	// Clip to the shared path byte budget so folders.path stays byte-exact with
+	// album_path and photo_path.
+	dir = ClipPath(dir)
 
 	year := 0
 	month := 0
@@ -80,9 +89,9 @@ func NewFolder(root, pathName string, modTime time.Time) Folder {
 	}
 
 	result := Folder{
-		FolderUID:     rnd.GenerateUID('d'),
+		FolderUID:     rnd.GenerateUID(FolderUID),
 		Root:          root,
-		Path:          pathName,
+		Path:          dir,
 		FolderType:    MediaUnknown,
 		FolderOrder:   sortby.Name,
 		FolderCountry: UnknownCountry.ID,
@@ -142,9 +151,9 @@ func (m *Folder) SetValuesFromPath() {
 	}
 }
 
-// Slug returns a slug based on the folder title.
+// Slug returns a collision-resistant slug derived from the folder path.
 func (m *Folder) Slug() string {
-	return txt.Slug(m.Path)
+	return txt.SlugUnique(m.Path)
 }
 
 // RootPath returns the full folder path including root.
@@ -168,16 +177,122 @@ func (m *Folder) Create() error {
 		return nil
 	}
 
+	m.syncOriginalsAlbum()
+
+	return nil
+}
+
+// ReconcileOriginalsFolderAlbums ensures existing originals folders have matching folder albums.
+// When rootPath is set, only that path and its descendants are synchronized.
+func ReconcileOriginalsFolderAlbums(rootPath string) (reconciled int, err error) {
+	rootPath = originalsFolderAlbumReconcileScope(rootPath)
+
+	var folders Folders
+
+	// Keep this scoped to active folders only. Conflict handling uses unscoped
+	// lookups, but bulk reconciliation must not recreate/sync albums for
+	// soft-deleted folder rows.
+	stmt := Db().Where("root = ? AND path <> ''", RootOriginals)
+
+	if rootPath != "" {
+		stmt = stmt.Where("path = ? OR "+clean.SqlPrefixCond(DbDialect(), true, "path"), append([]any{rootPath}, clean.SqlPrefixArgs(rootPath+"/")...)...)
+	}
+
+	if err = stmt.Order("path ASC").Find(&folders).Error; err != nil {
+		return reconciled, err
+	}
+
+	for i := range folders {
+		folders[i].syncOriginalsAlbum()
+		reconciled++
+	}
+
+	return reconciled, nil
+}
+
+// originalsFolderAlbumReconcileScope returns the effective reconciliation scope for a path.
+// If a slug collision is detected, the scope is expanded to the highest colliding
+// ancestor folder path so related rows can be repaired together.
+func originalsFolderAlbumReconcileScope(rootPath string) string {
+	rootPath = clean.UserPath(rootPath)
+
+	if rootPath == "" || !hasOriginalsFolderPath(rootPath) {
+		return rootPath
+	}
+
+	scopePath := rootPath
+
+	for hasOriginalsFolderAlbumSlugCollision(scopePath) {
+		parentPath := clean.UserPath(path.Dir(scopePath))
+
+		if parentPath == "" || parentPath == "." || parentPath == "/" || parentPath == scopePath {
+			break
+		}
+
+		scopePath = parentPath
+	}
+
+	return scopePath
+}
+
+// hasOriginalsFolderPath reports whether an active originals folder row exists for rootPath.
+func hasOriginalsFolderPath(rootPath string) bool {
+	var count int64
+
+	if err := Db().Model(&Folder{}).Where("root = ? AND path = ?", RootOriginals, rootPath).Count(&count).Error; err != nil {
+		log.Debugf("folder: %s (check folder path %s)", err, clean.LogQuote(rootPath))
+		return false
+	}
+
+	return count > 0
+}
+
+// hasOriginalsFolderAlbumSlugCollision reports whether rootPath collides with another
+// active folder album that shares the same slug but stores a different non-empty path.
+// The "different path" check runs in Go because MariaDB's utf8mb4_unicode_ci collation
+// collapses most emoji, so an SQL "album_path <> ?" would wrongly exclude an emoji
+// sibling (e.g. "ins/🪞" treated as equal to "ins/🍷") and miss the collision.
+func hasOriginalsFolderAlbumSlugCollision(rootPath string) bool {
+	albumSlugs := folderAlbumSlugCandidates(rootPath)
+
+	if len(albumSlugs) == 0 {
+		return false
+	}
+
+	var albums Albums
+
+	if err := Db().
+		Where("album_type = ? AND album_slug IN (?) AND album_path <> ''", AlbumFolder, albumSlugs).
+		Find(&albums).Error; err != nil {
+		log.Debugf("folder: %s (check album slug collision for %s)", err, clean.LogQuote(rootPath))
+		return false
+	}
+
+	for i := range albums {
+		if albums[i].AlbumPath != rootPath {
+			return true
+		}
+	}
+
+	return false
+}
+
+// syncOriginalsAlbum ensures an originals folder has a matching folder album.
+func (m *Folder) syncOriginalsAlbum() {
+	if m == nil || m.Root != RootOriginals || m.Path == "" {
+		return
+	}
+
 	f := form.SearchPhotos{
 		Path:   m.Path,
 		Public: true,
 	}
 
 	if a := FindFolderAlbum(m.Path); a != nil {
-		if a.DeletedAt != nil {
+		if a.DeletedAt.Valid {
 			// Ignore.
-		} else if err := a.UpdateFolder(m.Path, f.Serialize()); err != nil {
-			log.Errorf("folder: %s (update album)", err.Error())
+		} else if err := a.UpdateFolder(m.Path, f.Serialize(), m.Title()); err != nil {
+			log.Errorf("folder: %s (update album)", clean.Error(err))
 		}
 	} else if a := NewFolderAlbum(m.Title(), m.Path, f.Serialize()); a != nil {
 		a.AlbumYear = m.FolderYear
@@ -186,57 +301,64 @@ func (m *Folder) Create() error {
 		a.AlbumCountry = m.FolderCountry
 
 		if err := a.Create(); err != nil {
-			log.Errorf("folder: %s (add album)", err)
+			log.Errorf("folder: %s (add album)", clean.Error(err))
 		} else {
-			log.Infof("folder: added album %s (%s)", clean.Log(a.AlbumTitle), a.AlbumFilter)
+			log.Infof("folder: added album %s (%s)", clean.Log(a.AlbumTitle), clean.Log(a.AlbumFilter))
 		}
 	}
-
-	return nil
 }
 
-// FindFolder returns an existing row if exists.
-func FindFolder(root, pathName string) *Folder {
-	pathName = strings.Trim(pathName, string(os.PathSeparator))
+// FindFolder returns an existing folder, including soft-deleted rows.
+// This function is primarily used for create/index conflict resolution.
+func FindFolder(root, dir string) *Folder {
+	dir = clean.SlashPath(dir)
 
-	if pathName == RootPath {
-		pathName = ""
+	if dir == RootPath {
+		dir = ""
 	}
 
+	return findFolderKey(root, dir)
+}
+
+// findFolderKey returns the folder stored with the root and path given verbatim, including
+// soft-deleted ones, or nil if there is none.
+func findFolderKey(root, dir string) *Folder {
 	result := Folder{}
 
-	if err := Db().Where("path = ? AND root = ?", pathName, root).First(&result).Error; err == nil {
+	if err := UnscopedDb().Where("path = ? AND root = ?", dir, root).First(&result).Error; err == nil {
+		if result.DeletedAt.Valid {
+			log.Debugf("folder: found soft-deleted row for path %s in root %s during conflict lookup", clean.LogQuote(dir), clean.LogQuote(root))
+		}
+
 		return &result
 	}
 
 	return nil
 }
 
-// FirstOrCreateFolder returns the existing row, inserts a new row or nil in case of errors.
-func FirstOrCreateFolder(m *Folder) *Folder {
-	result := Folder{}
-
-	if err := Db().Where("path = ? AND root = ?", m.Path, m.Root).First(&result).Error; err == nil {
-		return &result
+// FirstOrCreateFolder returns the folder stored with the same root and path, or inserts it, and
+// reports whether it was created.
+func FirstOrCreateFolder(m *Folder) (folder *Folder, created bool, err error) {
+	if result := findFolderKey(m.Root, m.Path); result != nil {
+		return result, false, nil
 	} else if createErr := m.Create(); createErr == nil {
-		return m
-	} else if err := Db().Where("path = ? AND root = ?", m.Path, m.Root).First(&result).Error; err == nil {
-		return &result
+		return m, true, nil
+	} else if result = findFolderKey(m.Root, m.Path); result != nil {
+		return result, false, nil
 	} else {
-		log.Errorf("folder: %s (find or create %s)", createErr, m.Path)
+		log.Errorf("folder: %s (find or create %s)", clean.Error(createErr), clean.Log(m.Path))
+		return nil, false, createErr
 	}
-
-	return nil
 }
 
 // Updates selected properties in the database.
-func (m *Folder) Updates(values interface{}) error {
+func (m *Folder) Updates(values any) error {
 	return Db().Model(m).Updates(values).Error
 }
 
 // SetForm updates the entity properties based on form values.
-func (m *Folder) SetForm(f form.Folder) error {
-	if err := deepcopier.Copy(m).From(f); err != nil {
+func (m *Folder) SetForm(frm form.Folder) error {
+	if err := deepcopier.Copy(m).From(frm); err != nil {
 		return err
 	}
 

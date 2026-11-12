@@ -9,47 +9,51 @@ import (
 	"time"
 
 	"github.com/sirupsen/logrus"
-	"github.com/urfave/cli"
+	"github.com/urfave/cli/v2"
 
-	"github.com/photoprism/photoprism/internal/config"
-	"github.com/photoprism/photoprism/internal/migrate"
-	"github.com/photoprism/photoprism/pkg/report"
+	"github.com/photoprism/photoprism/internal/entity/migrate"
+	"github.com/photoprism/photoprism/pkg/txt/report"
 )
 
-var MigrationsStatusCommand = cli.Command{
+// MigrationsStatusCommand lists migration status.
+var MigrationsStatusCommand = &cli.Command{
 	Name:      "ls",
 	Aliases:   []string{"status", "show"},
 	Usage:     "Displays the status of schema migrations",
-	ArgsUsage: "[migrations...]",
+	ArgsUsage: "[migrations]...",
 	Flags:     report.CliFlags,
 	Action:    migrationsStatusAction,
 }
 
-var MigrationsRunCommand = cli.Command{
+// MigrationsRunCommand runs pending migrations.
+var MigrationsRunCommand = &cli.Command{
 	Name:      "run",
 	Aliases:   []string{"execute", "migrate"},
 	Usage:     "Executes database schema migrations",
-	ArgsUsage: "[migrations...]",
+	ArgsUsage: "[migrations]...",
 	Flags: []cli.Flag{
-		cli.BoolFlag{
-			Name:  "failed, f",
-			Usage: "run previously failed migrations",
+		&cli.BoolFlag{
+			Name:    "failed",
+			Aliases: []string{"f"},
+			Usage:   "runs previously failed migrations",
 		},
-		cli.BoolFlag{
-			Name:  "trace, t",
-			Usage: "show trace logs for debugging",
+		&cli.BoolFlag{
+			Name:    "trace",
+			Aliases: []string{"t"},
+			Usage:   "shows trace logs for debugging",
 		},
 	},
 	Action: migrationsRunAction,
 }
 
-// MigrationsCommand registers the "migrations" CLI command.
-var MigrationsCommand = cli.Command{
+// MigrationsCommands registers the "migrations" CLI command.
+var MigrationsCommands = &cli.Command{
 	Name:  "migrations",
 	Usage: "Database schema migration subcommands",
-	Subcommands: []cli.Command{
+	Subcommands: []*cli.Command{
 		MigrationsStatusCommand,
 		MigrationsRunCommand,
+		MigrationsTransferCommand,
 	},
 }
 
@@ -64,7 +68,6 @@ func migrationsStatusAction(ctx *cli.Context) error {
 		return err
 	}
 
-	conf.RegisterDb()
 	defer conf.Shutdown()
 
 	var ids []string
@@ -109,15 +112,16 @@ func migrationsStatusAction(ctx *cli.Context) error {
 			finished = "-"
 		}
 
-		if m.Error != "" {
+		switch {
+		case m.Error != "":
 			info = m.Error
-		} else if m.Finished() {
+		case m.Finished():
 			info = "OK"
-		} else if m.StartedAt.IsZero() {
+		case m.StartedAt.IsZero():
 			info = "-"
-		} else if m.Repeat(false) {
+		case m.Repeat(false):
 			info = "Repeat"
-		} else {
+		default:
 			info = "Running?"
 		}
 
@@ -144,16 +148,15 @@ func migrationsRunAction(ctx *cli.Context) error {
 
 	start := time.Now()
 
-	conf := config.NewConfig(ctx)
+	conf, err := InitConfig(ctx)
 
 	_, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	if err := conf.Init(); err != nil {
+	if err != nil {
 		return err
 	}
 
-	conf.RegisterDb()
 	defer conf.Shutdown()
 
 	if ctx.Bool("trace") {
@@ -177,7 +180,9 @@ func migrationsRunAction(ctx *cli.Context) error {
 	log.Infoln("migrating database schema...")
 
 	// Run migrations.
-	conf.MigrateDb(runFailed, ids)
+	if err := conf.MigrateDb(runFailed, ids); err != nil {
+		return err
+	}
 
 	elapsed := time.Since(start)
 

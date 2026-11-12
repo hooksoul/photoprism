@@ -10,14 +10,19 @@ import (
 	"github.com/photoprism/photoprism/pkg/txt"
 )
 
-var UnwantedDescriptions = map[string]bool{
+// UnwantedStrings lists boilerplate captions we strip during import.
+var UnwantedStrings = map[string]bool{
 	"Created by Imlib":         true, // Apps
 	"iClarified":               true,
 	"OLYMPUS DIGITAL CAMERA":   true, // Olympus
+	"MEDION DIGITAL CAMERA":    true, // Medion
+	"My beautiful picture":     true,
+	"HELLOMOTO":                true, // Motorola
 	"SAMSUNG":                  true, // Samsung
 	"SAMSUNG CAMERA PICTURES":  true,
 	"<Digimax i5, Samsung #1>": true,
 	"SONY DSC":                 true, // Sony
+	"Scanner":                  true, // KODAK Slide N Scan
 	"rhdr":                     true, // Huawei
 	"hdrpl":                    true,
 	"oznorWO":                  true,
@@ -44,22 +49,29 @@ var UnwantedDescriptions = map[string]bool{
 	"cof":                      true,
 	"qrf":                      true,
 	"fshbty":                   true,
+	"_cuva":                    true,
+	"smart":                    true,
+	"hdr":                      true,
+	"bsh":                      true,
 	"binary comment":           true, // Other
 	"default":                  true,
 	"Exif_JPEG_PICTURE":        true,
 	"DVC 10.1 HDMI":            true,
 	"charset=Ascii":            true,
+	"Digital Camera":           true,
 }
 
-var LowerCaseRegexp = regexp.MustCompile("[a-z\\d_\\-]+")
+// LowerCaseRegexp matches lower-case tokens in generated filenames.
+var LowerCaseRegexp = regexp.MustCompile(`[a-z\d_\-]+`)
 
-// SanitizeUnicode returns the string as valid Unicode with whitespace trimmed.
+// SanitizeUnicode returns the string as valid Unicode with whitespace trimmed, and removes control
+// characters other than tabs and line breaks, which are normalized to "\n".
 func SanitizeUnicode(s string) string {
 	if s == "" {
 		return ""
 	}
 
-	return clean.Unicode(strings.TrimSpace(s))
+	return clean.Unicode(strings.TrimSpace(clean.Text(s)))
 }
 
 // SanitizeString removes unwanted character from an exif value string.
@@ -74,7 +86,7 @@ func SanitizeString(s string) string {
 		return ""
 	}
 
-	return SanitizeUnicode(strings.Replace(s, "\"", "", -1))
+	return SanitizeUnicode(strings.ReplaceAll(s, "\"", ""))
 }
 
 // SanitizeUID normalizes unique IDs found in XMP or Exif metadata.
@@ -122,14 +134,14 @@ func SanitizeTitle(title string) string {
 	return result
 }
 
-// SanitizeDescription normalizes descriptions and removes unwanted information.
-func SanitizeDescription(s string) string {
+// SanitizeCaption normalizes metadata captions and removes unwanted text.
+func SanitizeCaption(s string) string {
 	s = SanitizeString(s)
 
 	switch {
 	case s == "":
 		return ""
-	case UnwantedDescriptions[s]:
+	case UnwantedStrings[s]:
 		return ""
 	case strings.HasPrefix(s, "DCIM\\") && !strings.Contains(s, " "):
 		return ""
@@ -148,10 +160,10 @@ func SanitizeMeta(s string) string {
 		var words []string
 
 		if err := json.Unmarshal([]byte(s), &words); err != nil {
-			return s
+			return SanitizeUnicode(s)
 		}
 
-		s = strings.Join(words, ", ")
+		s = SanitizeUnicode(strings.Join(words, ", "))
 	} else {
 		s = SanitizeString(s)
 	}

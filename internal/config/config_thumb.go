@@ -1,0 +1,145 @@
+package config
+
+import (
+	"github.com/photoprism/photoprism/internal/thumb"
+	"github.com/photoprism/photoprism/pkg/clean"
+)
+
+// JpegSize returns the size limit for automatically converted files in `PIXELS` (720-30000).
+func (c *Config) JpegSize() int {
+	if c.options.JpegSize < 720 {
+		return 720
+	} else if c.options.JpegSize > 30000 {
+		return 30000
+	}
+
+	return c.options.JpegSize
+}
+
+// PngSize returns the size limit for automatically converted files in `PIXELS` (720-30000).
+func (c *Config) PngSize() int {
+	if c.options.PngSize < 720 {
+		return 720
+	} else if c.options.PngSize > 30000 {
+		return 30000
+	}
+
+	return c.options.PngSize
+}
+
+// JpegQuality returns the jpeg image quality as thumb.Quality (25-100).
+func (c *Config) JpegQuality() thumb.Quality {
+	if c.options.JpegQuality < 25 {
+		c.options.JpegQuality = thumb.QualityMedium.Int()
+	} else if c.options.JpegQuality > 100 {
+		c.options.JpegQuality = thumb.QualityMax.Int()
+	}
+
+	return thumb.Quality(c.options.JpegQuality)
+}
+
+// ThumbLibrary returns the name of the image processing library to be used for generating thumbnails.
+func (c *Config) ThumbLibrary() string {
+	switch c.options.ThumbLibrary {
+	case thumb.LibVips, thumb.LibAuto:
+		return thumb.LibVips
+	default:
+		c.options.ThumbLibrary = clean.TypeLowerUnderscore(c.options.ThumbLibrary)
+
+		switch c.options.ThumbLibrary {
+		case "", thumb.LibAuto, "imaging", "imagine":
+			c.options.ThumbLibrary = thumb.LibVips
+			return thumb.LibVips
+		case "vips", "libvips":
+			c.options.ThumbLibrary = thumb.LibVips
+		default:
+			c.options.ThumbLibrary = thumb.LibVips
+		}
+
+		return thumb.LibVips
+	}
+}
+
+// ThumbColor returns the color space for thumbnails.
+func (c *Config) ThumbColor() thumb.ColorSpace {
+	return thumb.ParseColor(c.options.ThumbColor, c.ThumbLibrary())
+}
+
+// ThumbFilter returns the default thumbnail resample filter.
+func (c *Config) ThumbFilter() thumb.ResampleFilter {
+	return thumb.ParseFilter("", c.ThumbLibrary())
+}
+
+// ThumbUncached checks if on-demand thumbnail rendering is enabled (high memory and cpu usage).
+func (c *Config) ThumbUncached() bool {
+	return c.options.ThumbUncached
+}
+
+// ThumbSizeLimit returns the effective thumbnail serving limit in pixels.
+func (c *Config) ThumbSizeLimit() int {
+	if c.ThumbUncached() {
+		return c.ThumbSizeUncached()
+	}
+
+	return c.ThumbSizePrecached()
+}
+
+// ThumbSizePrecached returns the pre-cached thumbnail size limit in pixels (720-15360).
+func (c *Config) ThumbSizePrecached() int {
+	size := c.options.ThumbSize
+
+	if size < 720 {
+		size = 720 // Mobile, TV
+	} else if size > 15360 {
+		size = 15360 // 16K, e.g. for 360° media
+	}
+
+	return size
+}
+
+// ThumbSizeUncached returns the on-demand rendering size limit in pixels (720-15360).
+func (c *Config) ThumbSizeUncached() int {
+	limit := c.options.ThumbSizeUncached
+
+	if limit < 720 {
+		limit = 720 // Mobile, TV
+	} else if limit > 15360 {
+		limit = 15360 // 16K, e.g. for 360° media
+	}
+
+	if c.ThumbSizePrecached() > limit {
+		limit = c.ThumbSizePrecached()
+	}
+
+	return limit
+}
+
+// ThumbSizeFace returns the size limit in pixels (720-15360) for the source rendition rendered on
+// demand when a face crop would otherwise be taken from too few pixels, or zero when that is off.
+//
+// It bounds the picture a crop is drawn from, not the crop itself: a face crop is face.CropSize,
+// and an aligned model warps its own template out of the source, so neither changes with this. It
+// is independent of the other thumbnail options because indexing renders at most one rendition per
+// file it already reads, where the on-demand limit prices a page rendering hundreds at once.
+//
+// What it writes stays: indexing skips a size above the pre-generated limit, "photoprism thumbs"
+// never refreshes one and nothing purges by size, so a ceiling above the shipped 4096 buys a face
+// nothing measurable and leaves a rung per file that no other pass maintains.
+func (c *Config) ThumbSizeFace() int {
+	if c == nil {
+		return 0
+	}
+
+	size := c.options.ThumbSizeFace
+
+	switch {
+	case size <= 0:
+		return 0
+	case size < 720:
+		return 720 // Mobile, TV
+	case size > 15360:
+		return 15360 // 16K, e.g. for 360° media
+	}
+
+	return size
+}

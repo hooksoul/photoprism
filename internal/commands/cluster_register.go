@@ -1,0 +1,510 @@
+package commands
+
+import (
+	"bytes"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"net/url"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/urfave/cli/v2"
+
+	"github.com/photoprism/photoprism/internal/auth/acl"
+	"github.com/photoprism/photoprism/internal/config"
+	"github.com/photoprism/photoprism/internal/event"
+	"github.com/photoprism/photoprism/internal/service/cluster"
+	"github.com/photoprism/photoprism/internal/service/cluster/theme"
+	"github.com/photoprism/photoprism/pkg/clean"
+	"github.com/photoprism/photoprism/pkg/http/dns"
+	"github.com/photoprism/photoprism/pkg/http/header"
+	"github.com/photoprism/photoprism/pkg/log/status"
+	"github.com/photoprism/photoprism/pkg/rnd"
+	"github.com/photoprism/photoprism/pkg/txt/report"
+)
+
+// Supported cluster node register flags.
+var (
+	regNameFlag       = &cli.StringFlag{Name: "name", Usage: "node `NAME` (lowercase letters, digits, hyphens)"}
+	regRoleFlag       = &cli.StringFlag{Name: "role", Usage: "node `ROLE` (instance, service)", Value: "instance"}
+	regIntUrlFlag     = &cli.StringFlag{Name: "advertise-url", Usage: "internal service `URL`"}
+	regSiteUrlFlag    = &cli.StringFlag{Name: "site-url", Usage: "public site `URL` (https://...)"}
+	regAppNameFlag    = &LocalStringFlag{&cli.StringFlag{Name: "app-name", Usage: "override app `NAME` reported to the portal"}}
+	regAppVersionFlag = &cli.StringFlag{Name: "app-version", Usage: "override app `VERSION` reported to the portal"}
+	regLabelFlag      = &cli.StringSliceFlag{Name: "label", Usage: "`k=v` label (repeatable)"}
+	regRotateDatabase = &cli.BoolFlag{Name: "rotate", Usage: "rotates the node's database password"}
+	regRotateSec      = &cli.BoolFlag{Name: "rotate-secret", Usage: "rotates the node's client secret and revokes its other access tokens"}
+	regPortalURL      = &cli.StringFlag{Name: "portal-url", Usage: "Portal base `URL` (defaults to config)"}
+	regPortalTok      = &cli.StringFlag{Name: "join-token", Usage: "Portal access `TOKEN` (defaults to config)"}
+	regWriteConf      = &cli.BoolFlag{Name: "write-config", Usage: "persists returned secrets and DB settings to local config"}
+	regForceFlag      = &cli.BoolFlag{Name: "force", Aliases: []string{"f"}, Usage: "confirm actions that may overwrite/replace local data (e.g., --write-config)"}
+	regDryRun         = DryRunFlag("print derived values and payload without performing registration")
+)
+
+// ClusterRegisterCommand registers a node with the Portal via HTTP.
+// ClusterRegisterCommand wires the `cluster register` CLI entrypoint.
+var ClusterRegisterCommand = &cli.Command{
+	Name:  "register",
+	Usage: "Registers a node or updates its credentials within a cluster",
+	Flags: append([]cli.Flag{
+		regDryRun,
+		regNameFlag,
+		regRoleFlag,
+		regPortalURL,
+		regPortalTok,
+		regIntUrlFlag,
+		regSiteUrlFlag,
+		regAppNameFlag,
+		regAppVersionFlag,
+		regLabelFlag,
+		regRotateDatabase,
+		regRotateSec,
+		regWriteConf,
+		regForceFlag,
+	}, report.CliFlags...),
+	Action: clusterRegisterAction,
+}
+
+// clusterRegisterAction resolves CLI flags, builds the registration payload,
+// and calls the Portal's register endpoint with retry/backoff handling.
+func clusterRegisterAction(ctx *cli.Context) error {
+	return CallWithCoreDependencies(ctx, func(conf *config.Config) error {
+		// Resolve inputs
+		name := clean.DNSLabel(ctx.String("name"))
+		derivedName := false
+
+		if name == "" { // default from config if set
+			name = clean.DNSLabel(conf.NodeName())
+			if name != "" {
+				derivedName = true
+			}
+		}
+
+		if name == "" {
+			return cli.Exit(fmt.Errorf("node name is required (use --name or set node-name)"), 2)
+		}
+
+		nodeRole := cluster.NormalizeNodeRole(clean.TypeLowerDash(ctx.String("role")))
+		switch nodeRole {
+		case cluster.RoleInstance, cluster.RoleService:
+		default:
+			return cli.Exit(fmt.Errorf("invalid --role (must be instance or service)"), 2)
+		}
+
+		portalURL := ctx.String("portal-url")
+		derivedPortal := false
+		if portalURL == "" {
+			portalURL = conf.PortalUrl()
+			if portalURL != "" {
+				derivedPortal = true
+			}
+		}
+
+		// Derive advertise/site URLs when omitted.
+		advertise := ctx.String("advertise-url")
+		if advertise == "" {
+			advertise = conf.AdvertiseUrl()
+		}
+		site := strings.TrimSpace(ctx.String("site-url"))
+		if site == "" {
+			site = conf.SiteUrl()
+		}
+
+		overrideAppName := clean.TypeUnicode(ctx.String("app-name"))
+		overrideAppVersion := clean.TypeUnicode(ctx.String("app-version"))
+
+		defaultAppName := clean.TypeUnicode(conf.About())
+		defaultAppVersion := clean.TypeUnicode(conf.Version())
+
+		if overrideAppName == "" {
+			overrideAppName = defaultAppName
+		}
+		if overrideAppVersion == "" {
+			overrideAppVersion = defaultAppVersion
+		}
+
+		payload := cluster.RegisterRequest{
+			NodeName:       name,
+			NodeRole:       nodeRole,
+			Labels:         parseLabelSlice(ctx.StringSlice("label")),
+			AdvertiseUrl:   advertise,
+			RotateDatabase: ctx.Bool("rotate"),
+			RotateSecret:   ctx.Bool("rotate-secret"),
+			AppName:        overrideAppName,
+			AppVersion:     overrideAppVersion,
+		}
+
+		// If auto detection is allowed, rotate database only when the current node lacks configured credentials.
+		if !payload.RotateDatabase && conf.ShouldAutoRotateDatabase() {
+			payload.RotateDatabase = true
+		}
+
+		if site != "" {
+			payload.SiteUrl = site
+		}
+		if themeVersion, err := theme.DetectVersion(conf.ThemePath()); err == nil && themeVersion != "" {
+			payload.Theme = themeVersion
+		}
+		b := marshalRegisterRequest(payload)
+
+		// In dry-run, we allow empty portalURL (will print derived/empty values).
+		if ctx.Bool("dry-run") {
+			if ctx.Bool("json") {
+				out := struct {
+					PortalURL string                  `json:"PortalUrl"`
+					Payload   cluster.RegisterRequest `json:"Payload"`
+				}{PortalURL: portalURL, Payload: payload}
+				jb, _ := report.MarshalJSON(out)
+				fmt.Println(string(jb))
+			} else {
+				fmt.Printf("Portal URL: %s\n", portalURL)
+				fmt.Printf("Node Name:  %s\n", name)
+				if derivedPortal || derivedName || advertise == conf.AdvertiseUrl() {
+					fmt.Println("(derived defaults were used where flags were omitted)")
+				}
+				fmt.Printf("Advertise:  %s\n", advertise)
+				if payload.SiteUrl != "" {
+					fmt.Printf("Site URL:   %s\n", payload.SiteUrl)
+				}
+				if overrideAppName != "" {
+					fmt.Printf("App Name:   %s\n", overrideAppName)
+				}
+				if overrideAppVersion != "" {
+					fmt.Printf("App Version:%s\n", overrideAppVersion)
+				}
+				// Warn if non-HTTPS on public host; server will enforce too.
+				if warnInsecurePublicURL(advertise) {
+					fmt.Println("Warning: advertise-url is http for a public host; server may reject it (HTTPS required).")
+				}
+				if payload.SiteUrl != "" && warnInsecurePublicURL(payload.SiteUrl) {
+					fmt.Println("Warning: site-url is http for a public host; server may reject it (HTTPS required).")
+				}
+				// Single-line summary for quick operator scan
+				if payload.SiteUrl != "" {
+					fmt.Printf("Derived: portal=%s advertise=%s site=%s\n", portalURL, advertise, payload.SiteUrl)
+				} else {
+					fmt.Printf("Derived: portal=%s advertise=%s\n", portalURL, advertise)
+				}
+			}
+			return nil
+		}
+
+		// For actual registration, require portal URL and token.
+		if portalURL == "" {
+			return cli.Exit(fmt.Errorf("portal URL is required (use --portal-url or set portal-url)"), 2)
+		}
+
+		joinToken := ctx.String("join-token")
+
+		if joinToken == "" {
+			joinToken = conf.JoinToken()
+		}
+
+		token, err := clusterRegisterToken(conf, portalURL, joinToken, name)
+
+		if err != nil {
+			return cli.Exit(err, clusterTokenExitCode(err))
+		}
+
+		// POST with bounded backoff on 429
+		endpointUrl := stringsTrimRightSlash(portalURL) + "/api/v1/cluster/nodes/register"
+
+		var resp cluster.RegisterResponse
+		if err := postWithBackoff(endpointUrl, token, b, &resp); err != nil {
+			var httpErr *httpError
+			if errors.As(err, &httpErr) && httpErr.Status == http.StatusTooManyRequests {
+				return cli.Exit(fmt.Errorf("portal rate-limited registration attempts"), 6)
+			}
+			// Map common errors
+			if errors.As(err, &httpErr) {
+				switch httpErr.Status {
+				case http.StatusUnauthorized, http.StatusForbidden:
+					return cli.Exit(fmt.Errorf("%s", httpErr.Error()), 4)
+				case http.StatusConflict:
+					return cli.Exit(fmt.Errorf("%s", httpErr.Error()), 5)
+				case http.StatusBadRequest:
+					return cli.Exit(fmt.Errorf("%s", httpErr.Error()), 2)
+				case http.StatusNotFound:
+					return cli.Exit(fmt.Errorf("%s", httpErr.Error()), 3)
+				}
+			}
+			return cli.Exit(err, 1)
+		}
+
+		// Output
+		if ctx.Bool("json") {
+			jb, _ := report.MarshalJSON(resp)
+			fmt.Println(string(jb))
+		} else {
+			// Human-readable: node row and credentials if present (UUID first as primary identifier)
+			cols := []string{"UUID", "ClientID", "Name", "Role"}
+			row := []string{resp.Node.UUID, resp.Node.ClientID, resp.Node.Name, resp.Node.Role}
+
+			if resp.Database.Driver != "" {
+				cols = append(cols, "DB Driver")
+				row = append(row, resp.Database.Driver)
+			}
+			if resp.Database.Name != "" {
+				cols = append(cols, "DB Name")
+				row = append(row, resp.Database.Name)
+			}
+			if resp.Database.User != "" {
+				cols = append(cols, "DB User")
+				row = append(row, resp.Database.User)
+			}
+			if resp.Database.Host != "" {
+				cols = append(cols, "Host")
+				row = append(row, resp.Database.Host)
+			}
+			if resp.Database.Port > 0 {
+				cols = append(cols, "Port")
+				row = append(row, strconv.Itoa(resp.Database.Port))
+			}
+
+			rows := [][]string{row}
+			out, _ := report.RenderFormat(rows, cols, report.CliFormat(ctx))
+			fmt.Printf("\n%s\n", out)
+
+			// Secrets/credentials block if any
+			// Show secrets in up to two tables, then print DSN if present
+			if (resp.Secrets != nil && resp.Secrets.ClientSecret != "") || resp.Database.Password != "" {
+				fmt.Println("PLEASE WRITE DOWN THE FOLLOWING CREDENTIALS; THEY WILL NOT BE SHOWN AGAIN:")
+				if resp.Secrets != nil && resp.Secrets.ClientSecret != "" {
+					secretTable, _ := report.RenderFormat([][]string{{resp.Secrets.ClientSecret}}, []string{"Node Client Secret"}, report.CliFormat(ctx))
+					fmt.Printf("\n%s\n", secretTable)
+				}
+				if resp.Database.Password != "" {
+					dbTable, _ := report.RenderFormat([][]string{{resp.Database.User, resp.Database.Password}}, []string{"DB User", "DB Password"}, report.CliFormat(ctx))
+					fmt.Printf("\n%s\n", dbTable)
+				}
+				if resp.Database.DSN != "" {
+					fmt.Printf("DSN: %s\n", clean.Display(resp.Database.DSN))
+				}
+			}
+		}
+
+		nodeID := resp.Node.UUID
+		if nodeID == "" {
+			nodeID = resp.Node.Name
+		}
+
+		who := clusterAuditWho(ctx, conf)
+		event.AuditInfo(append(who,
+			string(acl.ResourceCluster),
+			"register node", "%s",
+			status.Succeeded,
+		), clean.Log(nodeID))
+
+		// Optional persistence. Explicitly rotated credentials replace the password the node uses, so the
+		// command fails when the node will not use the new ones.
+		if ctx.Bool("write-config") {
+			refused, err := persistRegisterResponse(conf, &resp)
+			rotated := ctx.Bool("rotate") && !resp.Database.Incomplete && (resp.Database.Password != "" || resp.Database.DSN != "")
+
+			switch {
+			case err != nil && rotated:
+				return cli.Exit(fmt.Errorf("the portal changed the database password, but the new credentials could not be saved (%s); save the node credentials shown above", clean.Error(err)), 1)
+			case err != nil:
+				return err
+			case rotated && refused:
+				return cli.Exit(errors.New("the portal changed the database password, but the new credentials could not be saved; save the node credentials shown above"), 1)
+			case rotated:
+				if override := conf.DatabaseDSNOverride(); override != "" {
+					return cli.Exit(fmt.Errorf("the portal changed the database password, but %s sets a database dsn that takes precedence over the saved credentials; set the node credentials shown above there", clean.Log(override)), 1)
+				}
+			}
+		}
+
+		if resp.Database.Incomplete && ctx.Bool("write-config") {
+			return cli.Exit(errors.New("the portal could not complete database provisioning; rotate the database credentials once this has been resolved"), 1)
+		} else if resp.Database.Incomplete {
+			return cli.Exit(errors.New("the portal could not complete database provisioning; save the node credentials shown above, then rotate the database credentials once this has been resolved"), 1)
+		}
+
+		return nil
+	})
+}
+
+// HTTP helpers and backoff
+
+// registerErrorBodyMax and registerResponseMax bound how much of a register response is read.
+const (
+	registerErrorBodyMax = 4096
+	registerResponseMax  = 1 << 20
+)
+
+type httpError struct {
+	Status int
+	Body   string
+}
+
+func (e *httpError) Error() string { return fmt.Sprintf("http %d: %s", e.Status, e.Body) }
+
+// postWithBackoff executes the register HTTP POST with bounded retries for 429 responses.
+func postWithBackoff(url, token string, payload []byte, out any) error {
+	// backoff: 500ms -> max ~8s, 6 attempts with jitter
+	delay := 500 * time.Millisecond
+	for range 6 {
+		// url is a register endpoint derived from the configured portal URL for this CLI command.
+		req, _ := http.NewRequest(http.MethodPost, url, bytes.NewReader(payload)) //nolint:gosec
+		header.SetAuthorization(req, token)
+		req.Header.Set(header.ContentType, "application/json")
+
+		client := &http.Client{Timeout: cluster.BootstrapRegisterTimeout}
+		resp, err := client.Do(req) //nolint:gosec
+		if err != nil {
+			return err
+		}
+
+		retry, err := func() (bool, error) {
+			defer func() {
+				if closeErr := resp.Body.Close(); closeErr != nil {
+					log.Debugf("cluster: %s (close register response body)", clean.ErrorFull(closeErr))
+				}
+			}()
+
+			if resp.StatusCode == http.StatusTooManyRequests {
+				// backoff and retry
+				return true, nil
+			}
+
+			if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+				b, _ := io.ReadAll(io.LimitReader(resp.Body, registerErrorBodyMax))
+				return false, &httpError{Status: resp.StatusCode, Body: string(b)}
+			}
+
+			dec := json.NewDecoder(io.LimitReader(resp.Body, registerResponseMax))
+			return false, dec.Decode(out)
+		}()
+
+		if err != nil {
+			return err
+		} else if retry {
+			time.Sleep(jitter(delay, 0.25))
+			if delay < 8*time.Second {
+				delay *= 2
+			}
+			continue
+		}
+
+		return nil
+	}
+	return &httpError{Status: http.StatusTooManyRequests, Body: "rate limited"}
+}
+
+// jitter applies +/- jitter to a duration to avoid retry stampedes.
+func jitter(d time.Duration, frac float64) time.Duration {
+	// simple +/- jitter
+	n := time.Duration(float64(d) * (1 + (randFloat()*2-1)*frac))
+	if n <= 0 {
+		return d
+	}
+	return n
+}
+
+// randFloat returns a simple pseudo-random float in [0,1) without touching math/rand global state.
+func randFloat() float64 { return float64(time.Now().UnixNano()%1000) / 1000.0 }
+
+// stringsTrimRightSlash removes trailing slashes to build consistent endpoints.
+func stringsTrimRightSlash(s string) string {
+	for len(s) > 0 && s[len(s)-1] == '/' {
+		s = s[:len(s)-1]
+	}
+	return s
+}
+
+// warnInsecurePublicURL returns true if the URL is HTTP on a non-local host.
+func warnInsecurePublicURL(u string) bool {
+	parsed, err := url.Parse(u)
+	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
+		return false
+	}
+	if parsed.Scheme != "http" {
+		return false
+	}
+	h := parsed.Hostname()
+	if dns.IsLoopbackHost(h) {
+		return false
+	}
+	return true
+}
+
+// parseLabelSlice converts repeated k=v CLI inputs into a map.
+func parseLabelSlice(labels []string) map[string]string {
+	if len(labels) == 0 {
+		return nil
+	}
+	m := make(map[string]string)
+	for _, kv := range labels {
+		if i := bytes.IndexByte([]byte(kv), '='); i > 0 && i < len(kv)-1 {
+			k := kv[:i]
+			v := kv[i+1:]
+			m[k] = v
+		}
+	}
+	if len(m) == 0 {
+		return nil
+	}
+	return m
+}
+
+// persistRegisterResponse writes returned secrets/DB details into local config when requested, and reports
+// whether database credentials of the response were refused.
+func persistRegisterResponse(conf *config.Config, resp *cluster.RegisterResponse) (refused bool, err error) {
+	updates := cluster.OptionsUpdate{}
+
+	if rnd.IsUUID(resp.UUID) {
+		updates.SetClusterUUID(resp.UUID)
+	}
+
+	if cidr := strings.TrimSpace(resp.ClusterCIDR); cidr != "" {
+		updates.SetClusterCIDR(cidr)
+	}
+
+	if resp.Node.ClientID != "" {
+		updates.SetNodeClientID(resp.Node.ClientID)
+	}
+
+	if rnd.IsUUID(resp.Node.UUID) {
+		updates.SetNodeUUID(resp.Node.UUID)
+	}
+
+	if jwksUrl := strings.TrimSpace(resp.JWKSUrl); jwksUrl != "" {
+		updates.SetJWKSUrl(jwksUrl)
+	}
+
+	// Node client secret is persisted only via config helper.
+	if resp.Secrets != nil && resp.Secrets.ClientSecret != "" {
+		if fileName, saveErr := conf.SaveNodeClientSecret(resp.Secrets.ClientSecret); saveErr != nil {
+			return false, saveErr
+		} else if fileName != "" {
+			log.Infof("wrote node client secret to %s", clean.Log(fileName))
+		}
+	}
+
+	// DB settings (MySQL/MariaDB only), which replace a stored DSN and are ignored as a whole if the
+	// server address is unusable. Credentials of a complete response that are not saved count as refused.
+	credentials := !resp.Database.Incomplete && (resp.Database.Password != "" || resp.Database.DSN != "")
+
+	if server, ok := updates.SetDatabase(resp.Database); !ok {
+		event.SystemWarn([]string{"cluster", "ignored database settings with unusable server address %s"}, clean.Log(server))
+	} else if credentials && !updates.HasDatabaseUpdate() {
+		event.SystemWarn([]string{"cluster", "ignored database settings without name, user, or password"})
+	}
+
+	// SaveClusterOptionsUpdate skips settings it refuses with a warning.
+	refused = credentials && (!updates.HasDatabaseUpdate() || config.ValidateClusterDatabaseUpdate(updates) != nil)
+
+	if !updates.IsZero() {
+		if _, err = conf.SaveClusterOptionsUpdate(updates); err != nil {
+			return refused, err
+		}
+		log.Infof("updated options.yml with cluster registration settings for node %s", clean.LogQuote(resp.Node.Name))
+	}
+
+	return refused, nil
+}

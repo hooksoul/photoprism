@@ -1,64 +1,55 @@
-# Dockerfiles and Docker Compose Examples
+## Dockerfiles for Development & Production
 
-[**Dockerfiles**](https://docs.docker.com/engine/reference/builder/) are text documents that contain all commands a user
-could call in a terminal to assemble an application image.
+[**Dockerfiles**](https://docs.docker.com/engine/reference/builder/) are text documents that contain all commands a user could call in a terminal to assemble an application image.
 
-[**Docker Compose**](https://docs.docker.com/compose/) uses [human-friendly YAML files](https://docs.photoprism.app/developer-guide/technologies/yaml/)
-to configure all application services so you can easily start them with a single command.
+[**Docker Compose**](https://docs.docker.com/compose/) uses [human-friendly YAML files](https://docs.photoprism.app/developer-guide/technologies/yaml/) to configure all application services so you can easily start them with a single command.
 
-## Why are we using Docker? ##
+See our [Getting Started FAQ](https://docs.photoprism.app/getting-started/faq/#how-can-i-install-photoprism-without-docker) for alternative installation methods, for example using the [*tar.gz* packages](https://github.com/photoprism/photoprism/blob/develop/setup/pkg/linux/README.md) we provide for download at [dl.photoprism.app/pkg/linux/](https://dl.photoprism.app/pkg/linux/README.html).
 
-Containers are nothing new; [Solaris Zones](https://en.wikipedia.org/wiki/Solaris_Containers) have been around for
-about 15 years, first released publicly in 2004. The chroot system call was introduced during
-[development of Version 7 Unix in 1979](https://en.wikipedia.org/wiki/Chroot). It is used ever since for hosting
-applications exposed to the public Internet.
+### What Are the Benefits of Using Docker?
 
-Modern Linux containers are an incremental enhancement. A main advantage of Docker is that application images
-can be easily made available to users via Internet. It provides a common standard across most operating
-systems and devices, which saves our team a lot of time that we can then spend [more effectively](https://docs.photoprism.app/developer-guide/issues/#effectiveness-efficiency), for example,
-providing support and developing one of the many features that users are waiting for.
+**(1) Docker uses standard features of the Linux kernel.** Containers are nothing new; [Solaris Zones](https://en.wikipedia.org/wiki/Solaris_Containers) were released about 20 years ago and the chroot system call was introduced during [development of Version 7 Unix in 1979](https://en.wikipedia.org/wiki/Chroot). It is used ever since for hosting applications exposed to the public Internet. Modern Linux containers are an incremental improvement of this, based on standard functionality that is part of the kernel.
 
-Human-readable and versioned Dockerfiles as part of our public source code also help avoid "works for me" moments and
-other unwelcome surprises by enabling teams to have the exact same environment everywhere in
-[development](https://github.com/photoprism/photoprism/blob/develop/docker/develop/bookworm/Dockerfile), staging,
-and [production](https://github.com/photoprism/photoprism/blob/develop/docker/photoprism/bookworm/Dockerfile).
+**(2) Docker saves time through simplified deployment and testing.** A main advantage of Docker is that application images can be [easily made available](https://hub.docker.com/r/photoprism/photoprism) to users via Internet. It provides a common standard across most operating systems and devices, which saves our team a lot of time that we can then spend [more effectively](https://docs.photoprism.app/developer-guide/code-quality/#effectiveness-efficiency), for example, providing support and developing one of the many features that users are waiting for.
 
-Last but not least, virtually all file format parsers have vulnerabilities that just haven't been discovered yet.
-This is a known risk that can affect you even if your computer is not directly connected to the Internet.
-Running apps in a container with limited host access is an easy way to improve security without
-compromising performance and usability.
+**(3) Dockerfiles are part of the source code repository.** [Human-readable](https://docs.docker.com/engine/reference/builder/) and [versioned Dockerfiles](https://github.com/photoprism/photoprism/tree/develop/docker) that are part of our public source code help avoid "works for me" moments and other unwelcome surprises by enabling us to have the exact [same environment](https://docs.photoprism.app/developer-guide/setup/) everywhere in [development](https://github.com/photoprism/photoprism/tree/develop/docker/develop), [staging, and production](https://github.com/photoprism/photoprism/tree/develop/docker/photoprism).
 
-## What about Virtual Machines? ##
+**(4) Running applications in containers is more secure.** Last but not least, virtually all file format parsers have vulnerabilities that just haven't been discovered yet. This is a known risk that can affect you even if your computer is not directly connected to the Internet. Running apps in a container with limited host access is an easy way to improve security without compromising performance and usability.
 
-A virtual machine running its own operating system provides more security, but typically has side effects
-such as lower performance and more difficult handling. You can also run Docker in a VM to get the best of
-both worlds. It's essentially what happens when you run dockerized applications on [virtual cloud servers](https://docs.photoprism.app/getting-started/cloud/digitalocean/)
-and operating systems other than Linux.
+### Why Not Use Virtual Machines Instead?
 
-## Alternatives ##
+A virtual machine with a dedicated operating system environment provides even more security, but usually has side effects such as lower performance and more difficult handling. Using a VM, however, doesn't prevent you from running containerized apps to get the best of both worlds. This is essentially what happens when you install Docker on [virtual cloud servers](https://docs.photoprism.app/getting-started/cloud/digitalocean/) and operating systems other than Linux.
 
-### Building From Source ###
+### Directory Overview
 
-You can build and install PhotoPrism from the publicly available [source code](https://docs.photoprism.app/developer-guide/setup/):
+| Directory     | Purpose                                                                                                                                      |
+|---------------|----------------------------------------------------------------------------------------------------------------------------------------------|
+| `develop/`    | Development images used as the base for the production image and by contributors to build and test PhotoPrism in a reproducible environment. |
+| `photoprism/` | Production (runtime) images published as [`photoprism/photoprism`](https://hub.docker.com/r/photoprism/photoprism) on Docker Hub.            |
+| `tensorflow/` | Helper image used to build and package the TensorFlow C library shipped with PhotoPrism.                                                     |
+| `demo/`       | Build context for the public [demo site](https://demo.photoprism.app/), including Traefik and job configuration.                             |
+| `ddns/`       | Minimal image for the Dynamic DNS updater used by our hosted services.                                                                       |
+| `dummy/`      | Test doubles for OIDC and WebDAV used by acceptance tests and local development.                                                             |
 
-```bash
-git clone https://github.com/photoprism/photoprism.git
-cd photoprism
-make all install DESTDIR=/opt/photoprism
-```
+### Which Image Should I Use?
 
-Missing build dependencies must be installed manually as shown in our human-readable and versioned
-[Dockerfile](https://github.com/photoprism/photoprism/blob/develop/docker/develop/Dockerfile). You often don't
-need to use the exact same versions, so it's possible to replace packages with what is available in your environment.
+> **Use the latest image whenever possible.** The base image used by the top-level [`Dockerfile`](../Dockerfile) is recommended for development. Currently, this is Ubuntu 26.10 ("Stonking Stingray"), i.e. `photoprism/develop:stonking`, which you can override with `DOCKERFILE_IMAGE_TAG` in your `.env` file. The CE images, i.e. `photoprism/photoprism:ce` and `photoprism/photoprism:preview-ce`, are built on the same base.
 
-Please note that we do not have the resources to provide private users with dependencies and
-[TensorFlow libraries](https://dl.photoprism.app/tensorflow/) for their personal environments. We recommend giving
-Docker a try if you use Linux as it saves developers a lot of time when building, testing, and deploying complex
-applications like PhotoPrism. It also effectively helps avoid "works for me" moments and missing dependencies.
+New container deployments should pull the `:latest` tag (or an explicit current release tag) from Docker Hub. Contributors setting up a local development environment should follow the [Developer Guide](https://docs.photoprism.app/developer-guide/setup/), which is kept in sync with the top-level `Dockerfile` and `compose.yaml`.
 
-### Installation Packages ###
+### Legacy Images ("Use at Your Own Risk")
 
-An [unofficial port](https://docs.photoprism.app/getting-started/freebsd/) is available for FreeBSD / FreeNAS users.
-You are invited to contribute by [building and testing standalone packages](https://docs.photoprism.app/developer-guide/) for Linux distributions and other operating systems.
+The `develop/` and `photoprism/` directories also contain Dockerfiles for a number of **older Linux distributions**, for example Ubuntu *Jammy*, *Noble*, *Oracular*, *Plucky*, *Questing*, *Impish*, *Lunar*, *Mantic* and Debian *Buster*, *Bullseye*, *Bookworm*.
 
-Updates are [released several times a month](https://docs.photoprism.app/release-notes/), so maintaining the long list of dependencies for additional environments would currently consume too many of [our resources](https://link.photoprism.app/membership).
+These files are **kept for documentation and reference purposes only**:
+
+- Their base images, system packages, and bundled dependencies (for example `libvips`, `libheif`, `ffmpeg`, `exiftool`, `darktable`) are typically outdated and may contain unpatched security vulnerabilities.
+- We **no longer build, publish, or test** these images as part of our regular release process.
+- Features and bug fixes added to the current image are not backported.
+- Compatibility with current Go dependencies (notably C bindings such as [`govips`](https://github.com/davidbyttow/govips), [`onnxruntime_go`](https://github.com/yalue/onnxruntime_go), and the TensorFlow C API) is **not guaranteed** — a successful build on an older base does not imply a working runtime.
+
+If you still need to build one of these images, consider it **"use at your own risk"**: you may need to upgrade individual system packages (for example pulling `libvips` from a backport PPA, as `scripts/dist/install-libvips.sh` does for Ubuntu Jammy), adjust pinned Go dependencies, or patch the Dockerfile to match the current upstream. Please do not open issues for problems that only affect legacy images.
+
+One exception to the note above: every image that installs ImageMagick also installs our `scripts/dist/convert/policy.xml`, at `/etc/ImageMagick-6/` or `/etc/ImageMagick-7/` depending on the version its base ships. This keeps the Dockerfiles consistent and stops a revived base from silently losing PDF and vector previews to a restrictive distribution default, but it is not a claim that these images are maintained — none of them is built or tested, so the setting is unverified there.
+
+For questions about supported environments and current system requirements, see the [System Requirements](https://docs.photoprism.app/getting-started/#system-requirements) documentation.

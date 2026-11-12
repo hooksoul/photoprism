@@ -1,14 +1,23 @@
 package config
 
 import (
+	"math/bits"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+
+	"github.com/photoprism/photoprism/internal/ai/vision"
+	"github.com/photoprism/photoprism/internal/service/cluster"
 )
 
-func TestConfig_DisableBackups(t *testing.T) {
+func TestConfig_DisableFrontend(t *testing.T) {
 	c := NewConfig(CliTestContext())
-	assert.False(t, c.DisableBackups())
+	assert.False(t, c.DisableFrontend())
+}
+
+func TestConfig_DisableSettings(t *testing.T) {
+	c := NewConfig(CliTestContext())
+	assert.False(t, c.DisableSettings())
 }
 
 func TestConfig_DisableWebDAV(t *testing.T) {
@@ -49,6 +58,36 @@ func TestConfig_DisableWebDAV(t *testing.T) {
 	c.options.Demo = false
 
 	assert.False(t, c.DisableWebDAV())
+
+	c.options.Edition = Portal
+	c.options.NodeRole = cluster.RolePortal
+	assert.True(t, c.DisableWebDAV())
+}
+
+func TestConfig_DisableMCP(t *testing.T) {
+	c := NewConfig(CliTestContext())
+
+	// Option defaults to false so the MCP endpoint is registered.
+	assert.False(t, c.DisableMCP())
+
+	c.options.DisableMCP = true
+	assert.True(t, c.DisableMCP())
+
+	c.options.DisableMCP = false
+	assert.False(t, c.DisableMCP())
+}
+
+func TestConfig_DisableAppPasswords(t *testing.T) {
+	c := NewConfig(CliTestContext())
+
+	// Backed by the AppPasswords feature flag, which defaults to enabled.
+	assert.False(t, c.DisableAppPasswords())
+
+	c.Settings().Features.AppPasswords = false
+	assert.True(t, c.DisableAppPasswords())
+
+	c.Settings().Features.AppPasswords = true
+	assert.False(t, c.DisableAppPasswords())
 }
 
 func TestConfig_DisableExifTool(t *testing.T) {
@@ -74,9 +113,22 @@ func TestConfig_DisableFaces(t *testing.T) {
 	assert.True(t, c.DisableFaces())
 	c.options.DisableFaces = false
 	c.options.DisableTensorFlow = true
-	assert.True(t, c.DisableFaces())
+	assert.False(t, c.DisableFaces())
 	c.options.DisableTensorFlow = false
 	assert.False(t, c.DisableFaces())
+}
+
+func TestConfig_XMPFaces(t *testing.T) {
+	t.Run("Disabled", func(t *testing.T) {
+		c := NewConfig(CliTestContext())
+		assert.False(t, c.XMPFaces())
+	})
+	t.Run("Enabled", func(t *testing.T) {
+		ctx := CliTestContext()
+		assert.NoError(t, ctx.Set("xmp-faces", "true"))
+		c := NewConfig(ctx)
+		assert.True(t, c.XMPFaces())
+	})
 }
 
 func TestConfig_DisableClassification(t *testing.T) {
@@ -86,7 +138,7 @@ func TestConfig_DisableClassification(t *testing.T) {
 	assert.True(t, c.DisableClassification())
 	c.options.DisableClassification = false
 	c.options.DisableTensorFlow = true
-	assert.True(t, c.DisableClassification())
+	assert.False(t, c.DisableClassification())
 	c.options.DisableTensorFlow = false
 	assert.False(t, c.DisableClassification())
 }
@@ -136,6 +188,12 @@ func TestConfig_DisableImageMagick(t *testing.T) {
 	assert.Equal(t, missing, c.DisableImageMagick())
 }
 
+func TestConfig_DisableVips(t *testing.T) {
+	c := NewConfig(CliTestContext())
+
+	assert.Equal(t, bits.UintSize < 64, c.DisableVips())
+}
+
 func TestConfig_DisableSips(t *testing.T) {
 	c := NewConfig(CliTestContext())
 	missing := c.SipsBin() == ""
@@ -153,6 +211,16 @@ func TestConfig_DisableVector(t *testing.T) {
 	assert.Equal(t, c.Sponsor(), !c.DisableVectors())
 	c.options.DisableVectors = true
 	assert.True(t, c.DisableVectors())
+	c.options.DisableVectors = false
+	assert.Equal(t, c.Sponsor(), !c.DisableVectors())
+}
+
+func TestConfig_DisableRsvgConvert(t *testing.T) {
+	c := NewConfig(CliTestContext())
+
+	assert.Equal(t, c.Sponsor(), !c.DisableRsvgConvert())
+	c.options.DisableVectors = true
+	assert.True(t, c.DisableRsvgConvert())
 	c.options.DisableVectors = false
 	assert.Equal(t, c.Sponsor(), !c.DisableVectors())
 }
@@ -175,4 +243,13 @@ func TestConfig_DisableRaw(t *testing.T) {
 	assert.False(t, c.DisableRaw())
 	assert.False(t, c.DisableDarktable())
 	assert.False(t, c.DisableRawTherapee())
+}
+
+func withVisionConfig(t *testing.T, cfg *vision.ConfigValues) {
+	t.Helper()
+	prev := vision.Config
+	vision.Config = cfg
+	t.Cleanup(func() {
+		vision.Config = prev
+	})
 }

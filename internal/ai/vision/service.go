@@ -1,0 +1,214 @@
+package vision
+
+import (
+	"net/url"
+	"strings"
+
+	"github.com/photoprism/photoprism/pkg/http/scheme"
+)
+
+// Service represents a remote computer vision service configuration.
+type Service struct {
+	Uri            string    `yaml:"Uri,omitempty" json:"uri"`
+	Method         string    `yaml:"Method,omitempty" json:"method"`
+	Model          string    `yaml:"Model,omitempty" json:"model,omitempty"` // Optional endpoint-specific model override.
+	Username       string    `yaml:"Username,omitempty" json:"-"`            // Optional basic auth user injected into Endpoint URLs.
+	Password       string    `yaml:"Password,omitempty" json:"-"`
+	Key            string    `yaml:"Key,omitempty" json:"-"`
+	Org            string    `yaml:"Org,omitempty" json:"org,omitempty"`         // Optional organization header (e.g. OpenAI).
+	Project        string    `yaml:"Project,omitempty" json:"project,omitempty"` // Optional project header (e.g. OpenAI).
+	Tier           string    `yaml:"Tier,omitempty" json:"tier,omitempty"`       // Optional service tier sent as service_tier in the request body (OpenAI, e.g. "flex").
+	Think          string    `yaml:"Think,omitempty" json:"think,omitempty"`     // Optional reasoning hint for compatible engines (e.g. Ollama, GPT-OSS); defaults to "false" for the Ollama engine.
+	FileScheme     string    `yaml:"FileScheme,omitempty" json:"fileScheme,omitempty"`
+	RequestFormat  ApiFormat `yaml:"RequestFormat,omitempty" json:"requestFormat,omitempty"`
+	ResponseFormat ApiFormat `yaml:"ResponseFormat,omitempty" json:"responseFormat,omitempty"`
+	Disabled       bool      `yaml:"Disabled,omitempty" json:"disabled,omitempty"`
+}
+
+// UriUnresolved reports whether the service has no endpoint although it is meant to use one: its Uri
+// expands to nothing, or it has no Uri and a request format that the Vision API does not accept.
+func (m *Service) UriUnresolved() bool {
+	if m == nil || m.Disabled {
+		return false
+	} else if strings.TrimSpace(m.Uri) == "" {
+		return m.UriMissing()
+	}
+
+	uri, _ := m.Endpoint()
+
+	return uri == ""
+}
+
+// UriMissing reports whether the service has no Uri although its request format is not accepted by the
+// Vision API, so its requests cannot be sent to the shared service.
+func (m *Service) UriMissing() bool {
+	if m == nil || m.Disabled || strings.TrimSpace(m.Uri) != "" {
+		return false
+	}
+
+	switch strings.ToLower(strings.TrimSpace(m.RequestFormat)) {
+	case "", ApiFormatVision, ApiFormatImages, ApiFormatUrl:
+		return false
+	default:
+		return true
+	}
+}
+
+// Endpoint returns the remote service request method and endpoint URL, if any. The URI expands only
+// variables whose names end in _URL, _URI, or _HOST, see expandUriEnv.
+func (m *Service) Endpoint() (uri, method string) {
+	if m.Disabled || strings.TrimSpace(m.Uri) == "" {
+		return "", ""
+	}
+
+	// A refused variable leaves the URI without a service rather than with a partial value.
+	expanded, refused := expandUriEnv(m.Uri)
+
+	if len(refused) > 0 {
+		warnRefusedEnv("Service.Uri", m.Uri, refused, uriEnvSuffixes)
+		return "", ""
+	} else if uri = strings.TrimSpace(expanded); uri == "" || strings.Contains(uri, "${") {
+		return "", ""
+	}
+
+	if m.Method != "" {
+		method = m.Method
+	} else {
+		method = ServiceMethod
+	}
+
+	if username, password := m.BasicAuth(); username != "" || password != "" {
+		if parsed, err := url.Parse(uri); err == nil {
+			if parsed.User == nil {
+				switch {
+				case username != "" && password != "":
+					parsed.User = url.UserPassword(username, password)
+				case username != "":
+					parsed.User = url.User(username)
+				}
+
+				if parsed.User != nil {
+					uri = parsed.String()
+				}
+			}
+		}
+	}
+
+	return uri, method
+}
+
+// GetModel returns the model identifier override for the endpoint with variables expanded, or an empty string.
+// It expands only variables whose names end in _MODEL; Model.GetModel sanitizes the result once a tag is split off.
+func (m *Service) GetModel() string {
+	if m.Disabled {
+		return ""
+	}
+
+	expanded, refused := expandEnvSuffix(m.Model, modelEnvSuffixes)
+
+	if len(refused) > 0 {
+		warnRefusedEnv("Service.Model", m.Model, refused, modelEnvSuffixes)
+	}
+
+	if !hasModelId(expanded) {
+		return ""
+	}
+
+	return strings.TrimSpace(expanded)
+}
+
+// EndpointKey returns the access token belonging to the remote service endpoint, if any.
+func (m *Service) EndpointKey() string {
+	if m.Disabled {
+		return ""
+	}
+
+	ensureEnv()
+
+	return strings.TrimSpace(expandEnv(m.Key))
+}
+
+// EndpointOrg returns the organization identifier for the endpoint, if any.
+func (m *Service) EndpointOrg() string {
+	if m.Disabled {
+		return ""
+	}
+
+	ensureEnv()
+
+	return strings.TrimSpace(expandEnv(m.Org))
+}
+
+// EndpointProject returns the project identifier for the endpoint, if any.
+func (m *Service) EndpointProject() string {
+	if m.Disabled {
+		return ""
+	}
+
+	ensureEnv()
+
+	return strings.TrimSpace(expandEnv(m.Project))
+}
+
+// EndpointTier returns the optional service tier for the endpoint, if any.
+func (m *Service) EndpointTier() string {
+	if m.Disabled {
+		return ""
+	}
+
+	ensureEnv()
+
+	return strings.TrimSpace(expandEnv(m.Tier))
+}
+
+// EndpointThink returns the optional thinking/reasoning setting for the endpoint, if any.
+func (m *Service) EndpointThink() string {
+	if m.Disabled {
+		return ""
+	}
+
+	ensureEnv()
+
+	return strings.TrimSpace(expandEnv(m.Think))
+}
+
+// BasicAuth returns the username and password for basic authentication.
+func (m *Service) BasicAuth() (username, password string) {
+	ensureEnv()
+	username = strings.TrimSpace(expandEnv(m.Username))
+	password = strings.TrimSpace(expandEnv(m.Password))
+	return username, password
+}
+
+// EndpointFileScheme returns the endpoint API file scheme type.
+func (m *Service) EndpointFileScheme() scheme.Type {
+	if m.Disabled {
+		return ""
+	} else if m.FileScheme == "" {
+		return ServiceFileScheme
+	}
+
+	return m.FileScheme
+}
+
+// EndpointRequestFormat returns the endpoint API request format.
+func (m *Service) EndpointRequestFormat() ApiFormat {
+	if m.Disabled {
+		return ""
+	} else if m.RequestFormat == "" {
+		return ApiFormatVision
+	}
+
+	return m.RequestFormat
+}
+
+// EndpointResponseFormat returns the endpoint API response format.
+func (m *Service) EndpointResponseFormat() ApiFormat {
+	if m.Disabled {
+		return ""
+	} else if m.ResponseFormat == "" {
+		return ApiFormatVision
+	}
+
+	return m.ResponseFormat
+}

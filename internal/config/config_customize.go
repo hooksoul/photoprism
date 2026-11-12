@@ -1,23 +1,17 @@
 package config
 
 import (
+	"net/url"
 	"path"
 	"path/filepath"
 	"strings"
+	"time"
 
-	"github.com/photoprism/photoprism/internal/i18n"
 	"github.com/photoprism/photoprism/pkg/clean"
 	"github.com/photoprism/photoprism/pkg/fs"
+	"github.com/photoprism/photoprism/pkg/i18n"
+	"github.com/photoprism/photoprism/pkg/time/tz"
 )
-
-// DefaultTheme returns the default user interface theme name.
-func (c *Config) DefaultTheme() string {
-	if c.options.DefaultTheme == "" || c.NoSponsor() {
-		return "default"
-	}
-
-	return c.options.DefaultTheme
-}
 
 // DefaultLocale returns the default user interface language locale name.
 func (c *Config) DefaultLocale() string {
@@ -26,6 +20,75 @@ func (c *Config) DefaultLocale() string {
 	}
 
 	return c.options.DefaultLocale
+}
+
+// DefaultTimezone returns the default time zone, e.g. for scheduling backups
+func (c *Config) DefaultTimezone() *time.Location {
+	if c.options.DefaultTimezone == "" {
+		return tz.TimeLocal
+	}
+
+	// Returns time zone if a valid identifier name was provided and UTC otherwise.
+	if timeZone, err := time.LoadLocation(c.options.DefaultTimezone); err != nil || timeZone == nil {
+		return tz.TimeLocal
+	} else {
+		return timeZone
+	}
+}
+
+// DefaultTheme returns the default user interface theme name.
+func (c *Config) DefaultTheme() string {
+	if c.options.DefaultTheme == "" {
+		return "default"
+	}
+
+	return c.options.DefaultTheme
+}
+
+// ThemeUrl returns the URL for downloading and installing a theme if none is installed.
+func (c *Config) ThemeUrl() string {
+	return sanitizeThemeURL(c.options.ThemeUrl)
+}
+
+// ThemeUrlRedacted returns the sanitized theme URL with sensitive user info masked.
+func (c *Config) ThemeUrlRedacted() string {
+	return clean.UriRedacted(c.ThemeUrl())
+}
+
+// SetThemeUrl sets the URL for downloading and installing a theme if none is installed.
+func (c *Config) SetThemeUrl(u string) *Config {
+	c.options.ThemeUrl = sanitizeThemeURL(u)
+
+	return c
+}
+
+// sanitizeThemeURL normalizes a theme archive URL and rejects invalid or insecure values.
+func sanitizeThemeURL(raw string) string {
+	raw = strings.TrimSpace(raw)
+
+	if raw == "" {
+		return ""
+	}
+
+	u, err := url.Parse(raw)
+
+	if err != nil || u == nil || !u.IsAbs() || u.Host == "" {
+		return ""
+	}
+
+	switch strings.ToLower(u.Scheme) {
+	case "http", "https":
+		// Keep supported scheme.
+	default:
+		return ""
+	}
+
+	// Enforce zip archives so callers cannot point to arbitrary file types.
+	if !strings.HasSuffix(strings.ToLower(u.Path), fs.ExtZip) {
+		return ""
+	}
+
+	return u.String()
 }
 
 // WallpaperUri returns the login screen background image URI.
@@ -50,18 +113,21 @@ func (c *Config) WallpaperUri() string {
 
 		wallpaperUri = "welcome.jpg"
 	} else if !strings.Contains(wallpaperUri, ".") {
-		wallpaperUri += fs.ExtJPEG
+		wallpaperUri += fs.ExtJpeg
 	}
 
 	// Complete URI as needed if file path is valid.
 	if fileName := clean.Path(wallpaperUri); fileName == "" {
 		return ""
-	} else if fs.FileExists(path.Join(c.StaticPath(), wallpaperPath, fileName)) {
-		wallpaperUri = c.StaticAssetUri(path.Join(wallpaperPath, fileName))
-	} else if fs.FileExists(c.CustomStaticFile(path.Join(wallpaperPath, fileName))) {
-		wallpaperUri = c.CustomStaticAssetUri(path.Join(wallpaperPath, fileName))
 	} else {
-		return ""
+		switch {
+		case fs.FileExists(path.Join(c.StaticPath(), wallpaperPath, fileName)):
+			wallpaperUri = c.StaticAssetUri(path.Join(wallpaperPath, fileName))
+		case fs.FileExists(c.CustomStaticFile(path.Join(wallpaperPath, fileName))):
+			wallpaperUri = c.CustomStaticAssetUri(path.Join(wallpaperPath, fileName))
+		default:
+			return ""
+		}
 	}
 
 	// Cache wallpaper URI if not empty.

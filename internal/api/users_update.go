@@ -3,18 +3,32 @@ package api
 import (
 	"net/http"
 
+	"github.com/dustin/go-humanize/english"
 	"github.com/gin-gonic/gin"
 
-	"github.com/photoprism/photoprism/internal/acl"
+	"github.com/photoprism/photoprism/internal/auth/acl"
+	"github.com/photoprism/photoprism/internal/config"
 	"github.com/photoprism/photoprism/internal/entity"
-	"github.com/photoprism/photoprism/internal/get"
-	"github.com/photoprism/photoprism/internal/i18n"
+	"github.com/photoprism/photoprism/internal/event"
+	"github.com/photoprism/photoprism/internal/photoprism/get"
+	"github.com/photoprism/photoprism/pkg/authn"
 	"github.com/photoprism/photoprism/pkg/clean"
+	"github.com/photoprism/photoprism/pkg/i18n"
+	"github.com/photoprism/photoprism/pkg/log/status"
 )
 
-// UpdateUser updates the profile information of the currently authenticated user.
+// UpdateUser updates profile information for the specified user.
 //
-// PUT /api/v1/users/:uid
+//	@Summary	update user profile information
+//	@Id			UpdateUser
+//	@Tags		Users
+//	@Accept		json
+//	@Produce	json
+//	@Param		uid							path		string		true	"user uid"
+//	@Param		user						body		form.User	true	"properties to be updated"
+//	@Success	200							{object}	entity.User
+//	@Failure	400,401,403,404,409,413,429	{object}	i18n.Response
+//	@Router		/api/v1/users/{uid} [put]
 func UpdateUser(router *gin.RouterGroup) {
 	router.PUT("/users/:uid", func(c *gin.Context) {
 		conf := get.Config()
@@ -24,15 +38,32 @@ func UpdateUser(router *gin.RouterGroup) {
 			return
 		}
 
-		// Check if the session user is allowed to manage all accounts or update his/her own account.
-		s := AuthAny(c, acl.ResourceUsers, acl.Permissions{acl.ActionManage, acl.AccessOwn, acl.ActionUpdate})
+		// Require user management or own-account update access.
+		s := AuthAny(c, acl.ResourceUsers, acl.Permissions{acl.ActionManage, acl.AccessOwn, acl.ActionUpdate, acl.ActionUpdateOwn})
 
 		if s.Abort(c) {
 			return
 		}
 
+		// A verified Portal cluster JWT (GrantJwtBearer) with users-manage scope is
+		// a trusted service principal — the Portal syncing cluster user state — with
+		// no end-user identity, so authorize it for user management like an admin
+		// instead of applying the per-user owner check below (which a user-less
+		// service token can never satisfy).
+		isClusterJWT := s.GrantType == authn.GrantJwtBearer.String() && s.ValidateScope(acl.ResourceUsers, acl.Permissions{acl.ActionManage})
+
+		// Check whether the role can manage all user accounts.
+		isAdmin := isClusterJWT || acl.Rules.AllowAll(acl.ResourceUsers, s.GetUserRole(), acl.Permissions{acl.AccessAll, acl.ActionManage})
 		uid := clean.UID(c.Param("uid"))
 
+		// Non-admin users may only update their own profile.
+		if !isAdmin && s.GetUser().UserUID != uid {
+			event.AuditErr([]string{ClientIP(c), "session %s", "users", clean.Log(uid), "update", status.Denied}, s.RefID)
+			AbortForbidden(c)
+			return
+		}
+
+		// Find user.
 		m := entity.FindUserByUID(uid)
 
 		if m == nil {
@@ -40,40 +71,130 @@ func UpdateUser(router *gin.RouterGroup) {
 			return
 		}
 
-		// Init form with model values.
+		// System accounts (Unknown id=-1, Visitor id=-2) must not be modified.
+		if m.ID < 0 {
+			event.AuditErr([]string{ClientIP(c), "session %s", "users", clean.Log(uid), "update", status.Denied}, s.RefID)
+			AbortForbidden(c)
+			return
+		}
+
+		// Initialize form with model values.
 		f, err := m.Form()
 
 		if err != nil {
-			log.Error(err)
+			log.Errorf("user: %s (init form)", clean.Error(err))
 			AbortSaveFailed(c)
 			return
 		}
 
-		// Update form with values from request.
+		// Assign and validate request form values.
+		LimitRequestBodyBytes(c, MaxMutationRequestBytes)
+
 		if err = c.BindJSON(&f); err != nil {
-			log.Error(err)
-			AbortBadRequest(c)
+			if IsRequestBodyTooLarge(err) {
+				AbortRequestTooLarge(c, i18n.ErrBadRequest)
+				return
+			}
+
+			AbortBadRequest(c, err)
 			return
 		}
 
-		// Check if the session user is has user management privileges.
-		isPrivileged := acl.Resources.AllowAll(acl.ResourceUsers, s.User().AclRole(), acl.Permissions{acl.AccessAll, acl.ActionManage})
+		privilegeLevelChange := isAdmin && m.PrivilegeLevelChange(f)
 
-		// Prevent super admins from locking themselves out.
-		if u := s.User(); u.IsSuperAdmin() && u.Equal(m) && !f.CanLogin {
-			f.CanLogin = true
+		// Check if the user account quota has been exceeded.
+		if f.UserRole != "" && m.UserRole != f.UserRole && !conf.UsersQuotaReached(acl.ParseRole(m.UserRole)) && conf.UsersQuotaReached(acl.ParseRole(f.UserRole)) {
+			event.AuditErr([]string{ClientIP(c), "session %s", "users", "%s", "update", authn.ErrUsersQuotaExceeded.Error()}, s.RefID, clean.LogQuote(m.UserName))
+			AbortQuotaExceeded(c)
+			return
 		}
 
-		// Save model with values from form.
-		if err = m.SaveForm(f, isPrivileged); err != nil {
-			log.Error(err)
+		// Get user from session.
+		u := s.GetUser()
+
+		// Prevent users from changing their own account role, disabling their
+		// own super admin status, or revoking their own web login — any of
+		// which could lock an operator out of the admin UI (e.g. a super admin
+		// demoting themselves). Other own-profile fields remain editable.
+		if u != nil && u.UserUID == m.UserUID {
+			switch {
+			case f.UserRole != "" && clean.Role(f.UserRole) != clean.Role(m.UserRole):
+				event.AuditErr([]string{ClientIP(c), "session %s", "users", "%s", "update own role", status.Denied}, s.RefID, clean.LogQuote(m.UserName))
+				AbortForbidden(c)
+				return
+			case m.SuperAdmin && !f.SuperAdmin:
+				event.AuditErr([]string{ClientIP(c), "session %s", "users", "%s", "disable own super admin status", status.Denied}, s.RefID, clean.LogQuote(m.UserName))
+				AbortForbidden(c)
+				return
+			case m.CanLogin && !f.CanLogin:
+				event.AuditErr([]string{ClientIP(c), "session %s", "users", "%s", "disable own web login", status.Denied}, s.RefID, clean.LogQuote(m.UserName))
+				AbortForbidden(c)
+				return
+			}
+		}
+
+		// Prevent a non-super-admin from demoting a super admin, revoking their super
+		// admin status, or disabling their web login, so a lower-privilege admin cannot
+		// lock the local operator out. The cluster JWT service principal is exempt.
+		if m.SuperAdmin && !isClusterJWT && !u.IsSuperAdmin() {
+			switch {
+			case f.UserRole != "" && clean.Role(f.UserRole) != clean.Role(m.UserRole):
+				event.AuditErr([]string{ClientIP(c), "session %s", "users", "%s", "demote super admin role", status.Denied}, s.RefID, clean.LogQuote(m.UserName))
+				AbortForbidden(c)
+				return
+			case !f.SuperAdmin:
+				event.AuditErr([]string{ClientIP(c), "session %s", "users", "%s", "disable super admin status", status.Denied}, s.RefID, clean.LogQuote(m.UserName))
+				AbortForbidden(c)
+				return
+			case m.CanLogin && !f.CanLogin:
+				event.AuditErr([]string{ClientIP(c), "session %s", "users", "%s", "disable super admin web login", status.Denied}, s.RefID, clean.LogQuote(m.UserName))
+				AbortForbidden(c)
+				return
+			}
+		}
+
+		// Persist form values. The cluster JWT is a user-less principal that
+		// u.IsAdmin()/u.IsSuperAdmin() reject, so authorize it explicitly for both admin and
+		// super-admin-level changes (else its role, login, and 2FA edits are silently dropped).
+		previousEmail, wasDeleted := m.UserEmail, m.IsDeleted()
+
+		// Only roles that may manage user accounts can change email addresses.
+		if !userEmailChangeAllowed(s, isClusterJWT) {
+			if email := f.Email(); email != "" && email != m.UserEmail {
+				event.AuditWarn([]string{ClientIP(c), "session %s", "users", "%s", "change email", status.Denied}, s.RefID, clean.LogQuote(m.UserName))
+			}
+
+			f.UserEmail = ""
+		}
+
+		if err = m.SaveForm(f, u, u.IsAdmin() || isClusterJWT, isClusterJWT); err != nil {
+			event.AuditErr([]string{ClientIP(c), "session %s", "users", "%s", "update", status.Error(err)}, s.RefID, clean.LogQuote(m.UserName))
 			AbortSaveFailed(c)
 			return
 		}
 
-		// Clear the session cache, as it contains user information.
-		s.ClearCache()
+		// Log event.
+		event.AuditInfo([]string{ClientIP(c), "session %s", "users", "%s", "updated"}, s.RefID, clean.LogQuote(m.UserName))
 
+		if restored := wasDeleted && !m.IsDeleted(); restored || m.UserEmail != previousEmail {
+			AuditSharedEmail(c, s, m, restored)
+		}
+
+		// Revoke other user sessions after a privilege level change,
+		// except for app passwords and client access tokens.
+		if privilegeLevelChange {
+			revoked := m.RevokeDerivedSessions([]string{s.ID})
+			event.AuditInfo([]string{ClientIP(c), "session %s", "users", "%s", "revoked %s"}, s.RefID, clean.LogQuote(m.UserName),
+				english.Plural(revoked, "session", "sessions"))
+		}
+
+		// Refresh role-dependent usage and client configuration after an admin update.
+		if isAdmin && f.UserRole != "" {
+			config.FlushUsageCache()
+			UpdateClientConfig()
+		}
+
+		// Find and return the updated user record.
 		m = entity.FindUserByUID(uid)
 
 		if m == nil {

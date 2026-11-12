@@ -1,23 +1,25 @@
 package entity
 
 import (
+	"errors"
 	"fmt"
-	"time"
 
 	gc "github.com/patrickmn/go-cache"
+	"gorm.io/gorm"
 
+	"github.com/photoprism/photoprism/internal/config/ttl"
 	"github.com/photoprism/photoprism/pkg/clean"
 	"github.com/photoprism/photoprism/pkg/rnd"
 )
 
-var albumCache = gc.New(15*time.Minute, 15*time.Minute)
+var albumCache = gc.New(ttl.CacheCollection.Duration(), ttl.CacheCollectionCleanup.Duration())
 
-// FlushAlbumCache resets the album cache.
+// FlushAlbumCache clears any cached album entries.
 func FlushAlbumCache() {
 	albumCache.Flush()
 }
 
-// CachedAlbumByUID returns an existing album or nil if not found.
+// CachedAlbumByUID returns the album with the specified UID from cache or database.
 func CachedAlbumByUID(uid string) (m Album, err error) {
 	// Valid album UID?
 	if uid == "" || rnd.InvalidUID(uid, AlbumUID) {
@@ -25,7 +27,7 @@ func CachedAlbumByUID(uid string) (m Album, err error) {
 	}
 
 	// Cached?
-	if cacheData, ok := albumCache.Get(uid); ok {
+	if cacheData, hit := albumCache.Get(uid); hit {
 		log.Tracef("album: cache hit for %s", uid)
 		return cacheData.(Album), nil
 	}
@@ -33,7 +35,7 @@ func CachedAlbumByUID(uid string) (m Album, err error) {
 	// Find in database.
 	m = Album{}
 
-	if r := Db().First(&m, "album_uid = ?", uid); r.RecordNotFound() {
+	if r := Db().First(&m, "album_uid = ?", uid); errors.Is(r.Error, gorm.ErrRecordNotFound) {
 		return m, fmt.Errorf("album not found")
 	} else if r.Error != nil {
 		return m, r.Error

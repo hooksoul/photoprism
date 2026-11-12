@@ -20,7 +20,7 @@ func (m SubjectMap) Pointer(name string) *Subject {
 
 var SubjectFixtures = SubjectMap{
 	"john-doe": Subject{
-		SubjUID:      "jqu0xs11qekk9jx8",
+		SubjUID:      "js6sg6b1qekk9jx8",
 		SubjSlug:     "john-doe",
 		SubjName:     "John Doe",
 		SubjType:     SubjPerson,
@@ -32,12 +32,12 @@ var SubjectFixtures = SubjectMap{
 		SubjNotes:    "Short Note",
 		FileCount:    1,
 		PhotoCount:   1,
-		CreatedAt:    TimeStamp(),
-		UpdatedAt:    TimeStamp(),
-		DeletedAt:    nil,
+		Thumb:        "",
+		CreatedAt:    Now(),
+		UpdatedAt:    Now(),
 	},
 	"joe-biden": Subject{
-		SubjUID:      "jqy3y652h8njw0sx",
+		SubjUID:      "js6sg6b2h8njw0sx",
 		SubjSlug:     "joe-biden",
 		SubjName:     "Joe Biden",
 		SubjType:     SubjPerson,
@@ -49,12 +49,12 @@ var SubjectFixtures = SubjectMap{
 		SubjNotes:    "",
 		FileCount:    1,
 		PhotoCount:   1,
-		CreatedAt:    TimeStamp(),
-		UpdatedAt:    TimeStamp(),
-		DeletedAt:    nil,
+		Thumb:        "",
+		CreatedAt:    Now(),
+		UpdatedAt:    Now(),
 	},
 	"dangling": Subject{
-		SubjUID:      "jqy1y111h1njaaaa",
+		SubjUID:      "js6sg6b1h1njaaaa",
 		SubjSlug:     "dangling-subject",
 		SubjName:     "Dangling Subject",
 		SubjAlias:    "Powell",
@@ -65,15 +65,15 @@ var SubjectFixtures = SubjectMap{
 		SubjExcluded: false,
 		SubjBio:      "",
 		SubjNotes:    "",
-		Thumb:        "2cad9168fa6acc5c5c2965ddf6ec465ca42fd818",
+		Thumb:        "2cad9168fa6acc5c5c2965ddf6ec465ca42fd818-0910162fd2fd",
+		ThumbSrc:     SrcManual,
 		FileCount:    0,
 		PhotoCount:   0,
-		CreatedAt:    TimeStamp(),
-		UpdatedAt:    TimeStamp(),
-		DeletedAt:    nil,
+		CreatedAt:    Now(),
+		UpdatedAt:    Now(),
 	},
 	"jane-doe": Subject{
-		SubjUID:      "jqy1y111h1njaaab",
+		SubjUID:      "js6sg6b1h1njaaab",
 		SubjSlug:     "jane-doe",
 		SubjName:     "Jane Doe",
 		SubjType:     SubjPerson,
@@ -85,12 +85,12 @@ var SubjectFixtures = SubjectMap{
 		SubjNotes:    "",
 		FileCount:    3,
 		PhotoCount:   2,
-		CreatedAt:    TimeStamp().AddDate(0, 0, 1),
-		UpdatedAt:    TimeStamp(),
-		DeletedAt:    nil,
+		Thumb:        "",
+		CreatedAt:    Now().AddDate(0, 0, 1),
+		UpdatedAt:    Now(),
 	},
 	"actress-1": Subject{
-		SubjUID:      "jqy1y111h1njaaac",
+		SubjUID:      "js6sg6b1h1njaaac",
 		SubjSlug:     "actress-a",
 		SubjName:     "Actress A",
 		SubjType:     SubjPerson,
@@ -98,12 +98,12 @@ var SubjectFixtures = SubjectMap{
 		SubjFavorite: false,
 		SubjPrivate:  false,
 		SubjNotes:    "",
-		CreatedAt:    TimeStamp(),
-		UpdatedAt:    TimeStamp(),
-		DeletedAt:    nil,
+		Thumb:        "",
+		CreatedAt:    Now(),
+		UpdatedAt:    Now(),
 	},
 	"actor-1": Subject{
-		SubjUID:      "jqy1y111h1njaaad",
+		SubjUID:      "js6sg6b1h1njaaad",
 		SubjSlug:     "actor-a",
 		SubjName:     "Actor A",
 		SubjType:     SubjPerson,
@@ -111,15 +111,15 @@ var SubjectFixtures = SubjectMap{
 		SubjFavorite: false,
 		SubjPrivate:  false,
 		SubjNotes:    "",
-		CreatedAt:    TimeStamp(),
-		UpdatedAt:    TimeStamp(),
-		DeletedAt:    nil,
+		Thumb:        "",
+		CreatedAt:    Now(),
+		UpdatedAt:    Now(),
 	},
 }
 
 // CreateSubjectFixtures inserts known entities into the database for testing.
 func CreateSubjectFixtures() {
 	for _, entity := range SubjectFixtures {
-		Db().Create(&entity)
+		createFixture(&entity)
 	}
 }

@@ -1,6 +1,6 @@
 /*
 
-Copyright (c) 2018 - 2023 PhotoPrism UG. All rights reserved.
+Copyright (c) 2018 - 2026 PhotoPrism UG. All rights reserved.
 
     This program is free software: you can redistribute it and/or modify
     it under Version 3 of the GNU Affero General Public License (the "AGPL"):
@@ -13,7 +13,7 @@ Copyright (c) 2018 - 2023 PhotoPrism UG. All rights reserved.
 
     The AGPL is supplemented by our Trademark and Brand Guidelines,
     which describe how our Brand Assets may be used:
-    <https://www.photoprism.app/trademark>
+    <https://www.photoprism.app/trademark/>
 
 Feel free to send an email to hello@photoprism.app if you have questions,
 want to support our work, or just want to say hello.
@@ -23,14 +23,59 @@ Additional information can be found in our Developer Guide:
 
 */
 
-import Api from "api.js";
-import Event from "pubsub-js";
+import $api from "common/api";
+import $event from "common/event";
+import { createNamespacedStorage } from "common/storage";
+import {
+  persistInstanceIdentity,
+  InstanceIdentityKeys,
+  instanceTitle,
+  listLogoutTargets,
+  signOutInstances,
+  clearInstanceStorage,
+} from "common/instances";
+import { $view } from "common/view";
 import User from "model/user";
 import Socket from "websocket.js";
 
-const SessionHeader = "X-Session-ID";
-const PublicID = "234200000000000000000000000000000000000000000000";
+const RequestHeader = "X-Auth-Token";
+const PublicSessionID = "a9b8ff820bf40ab451910f8bbfe401b2432446693aa539538fbd2399560a722f";
+const PublicAuthToken = "234200000000000000000000000000000000000000000000";
 const LoginPage = "login";
+
+// login.* keys survive auth.gohtml's session.* wipe after the OIDC roundtrip.
+const LoginRedirectKey = "login.next";
+const LogoutSignalKey = "login.logout";
+// One-shot flag (per browser tab) for the OIDC auto-redirect attempt. Stored
+// in sessionStorage so a closed tab clears it, and so a failed/abandoned OIDC
+// roundtrip can fall back to the local login form instead of looping.
+const OidcAttemptKey = "login.oidc.attempt";
+// Loop guard for the post-login redirect (login.next): the timestamp of the last
+// follow, and the window within which a re-entry counts as a bounce-back loop.
+// Lets /login fall back to the default route instead of looping when the redirect
+// target (e.g. the OIDC OP /api/v1/oauth/authorize) can't authenticate the navigation.
+const LoginRedirectAttemptKey = "login.next.at";
+const LoginRedirectLoopWindow = 6000;
+
+const resolveStorageNamespace = (config) => {
+  if (typeof config?.storageNamespace === "string" && config.storageNamespace !== "") {
+    return config.storageNamespace;
+  }
+
+  if (typeof config?.get === "function") {
+    const storageNamespace = config.get("storageNamespace");
+
+    if (typeof storageNamespace === "string" && storageNamespace !== "") {
+      return storageNamespace;
+    }
+  }
+
+  if (typeof config?.values?.storageNamespace === "string" && config.values.storageNamespace !== "") {
+    return config.values.storageNamespace;
+  }
+
+  return "";
+};
 
 export default class Session {
   /**
@@ -39,43 +84,95 @@ export default class Session {
    * @param {object} shared
    */
   constructor(storage, config, shared) {
-    this.storage_key = "session_storage";
-    this.auth = false;
+    this.storageKey = "session";
+    this.loginRedirect = false;
     this.config = config;
+    this.baseUri = config?.baseUri;
+    this.storageNamespace = resolveStorageNamespace(config);
+    this.provider = "";
     this.user = new User(false);
+    this.scope = "";
     this.data = null;
+    this.localStorage = storage;
+    const sessionStorage = typeof window === "undefined" ? undefined : window.sessionStorage;
+    this.sessionStorage = createNamespacedStorage(sessionStorage, this.storageNamespace);
 
     // Set session storage.
-    if (storage.getItem(this.storage_key) === "true") {
-      this.storage = window.sessionStorage;
+    if (storage.getItem(this.storageKey) === "true") {
+      this.storage = this.sessionStorage;
     } else {
-      this.storage = storage;
+      this.storage = this.localStorage;
     }
 
-    // Restore from session storage.
-    if (this.applyId(this.storage.getItem("session_id"))) {
-      const dataJson = this.storage.getItem("data");
-      if (dataJson !== "undefined") {
-        this.data = JSON.parse(dataJson);
+    // Restore authentication data stored under previously used keys.
+    if (
+      !this.storage.getItem(this.storageKey + ".token") &&
+      this.storage.getItem("authToken") &&
+      !this.storage.getItem(this.storageKey + ".id") &&
+      this.storage.getItem("sessionId")
+    ) {
+      this.storage.setItem(this.storageKey + ".token", this.storage.getItem("authToken"));
+      this.storage.removeItem("authToken");
+
+      this.storage.setItem(this.storageKey + ".id", this.storage.getItem("sessionId"));
+      this.storage.removeItem("sessionId");
+
+      const dataJson = this.storage.getItem("sessionData");
+      if (dataJson && dataJson !== "undefined") {
+        this.storage.setItem(this.storageKey + ".data", dataJson);
+        this.storage.removeItem("sessionData");
       }
 
       const userJson = this.storage.getItem("user");
-      if (userJson !== "undefined") {
-        this.user = new User(JSON.parse(userJson));
+      if (userJson && userJson !== "undefined") {
+        this.storage.setItem(this.storageKey + ".user", userJson);
+        this.storage.removeItem("user");
+      }
+
+      const provider = this.storage.getItem("provider");
+      if (provider !== null && provider !== "undefined") {
+        this.storage.setItem(this.storageKey + ".provider", provider);
+        this.storage.removeItem("provider");
+      }
+    }
+
+    // Restore authentication from session storage.
+    if (this.applyAuthToken(this.storage.getItem(this.storageKey + ".token")) && this.applyId(this.storage.getItem(this.storageKey + ".id"))) {
+      const data = this.getStoredJSON(this.storageKey + ".data");
+      if (data) {
+        this.data = data;
+      }
+
+      const user = this.getStoredJSON(this.storageKey + ".user");
+      if (user) {
+        this.user = new User(user);
+      }
+
+      const provider = this.storage.getItem(this.storageKey + ".provider");
+      if (provider !== null && provider !== "undefined") {
+        this.provider = provider;
+      }
+
+      const scope = this.storage.getItem(this.storageKey + ".scope");
+      if (scope !== null && scope !== "undefined") {
+        this.scope = scope;
       }
     }
 
     // Authenticated?
-    if (this.isUser()) {
-      this.auth = true;
+    this.auth = this.isUser();
+
+    // Record this instance's identity so peers on a shared domain can switch to it.
+    if (this.auth) {
+      this.recordInstanceIdentity();
     }
 
     // Subscribe to session events.
-    Event.subscribe("session.logout", () => {
+    $event.subscribe("session.logout", () => {
       return this.onLogout();
     });
 
-    Event.subscribe("websocket.connected", () => {
+    $event.subscribe("websocket.connected", () => {
       this.sendClientInfo();
     });
 
@@ -84,11 +181,12 @@ export default class Session {
       this.config.progress(80);
       this.redeemToken(shared.token).finally(() => {
         this.config.progress(99);
-        if (shared.uri) {
-          window.location = shared.uri;
-        } else {
-          window.location = this.config.baseUri + "/";
-        }
+
+        // Redirect URL.
+        const location = shared.uri ? shared.uri : this.config.baseUri + "/";
+
+        // Redirect to URL after one second.
+        this.followRedirect(location, 1000);
       });
     } else {
       this.config.progress(80);
@@ -99,55 +197,191 @@ export default class Session {
     }
   }
 
+  getStoredJSON(key) {
+    const value = this.storage.getItem(key);
+
+    if (!value || value === "undefined") {
+      return null;
+    }
+
+    try {
+      return JSON.parse(value);
+    } catch {
+      this.storage.removeItem(key);
+      return null;
+    }
+  }
+
+  setStoragePreference(useSessionStorage) {
+    this.localStorage.setItem(this.storageKey, useSessionStorage ? "true" : "false");
+    this.sessionStorage.removeItem(this.storageKey);
+  }
+
   useSessionStorage() {
-    this.deleteId();
-    this.storage.setItem(this.storage_key, "true");
-    this.storage = window.sessionStorage;
+    this.reset();
+    this.setStoragePreference(true);
+    this.storage = this.sessionStorage;
   }
 
   useLocalStorage() {
-    this.storage.setItem(this.storage_key, "false");
-    this.storage = window.localStorage;
+    this.setStoragePreference(false);
+    this.storage = this.localStorage;
   }
 
-  applyId(id) {
-    if (!id) {
-      this.deleteId();
-      return false;
+  usesSessionStorage() {
+    return this.storage === this.sessionStorage;
+  }
+
+  clearNamespacedKey(key) {
+    [this.localStorage, this.sessionStorage].forEach((storage) => {
+      if (!storage || typeof storage.removeItem !== "function") {
+        return;
+      }
+
+      if (typeof storage.getLegacyItem === "function") {
+        storage.removeItem(key, { legacy: false });
+      } else {
+        storage.removeItem(key);
+      }
+    });
+  }
+
+  clearLegacyKey(key) {
+    if (!key) {
+      return;
     }
 
-    this.session_id = id;
+    [this.localStorage, this.sessionStorage].forEach((storage) => {
+      if (!storage) {
+        return;
+      }
 
-    Api.defaults.headers.common[SessionHeader] = id;
-
-    return true;
-  }
-
-  setId(id) {
-    this.storage.setItem("session_id", id);
-    return this.applyId(id);
+      if (typeof storage.removeLegacyItem === "function") {
+        storage.removeLegacyItem(key);
+      } else if (typeof storage.removeItem === "function") {
+        storage.removeItem(key);
+      }
+    });
   }
 
   setConfig(values) {
     this.config.setValues(values);
   }
 
+  setAuthToken(authToken) {
+    if (authToken) {
+      this.storage.setItem(this.storageKey + ".token", authToken);
+      if (authToken === PublicAuthToken) {
+        this.setId(PublicSessionID);
+      }
+    }
+
+    return this.applyAuthToken(authToken);
+  }
+
+  getAuthToken() {
+    return this.authToken;
+  }
+
+  hasAuthToken() {
+    return !!this.authToken;
+  }
+
+  applyAuthToken(authToken) {
+    if (!authToken) {
+      this.reset();
+      return false;
+    }
+
+    this.authToken = authToken;
+
+    $api.defaults.headers.common[RequestHeader] = authToken;
+
+    return true;
+  }
+
+  setId(id) {
+    this.storage.setItem(this.storageKey + ".id", id);
+    this.id = id;
+  }
+
   getId() {
-    return this.session_id;
+    return this.id;
   }
 
   hasId() {
-    return !!this.session_id;
+    return !!this.id;
   }
 
-  deleteId() {
-    this.session_id = null;
+  applyId(id) {
+    if (!id) {
+      return false;
+    }
+
+    this.setId(id);
+
+    return true;
+  }
+
+  isAuthenticated() {
+    return this.hasId() && this.hasAuthToken();
+  }
+
+  deleteAuthentication() {
+    this.id = null;
+    this.authToken = null;
     this.provider = "";
-    this.storage.removeItem("session_id");
+    this.scope = "";
 
-    delete Api.defaults.headers.common[SessionHeader];
+    // "session.id" is the SHA256 hash of the auth token.
+    this.clearNamespacedKey(this.storageKey + ".id");
+    this.clearNamespacedKey(this.storageKey + ".token");
+    this.clearNamespacedKey(this.storageKey + ".provider");
+    this.clearNamespacedKey(this.storageKey + ".scope");
 
-    this.deleteAll();
+    // Remove deprecated raw keys from both storage backends. Supported
+    // instances use namespaced keys, so clearing legacy globals is safe.
+    this.clearLegacyKey("session.token");
+    this.clearLegacyKey("authToken");
+    this.clearLegacyKey("session.id");
+    this.clearLegacyKey("sessionId");
+    this.clearLegacyKey("session_id");
+    this.clearLegacyKey("session.provider");
+    this.clearLegacyKey("provider");
+    this.clearLegacyKey("session.scope");
+    this.clearLegacyKey("authError");
+    this.clearLegacyKey("session.error");
+    this.clearLegacyKey("session.messageId");
+    this.clearLegacyKey("session.messageParams");
+
+    delete $api.defaults.headers.common[RequestHeader];
+  }
+
+  setProvider(provider) {
+    this.storage.setItem(this.storageKey + ".provider", provider);
+    this.provider = provider;
+  }
+
+  getProvider() {
+    if (!this.provider) {
+      return "";
+    }
+
+    return this.provider;
+  }
+
+  hasPassword() {
+    switch (this.getProvider()) {
+      case "local":
+      case "ldap":
+        return true;
+      default:
+        return false;
+    }
+  }
+
+  hasProvider() {
+    return !!this.provider;
   }
 
   setResp(resp) {
@@ -155,18 +389,34 @@ export default class Session {
       return;
     }
 
-    if (resp.data.id) {
-      this.setId(resp.data.id);
+    if (resp.data.session_id) {
+      this.setId(resp.data.session_id);
     }
+
+    if (resp.data.access_token) {
+      this.setAuthToken(resp.data.access_token);
+    } else if (resp.data.id) {
+      // TODO: "id" field is deprecated! Clients should now use "access_token" instead.
+      // see https://github.com/photoprism/photoprism/commit/0d2f8be522dbf0a051ae6ef78abfc9efded0082d
+      this.setAuthToken(resp.data.id);
+    }
+
     if (resp.data.provider) {
-      this.provider = resp.data.provider;
+      this.setProvider(resp.data.provider);
     }
+
     if (resp.data.config) {
       this.setConfig(resp.data.config);
     }
+
     if (resp.data.user) {
       this.setUser(resp.data.user);
     }
+
+    if (resp.data.scope) {
+      this.setScope(resp.data.scope);
+    }
+
     if (resp.data.data) {
       this.setData(resp.data.data);
     }
@@ -178,7 +428,7 @@ export default class Session {
     }
 
     this.data = data;
-    this.storage.setItem("data", JSON.stringify(data));
+    this.storage.setItem(this.storageKey + ".data", JSON.stringify(data));
 
     if (data.user) {
       this.setUser(data.user);
@@ -207,12 +457,58 @@ export default class Session {
     }
 
     this.user = new User(user);
-    this.storage.setItem("user", JSON.stringify(user));
+    this.storage.setItem(this.storageKey + ".user", JSON.stringify(user));
     this.auth = this.isUser();
+
+    if (this.auth) {
+      this.recordInstanceIdentity();
+    }
+  }
+
+  // recordInstanceIdentity stores this instance's SiteUrl, display title, and app
+  // icon under the active namespace so other instances on the same origin can offer
+  // a switch entry. The title prefers the configured site name (see instanceTitle)
+  // and falls back to the distinctive base-path segment for unbranded instances;
+  // the icon is the root-relative app icon, which resolves on the shared origin from
+  // any peer. No-op when the site URL is unknown or storage is unavailable.
+  recordInstanceIdentity() {
+    const values = this.config?.values;
+
+    if (!values || !values.siteUrl) {
+      return;
+    }
+
+    persistInstanceIdentity(this.storage, {
+      url: values.siteUrl,
+      // Frontend URI (e.g. "/portal" or "/i/pro-1/library") so peers open the
+      // app entry point rather than a web-overlay landing page at the site root.
+      route: this.config?.frontendUri,
+      title: instanceTitle(values),
+      icon: this.config.getIcon(),
+      // Flag the Portal's own session so Sign-Out delegates it to the Portal end-session endpoint.
+      portal: !!this.config?.isPortal?.(),
+    });
   }
 
   getUser() {
     return this.user;
+  }
+
+  setScope(scope) {
+    this.scope = scope;
+    this.storage.setItem(this.storageKey + ".scope", scope);
+  }
+
+  hasScope() {
+    return Boolean(this.scope) && this.scope !== "*";
+  }
+
+  getScope() {
+    if (this.hasScope()) {
+      return this.scope;
+    }
+
+    return "*";
   }
 
   getUserUID() {
@@ -227,26 +523,111 @@ export default class Session {
     return !this.config.isPublic() && !this.isUser();
   }
 
-  isUser() {
-    return this.user && this.user.hasId();
+  followLoginRedirectUrl(defaultUrl) {
+    const url = this.getLoginRedirectUrl(defaultUrl);
+    this.clearLoginRedirectUrl();
+    this.followRedirect(url);
+    return this;
   }
 
-  getHome() {
+  // Returns the post-login redirect target: in-memory first, then namespaced
+  // storage (survives the OIDC roundtrip), else `defaultUrl` (defaults to "/";
+  // pass null to branch on "no redirect recorded").
+  getLoginRedirectUrl(defaultUrl) {
+    if (this.loginRedirect) {
+      return this.loginRedirect;
+    }
+
+    const stored = this.localStorage?.getItem(LoginRedirectKey);
+    if (stored) {
+      return stored;
+    }
+
+    return defaultUrl === undefined ? "/" : defaultUrl;
+  }
+
+  // Reports whether a deep-link redirect target is recorded. The /login
+  // route guard uses this as the deep-link arrival signal: a stored URL
+  // means the global router guard bounced the user here from a protected
+  // page, while a missing one means the user opened /login directly.
+  hasLoginRedirectUrl() {
+    if (this.loginRedirect) {
+      return true;
+    }
+    return !!this.localStorage?.getItem(LoginRedirectKey);
+  }
+
+  clearLoginRedirectUrl() {
+    this.loginRedirect = false;
+    this.localStorage?.removeItem(LoginRedirectKey);
+    // The OIDC attempt flag is paired with the deep-link target: clearing
+    // the target (after successful login or logout) frees the next deep-link
+    // arrival to trigger a fresh OIDC roundtrip.
+    this.sessionStorage?.removeItem(OidcAttemptKey);
+
+    return this;
+  }
+
+  // Records the post-login target. Persisted so it survives the OIDC roundtrip.
+  setLoginRedirectUrl(url) {
+    if (this.invalidRedirectUrl(url)) {
+      return this.clearLoginRedirectUrl();
+    }
+
+    this.loginRedirect = url;
+    this.localStorage?.setItem(LoginRedirectKey, url);
+
+    return this;
+  }
+
+  // invalidRedirectUrl rejects empty or login-page post-login redirect targets.
+  invalidRedirectUrl(url) {
+    if (typeof url !== "string") {
+      return true;
+    }
+    const trimmed = url.trim();
+    if (trimmed === "") {
+      return true;
+    }
+    let path = trimmed;
+    try {
+      const origin = (typeof window !== "undefined" && window.location?.origin) || "http://localhost";
+      path = new URL(trimmed, origin).pathname;
+    } catch {
+      path = trimmed.split("?")[0].split("#")[0];
+    }
+    path = path.replace(/\/+$/, "");
+    if (!path) {
+      return true;
+    }
+    const loginUri = (this.config?.loginUri || "").replace(/\/+$/, "");
+    if (loginUri && path === loginUri) {
+      return true;
+    }
+    return path.endsWith("/login");
+  }
+
+  // isUser returns true when the current session has a fully-loaded user record.
+  isUser() {
+    return !!this.user?.hasId();
+  }
+
+  getDefaultRoute() {
     if (this.loginRequired()) {
       return LoginPage;
-    } else if (this.config.allow("photos", "access_library")) {
-      return "browse";
-    } else {
-      return "albums";
     }
+
+    return this.config.getDefaultRoute();
   }
 
+  // isAdmin returns true when the session belongs to an admin or super-admin user.
   isAdmin() {
-    return this.user && this.user.hasId() && (this.user.Role === "admin" || this.user.SuperAdmin);
+    return !!(this.user?.hasId() && (this.user.Role === "admin" || this.user.SuperAdmin));
   }
 
+  // isSuperAdmin returns true when the session belongs to a super-admin user.
   isSuperAdmin() {
-    return this.user && this.user.hasId() && this.user.SuperAdmin;
+    return !!(this.user?.hasId() && this.user.SuperAdmin);
   }
 
   isAnonymous() {
@@ -263,24 +644,42 @@ export default class Session {
 
   deleteData() {
     this.data = null;
-    this.storage.removeItem("data");
+    this.clearNamespacedKey(this.storageKey + ".data");
+    this.clearLegacyKey("sessionData");
+    this.clearLegacyKey("session.data");
   }
 
   deleteUser() {
     this.auth = false;
     this.user = new User(false);
-    this.storage.removeItem("user");
+    this.clearNamespacedKey(this.storageKey + ".user");
+    this.clearLegacyKey("user");
+    this.clearLegacyKey("session.user");
+    // Drop this instance's switcher identity so a logged-out instance is no
+    // longer offered as a switch target by peers on the same shared domain.
+    InstanceIdentityKeys.forEach((key) => this.clearNamespacedKey(key));
   }
 
-  deleteAll() {
+  deleteClipboard() {
+    this.clearNamespacedKey("clipboard");
+    this.clearNamespacedKey("clipboard.photos");
+    this.clearNamespacedKey("clipboard.albums");
+  }
+
+  reset() {
+    this.deleteAuthentication();
     this.deleteData();
     this.deleteUser();
+    this.deleteClipboard();
+    // Clear the Photo LRU so cached metadata cannot leak across role
+    // changes. Dynamic import avoids the session ↔ photo module cycle.
+    import("model/photo").then((m) => m.default.clearCache()).catch(() => {});
   }
 
   sendClientInfo() {
     const hasConfig = !!window.__CONFIG__;
     const clientInfo = {
-      session: this.getId(),
+      session: this.getAuthToken(),
       cssUri: hasConfig ? window.__CONFIG__.cssUri : "",
       jsUri: hasConfig ? window.__CONFIG__.jsUri : "",
       version: hasConfig ? window.__CONFIG__.version : "",
@@ -288,7 +687,7 @@ export default class Session {
 
     try {
       Socket.send(JSON.stringify(clientInfo));
-    } catch (e) {
+    } catch {
       if (this.config.debug) {
         console.log("session: can't use websocket, not connected (yet)");
       }
@@ -299,45 +698,52 @@ export default class Session {
     if (!window || !window.location) {
       return true;
     }
+
     return LoginPage === window.location.href.substring(window.location.href.lastIndexOf("/") + 1);
   }
 
-  login(username, password, token) {
-    this.deleteId();
+  login(username, password, code, token) {
+    this.reset();
 
-    return Api.post("session", { username, password, token }).then((resp) => {
-      const reload = this.config.getLanguage() !== resp.data?.config?.settings?.ui?.language;
+    return $api.post("session", { username, password, code, token }).then((resp) => {
+      const reload = this.config.getLanguageLocale() !== resp.data?.config?.settings?.ui?.language;
       this.setResp(resp);
-      this.sendClientInfo();
+      this.onLogin();
       return Promise.resolve(reload);
     });
   }
 
+  onLogin() {
+    this.sendClientInfo();
+  }
+
   refresh() {
-    // Refresh session information.
+    // Check if the authentication is still valid and update the client session data.
     if (this.config.isPublic()) {
-      // No authentication in public mode.
-      this.setId(PublicID);
-      return Api.get("session/" + this.getId()).then((resp) => {
+      // Use a static auth token in public mode, as no additional authentication is required.
+      this.setAuthToken(PublicAuthToken);
+      this.setId(PublicSessionID);
+      return $api.get("session").then((resp) => {
         this.setResp(resp);
         return Promise.resolve();
       });
-    } else if (this.hasId()) {
-      // Verify authentication.
-      return Api.get("session/" + this.getId())
+    } else if (this.isAuthenticated()) {
+      // Check the auth token by fetching the client session data from the API.
+      return $api
+        .get("session")
         .then((resp) => {
           this.setResp(resp);
           return Promise.resolve();
         })
         .catch(() => {
-          this.deleteId();
+          this.reset();
           if (!this.isLogin()) {
             window.location.reload();
           }
           return Promise.reject();
         });
     } else {
-      // No authentication yet.
+      // Skip updating session data if client is not authenticated.
       return Promise.resolve();
     }
   }
@@ -347,25 +753,159 @@ export default class Session {
       return Promise.reject();
     }
 
-    return Api.post("session", { token }).then((resp) => {
+    return $api.post("session", { token }).then((resp) => {
       this.setResp(resp);
       this.sendClientInfo();
     });
   }
 
-  onLogout(noRedirect) {
-    this.deleteId();
-    if (noRedirect !== true && !this.isLogin()) {
-      window.location = this.config.baseUri + "/";
+  createApp(client_name, scope, expires_in, password) {
+    if (!this.isUser() || !this.user.Name) {
+      return Promise.reject();
     }
-    return Promise.resolve();
+
+    if (!scope) {
+      scope = "*";
+    }
+
+    return $api
+      .post("oauth/token", {
+        grant_type: password ? "password" : "session",
+        client_name: client_name,
+        scope: scope,
+        expires_in: expires_in,
+        username: this.user.Name,
+        password: password,
+      })
+      .then((response) => Promise.resolve(response.data));
+  }
+
+  deleteApp(token) {
+    return $api
+      .post("oauth/revoke", {
+        token: token,
+      })
+      .then((response) => Promise.resolve(response.data));
+  }
+
+  followRedirect(url, delay) {
+    if (!url) {
+      return;
+    }
+
+    // Default redirect delay in milliseconds.
+    if (!delay) {
+      delay = 100;
+    }
+
+    // Redirect to URL with the specified delay.
+    $view.redirect(url, delay, true);
+  }
+
+  // isClusterSession reports whether the current session was signed in through the
+  // cluster Portal OIDC provider, so sign-out runs the cluster-wide fan-out and
+  // clears the Portal OP cookie. Read before reset()/signOut() clears the provider.
+  isClusterSession() {
+    return this.getProvider() === "oidc" && !!this.config?.isClusterOidc?.();
+  }
+
+  // logoutRedirectUri returns the post-sign-out landing URL: a cluster-OIDC session
+  // goes directly to the Portal login page (re-auth → instance chooser), everyone
+  // else to the local login. The instance OIDC roundtrip is never re-initiated on
+  // sign-out, since that would pin the Portal login's return_to to the just-left
+  // instance and dead-end accounts without a grant there; when the Portal login URL
+  // is unknown, the local form is the fallback landing. Read provider before reset().
+  logoutRedirectUri() {
+    if (this.isClusterSession()) {
+      return this.config.portalLoginUri() || this.config.loginUri;
+    }
+
+    return this.config.loginUri;
+  }
+
+  // onLogout resets client state and resolves to the post-sign-out landing URL. It follows
+  // the redirect itself unless noRedirect is set, in which case the caller does (e.g. the
+  // /logout route guard), so the resolved URL — the provider logout URL when present — is
+  // returned either way.
+  onLogout(noRedirect, providerLogoutUri) {
+    // Prefer the backend's provider logout URL (RP-initiated logout); else the local target,
+    // resolved before reset() clears the auth provider.
+    const redirectUri = providerLogoutUri || this.logoutRedirectUri();
+
+    this.reset();
+
+    // Drop stale deep-link redirects; raise one-shot flag so /login skips
+    // auto-OIDC once when PHOTOPRISM_OIDC_REDIRECT is on.
+    this.clearLoginRedirectUrl();
+    this.localStorage?.setItem(LogoutSignalKey, "1");
+
+    if (noRedirect !== true && !this.isLogin()) {
+      this.followRedirect(redirectUri);
+    }
+
+    return Promise.resolve(redirectUri);
+  }
+
+  // Reads and clears the one-shot logout flag set by onLogout().
+  consumeLogoutSignal() {
+    if (!this.localStorage) {
+      return false;
+    }
+    const raised = this.localStorage.getItem(LogoutSignalKey) === "1";
+    if (raised) {
+      this.localStorage.removeItem(LogoutSignalKey);
+    }
+    return raised;
+  }
+
+  // Marks that an OIDC auto-redirect attempt is in flight for this tab.
+  markOidcAttempt() {
+    this.sessionStorage?.setItem(OidcAttemptKey, "1");
+    return this;
+  }
+
+  // Reads and clears the OIDC attempt flag. Returns true once per tab between
+  // markOidcAttempt() calls, so /login can fall back to the form when an OIDC
+  // roundtrip fails or is abandoned instead of looping back to the IdP.
+  consumeOidcAttempt() {
+    if (!this.sessionStorage) {
+      return false;
+    }
+    const raised = this.sessionStorage.getItem(OidcAttemptKey) === "1";
+    if (raised) {
+      this.sessionStorage.removeItem(OidcAttemptKey);
+    }
+    return raised;
+  }
+
+  // Records the time we last followed the post-login redirect, so a fast
+  // bounce-back can be recognized as a loop. Stored per browser tab.
+  markLoginRedirectAttempt() {
+    this.sessionStorage?.setItem(LoginRedirectAttemptKey, String(Date.now()));
+    return this;
+  }
+
+  // loginRedirectLooping reports whether the post-login redirect was followed
+  // within the last LoginRedirectLoopWindow ms, i.e. the target bounced straight
+  // back without authenticating the navigation — used to break redirect loops.
+  loginRedirectLooping() {
+    const at = parseInt(this.sessionStorage?.getItem(LoginRedirectAttemptKey) || "0", 10);
+    return at > 0 && Date.now() - at < LoginRedirectLoopWindow;
+  }
+
+  // Clears the post-login redirect loop guard.
+  clearLoginRedirectAttempt() {
+    this.sessionStorage?.removeItem(LoginRedirectAttemptKey);
+    return this;
   }
 
   logout(noRedirect) {
-    if (this.hasId()) {
-      return Api.delete("session/" + this.getId())
-        .then(() => {
-          return this.onLogout(noRedirect);
+    if (this.isAuthenticated()) {
+      return $api
+        .delete("session")
+        .then((resp) => {
+          // providerLogoutUri (RP-initiated logout) redirects the browser to the provider.
+          return this.onLogout(noRedirect, resp?.data?.providerLogoutUri);
         })
         .catch(() => {
           return this.onLogout(noRedirect);
@@ -373,5 +913,56 @@ export default class Session {
     } else {
       return this.onLogout(noRedirect);
     }
+  }
+
+  // revokePeerSessions revokes reachable peer sessions and clears their stored keys.
+  // Keys are cleared synchronously; the returned promise settles peer revocation.
+  // Unwrap stores so cross-namespace keys are not prefixed twice.
+  revokePeerSessions() {
+    const rawStore = (s) => (s && s.storage ? s.storage : s);
+    const stores = [rawStore(this.localStorage), rawStore(this.sessionStorage)];
+
+    let targets = [];
+    try {
+      targets = listLogoutTargets({ currentNamespace: this.storageNamespace, stores });
+    } catch {
+      targets = [];
+    }
+
+    // Cluster-OIDC Sign-Out delegates the Portal session to its end-session endpoint (which
+    // performs the upstream RP-logout); revoking it here would strip the session it needs.
+    let deleteTargets = targets;
+    if (this.isClusterSession() && this.config?.oidcLogout?.()) {
+      deleteTargets = targets.filter((t) => !t.portal);
+    }
+
+    const revoked = signOutInstances(deleteTargets).catch(() => {});
+    clearInstanceStorage(
+      targets.map((t) => t.namespace),
+      stores
+    );
+    return revoked;
+  }
+
+  // logoutEverywhere performs a cluster-wide Sign-Out (Tier 2): best-effort revokes
+  // every reachable peer instance's session server-side, drops their local tokens,
+  // then signs out the current instance (clearing the OP cookie) and redirects.
+  // Shared-domain (same-origin) clusters only; always resolves.
+  logoutEverywhere(noRedirect) {
+    return this.revokePeerSessions().then(() => this.logout(noRedirect));
+  }
+
+  // Synchronous cluster-wide logout for SPA route guards (/logout): revokes every
+  // reachable peer session and the current one (best-effort, in the background),
+  // clears shared storage, then resets client state. Firing the current DELETE with
+  // the captured token avoids a 401 echo that would re-raise the logout flag.
+  signOut() {
+    this.revokePeerSessions();
+    const token = this.getAuthToken();
+    if (token) {
+      $api.delete("session", { headers: { [RequestHeader]: token } }).catch(() => {});
+    }
+    this.onLogout(true);
+    return this;
   }
 }

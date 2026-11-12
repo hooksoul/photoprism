@@ -1,0 +1,137 @@
+package proxy
+
+import (
+	"net/http"
+	"net/url"
+	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+func TestRewriteLocation(t *testing.T) {
+	prefix := "/i/acme/"
+	host := "portal.example.com"
+
+	assert.Equal(t, "/i/acme/library", RewriteLocation("/library", prefix, host))
+	assert.Equal(t, "/i/acme/", RewriteLocation("/", prefix, host))
+	assert.Equal(t, "https://portal.example.com/i/acme/library", RewriteLocation("https://portal.example.com/library", prefix, host))
+	assert.Equal(t, "https://other.example.com/library", RewriteLocation("https://other.example.com/library", prefix, host))
+
+	// Portal-root paths are owned by the Portal itself (OIDC OP, discovery,
+	// admin UI). Instances that redirect to them — for example the Pro RP
+	// pointing at the Portal's authorize endpoint — must not be re-scoped
+	// under the instance path prefix.
+	assert.Equal(t, "/api/v1/oauth/authorize", RewriteLocation("/api/v1/oauth/authorize", prefix, host))
+	assert.Equal(t, "/.well-known/openid-configuration", RewriteLocation("/.well-known/openid-configuration", prefix, host))
+	assert.Equal(t, "/portal/login", RewriteLocation("/portal/login", prefix, host))
+	assert.Equal(t, "https://portal.example.com/api/v1/oauth/authorize?x=1", RewriteLocation("https://portal.example.com/api/v1/oauth/authorize?x=1", prefix, host))
+
+	// Instance-owned API paths (everything under /api/v1/ that is not the OP)
+	// must still be re-scoped under the per-instance prefix.
+	assert.Equal(t, "/i/acme/api/v1/photos", RewriteLocation("/api/v1/photos", prefix, host))
+}
+
+func TestIsPortalRootPath(t *testing.T) {
+	assert.True(t, isPortalRootPath("/api/v1/oauth/authorize"))
+	assert.True(t, isPortalRootPath("/api/v1/oauth/token"))
+	assert.True(t, isPortalRootPath("/api/v1/oauth/userinfo"))
+	assert.True(t, isPortalRootPath("/.well-known/openid-configuration"))
+	assert.True(t, isPortalRootPath("/portal/login"))
+	assert.True(t, isPortalRootPath("api/v1/oauth/authorize"))
+	assert.False(t, isPortalRootPath("/oauth/authorize"))
+	assert.False(t, isPortalRootPath("/library"))
+	assert.False(t, isPortalRootPath("/api/v1/photos"))
+	assert.False(t, isPortalRootPath(""))
+}
+
+func TestRewriteSetCookiePath(t *testing.T) {
+	prefix := "/i/acme/"
+
+	assert.Equal(t, "session=1; Path=/i/acme/; HttpOnly", RewriteSetCookiePath("session=1; Path=/; HttpOnly", prefix))
+	assert.Equal(t, "session=1; HttpOnly; Path=/i/acme/", RewriteSetCookiePath("session=1; HttpOnly", prefix))
+	assert.Equal(t, "session=1; Path=/i/acme/; HttpOnly", RewriteSetCookiePath("session=1; Path=/i/acme/; HttpOnly", prefix))
+}
+
+func TestHostMatch(t *testing.T) {
+	assert.True(t, HostMatch("portal.example.com", "portal.example.com"))
+	assert.True(t, HostMatch("portal.example.com:443", "portal.example.com"))
+	assert.True(t, HostMatch("Portal.Example.Com:443", "portal.example.com"))
+	assert.False(t, HostMatch("node.example.com", "portal.example.com"))
+	assert.True(t, HostMatch("[2001:db8::1]", "[2001:db8::1]"))
+	assert.True(t, HostMatch("[2001:db8::1]:8443", "[2001:db8::1]"))
+	assert.True(t, HostMatch("[2001:DB8::1]", "2001:db8::1"))
+	assert.False(t, HostMatch("[2001:db8::2]", "[2001:db8::1]"))
+	assert.True(t, HostMatch("[2001:0db8::0001]", "[2001:db8::1]"))
+	assert.True(t, HostMatch("192.0.2.1:2342", "192.0.2.1"))
+}
+
+func TestHostMatch_Invalid(t *testing.T) {
+	for _, host := range []string{
+		"[portal.example.com]",
+		"[PORTAL.EXAMPLE.COM]",
+		"[portal.example.com]:443",
+		"portal.example.com:evil.com",
+		"portal.example.com:0",
+		"portal.example.com:70000",
+		"portal.example.com:+443",
+		"portal.example.com:0443",
+		"portal.example.com:",
+		"[192.0.2.1]",
+		"[::ffff:192.0.2.1]",
+		"[]",
+		"",
+		"portal.example.com@evil",
+		"portal.example.com/x",
+		"portal.example.\u0441om",
+	} {
+		assert.False(t, HostMatch(host, "portal.example.com"), host)
+	}
+
+	assert.False(t, HostMatch("\u212a.example.com", "k.example.com"))
+	assert.False(t, HostMatch("photos.example.\u0130o", "photos.example.io"))
+
+	assert.False(t, HostMatch("[192.0.2.1]", "192.0.2.1"))
+	assert.False(t, HostMatch("", ""))
+}
+
+func TestHostKey(t *testing.T) {
+	for in, want := range map[string]string{
+		"Portal.Example.Com":     "portal.example.com",
+		"portal.example.com:443": "portal.example.com",
+		"[2001:DB8::1]:8443":     "2001:db8::1",
+		"2001:db8::1":            "2001:db8::1",
+		"192.0.2.1":              "192.0.2.1",
+	} {
+		got, ok := hostKey(in)
+		assert.True(t, ok, in)
+		assert.Equal(t, want, got, in)
+	}
+
+	_, ok := hostKey("[portal.example.com]")
+	assert.False(t, ok)
+}
+
+func TestRewriteDestinationHost(t *testing.T) {
+	upstream, err := url.Parse("http://instance.internal:2342")
+	require.NoError(t, err)
+
+	t.Run("RewritesMatchingHost", func(t *testing.T) {
+		req, err := http.NewRequest(http.MethodGet, "http://portal.example.com", nil)
+		require.NoError(t, err)
+		req.Header.Set("Destination", "http://portal.example.com/i/acme/import/dst.txt")
+
+		RewriteDestinationHost(req, "portal.example.com", upstream)
+
+		assert.Equal(t, "http://instance.internal:2342/i/acme/import/dst.txt", req.Header.Get("Destination"))
+	})
+	t.Run("SkipsDifferentHost", func(t *testing.T) {
+		req, err := http.NewRequest(http.MethodGet, "http://portal.example.com", nil)
+		require.NoError(t, err)
+		req.Header.Set("Destination", "http://other.example.com/i/acme/import/dst.txt")
+
+		RewriteDestinationHost(req, "portal.example.com", upstream)
+
+		assert.Equal(t, "http://other.example.com/i/acme/import/dst.txt", req.Header.Get("Destination"))
+	})
+}

@@ -1,34 +1,10 @@
-/*
-
-Copyright (c) 2018 - 2023 PhotoPrism UG. All rights reserved.
-
-    This program is free software: you can redistribute it and/or modify
-    it under Version 3 of the GNU Affero General Public License (the "AGPL"):
-    <https://docs.photoprism.app/license/agpl>
-
-    This program is distributed in the hope that it will be useful,
-    but WITHOUT ANY WARRANTY; without even the implied warranty of
-    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-    GNU Affero General Public License for more details.
-
-    The AGPL is supplemented by our Trademark and Brand Guidelines,
-    which describe how our Brand Assets may be used:
-    <https://www.photoprism.app/trademark>
-
-Feel free to send an email to hello@photoprism.app if you have questions,
-want to support our work, or just want to say hello.
-
-Additional information can be found in our Developer Guide:
-<https://docs.photoprism.app/developer-guide/>
-
-*/
-
 import Model from "model.js";
 import { DateTime } from "luxon";
-import { $gettext } from "common/vm";
+import { $gettext } from "common/gettext";
 
 const c = window.__CONFIG__;
 
+// Link encapsulates share links for albums/photos exposed via the public API.
 export default class Link extends Model {
   getDefaults() {
     return {
@@ -39,8 +15,6 @@ export default class Link extends Model {
       Expires: 0,
       Views: 0,
       MaxViews: 0,
-      Password: "",
-      HasPassword: false,
       Comment: "",
       Perm: 0,
       CreatedAt: "",
@@ -50,6 +24,19 @@ export default class Link extends Model {
 
   getToken() {
     return this.Token.toLowerCase().trim();
+  }
+
+  // validateToken checks a custom share token and returns true or an error message.
+  // It mirrors the character set and length limits the server applies when resolving a share link,
+  // so the field reports a value the server would reject.
+  static validateToken(value) {
+    const token = value ? String(value).toLowerCase().trim() : "";
+
+    if (!token) {
+      return true;
+    }
+
+    return token.length >= 6 && token.length <= 160 && /^[0-9a-z\-_:]+$/.test(token) ? true : $gettext("Invalid");
   }
 
   siteUrl() {
@@ -106,9 +93,7 @@ export default class Link extends Model {
   }
 
   expires() {
-    return DateTime.fromISO(this.ModifiedAt)
-      .plus({ seconds: this.Expires })
-      .toLocaleString(DateTime.DATE_MED);
+    return DateTime.fromISO(this.ModifiedAt).plus({ seconds: this.Expires }).toLocaleString(DateTime.DATE_MED);
   }
 
   static getCollectionResource() {

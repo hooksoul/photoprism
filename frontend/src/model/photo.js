@@ -1,96 +1,59 @@
-/*
-
-Copyright (c) 2018 - 2023 PhotoPrism UG. All rights reserved.
-
-    This program is free software: you can redistribute it and/or modify
-    it under Version 3 of the GNU Affero General Public License (the "AGPL"):
-    <https://docs.photoprism.app/license/agpl>
-
-    This program is distributed in the hope that it will be useful,
-    but WITHOUT ANY WARRANTY; without even the implied warranty of
-    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-    GNU Affero General Public License for more details.
-
-    The AGPL is supplemented by our Trademark and Brand Guidelines,
-    which describe how our Brand Assets may be used:
-    <https://www.photoprism.app/trademark>
-
-Feel free to send an email to hello@photoprism.app if you have questions,
-want to support our work, or just want to say hello.
-
-Additional information can be found in our Developer Guide:
-<https://docs.photoprism.app/developer-guide/>
-
-*/
-
 import memoizeOne from "memoize-one";
-
 import RestModel from "model/rest";
+import ModelCache from "model/model-cache";
 import File from "model/file";
 import Marker from "model/marker";
-import Api from "common/api";
 import { DateTime } from "luxon";
-import Util from "common/util";
-import { config } from "app/session";
+import { $config } from "app/session";
+import $api from "common/api";
+import { subscribeEntityActions } from "common/event";
+import $util from "common/util";
 import countries from "options/countries.json";
-import { $gettext } from "common/vm";
-import Clipboard from "common/clipboard";
+import { $gettext } from "common/gettext";
+import { PhotoClipboard } from "common/clipboard";
 import download from "common/download";
 import * as src from "common/src";
-import { canUseOGV, canUseVP8, canUseVP9, canUseAv1, canUseWebM, canUseHevc } from "common/caniuse";
+import * as media from "common/media";
+import * as formats from "options/formats";
 
-export const CodecOGV = "ogv";
-export const CodecVP8 = "vp8";
-export const CodecVP9 = "vp9";
-export const CodecAv1 = "av01";
-export const CodecAvc1 = "avc1";
-export const CodecHvc1 = "hvc1";
-export const FormatMp4 = "mp4";
-export const FormatAv1 = "av01";
-export const FormatAvc = "avc";
-export const FormatHevc = "hevc";
-export const FormatWebM = "webm";
-export const FormatJpeg = "jpg";
-export const FormatPng = "png";
-export const FormatSvg = "svg";
-export const FormatGif = "gif";
-export const MediaImage = "image";
-export const MediaRaw = "raw";
-export const MediaAnimated = "animated";
-export const MediaLive = "live";
-export const MediaVideo = "video";
-export const MediaVector = "vector";
-export const MediaSidecar = "sidecar";
 export const YearUnknown = -1;
 export const MonthUnknown = -1;
 export const DayUnknown = -1;
 export const TimeZoneUTC = "UTC";
+export const TimeZoneLocal = "Local";
 
-const num = "numeric";
-const short = "short";
-const long = "long";
+// isTimeZoneUTC reports whether the time zone is UTC.
+export function isTimeZoneUTC(zone) {
+  return typeof zone === "string" && zone.toLowerCase() === TimeZoneUTC.toLowerCase();
+}
 
-export const DATE_FULL = {
-  year: num,
-  month: long,
-  day: num,
-  weekday: long,
-  hour: num,
-  minute: num,
-};
+// isTimeZoneLocal reports whether the time zone is Local or not set, so the wall time is all that is known.
+export function isTimeZoneLocal(zone) {
+  return !zone || zone === TimeZoneLocal;
+}
 
-export const DATE_FULL_TZ = {
-  year: num,
-  month: short,
-  day: num,
-  weekday: short,
-  hour: num,
-  minute: num,
-  timeZoneName: short,
-};
+// localTimeString formats the wall time of a date as the naive UTC timestamp stored in TakenAtLocal.
+function localTimeString(date) {
+  return date.toISO({ suppressMilliseconds: true, includeOffset: false }) + "Z";
+}
 
-export let BatchSize = 120;
+export let BatchSize = 156;
 
+// MaxLength mirrors the backend Set*-helper clips (txt.ClipShortText / ClipText)
+// so UI validation matches what the server persists; keep in sync with details.go.
+export const MaxLength = Object.freeze({
+  Title: 200,
+  Caption: 4096,
+  Subject: 1024,
+  Artist: 1024,
+  Copyright: 1024,
+  License: 1024,
+  Keywords: 2048,
+  Notes: 2048,
+  Exposure: 64,
+});
+
+// Photo models core metadata for images and videos shown in the UI.
 export class Photo extends RestModel {
   constructor(values) {
     super(values);
@@ -101,26 +64,27 @@ export class Photo extends RestModel {
       ID: "",
       UID: "",
       DocumentID: "",
-      Type: MediaImage,
+      Type: media.Image,
       TypeSrc: "",
       Stack: 0,
       Favorite: false,
       Private: false,
       Scan: false,
       Panorama: false,
+      Projection: "",
       Portrait: false,
       TakenAt: "",
       TakenAtLocal: "",
       TakenSrc: "",
       TimeZone: "",
       Path: "",
-      Color: 0,
+      Color: -1,
       Name: "",
       OriginalName: "",
       Title: "",
       TitleSrc: "",
-      Description: "",
-      DescriptionSrc: "",
+      Caption: "",
+      CaptionSrc: "",
       Resolution: 0,
       Quality: 0,
       Faces: 0,
@@ -134,11 +98,19 @@ export class Photo extends RestModel {
       Views: 0,
       Camera: {},
       CameraID: 0,
+      CameraMake: "",
+      CameraModel: "",
+      CameraType: "",
       CameraSerial: "",
       CameraSrc: "",
       Lens: {},
       LensID: 0,
-      Country: "",
+      LensMake: "",
+      LensModel: "",
+      // "zz" mirrors the backend UnknownCountry default; without it the
+      // required country rule flashes red between dialog mount and the
+      // findCached() resolve that hydrates the real value.
+      Country: "zz",
       Year: YearUnknown,
       Month: MonthUnknown,
       Day: DayUnknown,
@@ -176,6 +148,7 @@ export class Photo extends RestModel {
       FileUID: "",
       FileRoot: "",
       FileName: "",
+      FileError: "",
       FileType: "",
       MediaType: "",
       FPS: 0.0,
@@ -183,6 +156,12 @@ export class Photo extends RestModel {
       Hash: "",
       Width: "",
       Height: "",
+      // Details.
+      DetailsKeywords: "",
+      DetailsSubject: "",
+      DetailsArtist: "",
+      DetailsCopyright: "",
+      DetailsLicense: "",
       // Date fields.
       CreatedAt: "",
       UpdatedAt: "",
@@ -193,38 +172,43 @@ export class Photo extends RestModel {
   }
 
   classes() {
-    return this.generateClasses(
-      this.isPlayable(),
-      Clipboard.has(this),
-      this.Portrait,
-      this.Favorite,
-      this.Private,
-      this.Files.length > 1
-    );
+    return this.generateClasses(this.isPlayable(), PhotoClipboard.has(this), this.Portrait, this.Favorite, this.Private, this.isStack());
   }
 
-  generateClasses = memoizeOne(
-    (isPlayable, isInClipboard, portrait, favorite, isPrivate, hasMultipleFiles) => {
-      let classes = ["is-photo", "uid-" + this.UID, "type-" + this.Type];
+  generateClasses = memoizeOne((isPlayable, isInClipboard, portrait, favorite, isPrivate, isStack) => {
+    let classes = ["is-photo", "uid-" + this.UID, "type-" + this.Type];
 
-      if (isPlayable) classes.push("is-playable");
-      if (isInClipboard) classes.push("is-selected");
-      if (portrait) classes.push("is-portrait");
-      if (favorite) classes.push("is-favorite");
-      if (isPrivate) classes.push("is-private");
-      if (hasMultipleFiles) classes.push("is-stack");
-
-      return classes;
+    if (isPlayable) {
+      classes.push("is-playable");
     }
-  );
+    if (isInClipboard) {
+      classes.push("is-selected");
+    }
+    if (portrait) {
+      classes.push("is-portrait");
+    }
+    if (favorite) {
+      classes.push("is-favorite");
+    }
+    if (isPrivate) {
+      classes.push("is-private");
+    }
+    if (isStack) {
+      classes.push("is-stack");
+    }
+
+    return classes;
+  });
 
   localDayString() {
     if (!this.TakenAtLocal) {
       return new Date().getDate().toString().padStart(2, "0");
     }
 
-    if (!this.Day || this.Day <= 0) {
-      return this.TakenAtLocal.substr(8, 2);
+    if (!this.Day) {
+      return this.TakenAtLocal.substring(8, 10);
+    } else if (this.Day <= 0) {
+      return "01";
     }
 
     return this.Day.toString().padStart(2, "0");
@@ -236,7 +220,7 @@ export class Photo extends RestModel {
     }
 
     if (!this.Month || this.Month <= 0) {
-      return this.TakenAtLocal.substr(5, 2);
+      return this.TakenAtLocal.substring(5, 7);
     }
 
     return this.Month.toString().padStart(2, "0");
@@ -248,12 +232,13 @@ export class Photo extends RestModel {
     }
 
     if (!this.Year || this.Year <= 1000) {
-      return this.TakenAtLocal.substr(0, 4);
+      return this.TakenAtLocal.substring(0, 4);
     }
 
     return this.Year.toString();
   }
 
+  // localDateString combines calendar fields and wall time in the current time zone.
   localDateString(time) {
     if (!this.localYearString()) {
       return this.TakenAtLocal;
@@ -262,16 +247,10 @@ export class Photo extends RestModel {
     let date = this.localYearString() + "-" + this.localMonthString() + "-" + this.localDayString();
 
     if (!time) {
-      time = this.TakenAtLocal.substr(11, 8);
+      time = this.TakenAtLocal.substring(11, 19);
     }
 
-    let iso = `${date}T${time}`;
-
-    if (this.originalTimeZoneUTC()) {
-      iso += "Z";
-    }
-
-    return iso;
+    return `${date}T${time}${this.currentTimeZoneUTC() ? "Z" : ""}`;
   }
 
   getTimeZone() {
@@ -282,8 +261,9 @@ export class Photo extends RestModel {
     return "";
   }
 
+  // timeIsUTC reports whether the displayed time uses UTC.
   timeIsUTC() {
-    return this.originalTimeZoneUTC() || this.currentTimeZoneUTC();
+    return this.currentTimeZoneUTC();
   }
 
   getDateTime() {
@@ -294,24 +274,96 @@ export class Photo extends RestModel {
     }
   }
 
-  currentTimeZoneUTC() {
-    const tz = this.getTimeZone();
-
-    if (tz) {
-      return tz.toLowerCase() === TimeZoneUTC.toLowerCase();
+  // setValues also resets the time anchor when the values carry a time or zone, since they are the known time again.
+  setValues(values, scalarOnly) {
+    if (values && ["TakenAt", "TakenAtLocal", "TimeZone"].some((key) => Object.hasOwn(values, key))) {
+      this.__timeAnchor = null;
     }
 
-    return false;
+    return super.setValues(values, scalarOnly);
   }
 
-  originalTimeZoneUTC() {
-    const tz = this.originalValue("TimeZone");
+  // rollback also resets the time anchor to the saved values.
+  rollback() {
+    this.__timeAnchor = null;
+    return super.rollback();
+  }
 
-    if (tz) {
-      return tz.toLowerCase() === TimeZoneUTC.toLowerCase();
+  // timeAnchor returns the known time that time zone changes start from: the time entered last with
+  // setLocalTime, or else the saved one, so changing the zone several times gives the same result as once.
+  timeAnchor() {
+    if (this.__timeAnchor) {
+      return this.__timeAnchor;
     }
 
-    return false;
+    return {
+      fromUTC: this.originalTimeZoneUTC(),
+      TakenAt: this.originalValue("TakenAt"),
+      TakenAtLocal: this.originalValue("TakenAtLocal"),
+    };
+  }
+
+  // setLocalTime sets the capture time from the date parts and a wall time in the current zone,
+  // and makes it the known time for later zone changes. It returns the parsed local date.
+  setLocalTime(time) {
+    const localDate = this.localDate(time);
+
+    if (!localDate.isValid) {
+      return localDate;
+    }
+
+    this.TakenAtLocal = localTimeString(localDate);
+
+    if (!isTimeZoneLocal(this.TimeZone)) {
+      this.TakenAt = localDate.toUTC().toISO({ suppressMilliseconds: true });
+    }
+
+    this.__timeAnchor = { fromUTC: this.currentTimeZoneUTC(), TakenAt: this.TakenAt, TakenAtLocal: this.TakenAtLocal };
+
+    return localDate;
+  }
+
+  // changeTimeZone sets a new zone without editing the time: a known UTC time is converted to the local time
+  // in that zone, and a known local time is kept, see timeAnchor. Month and Year follow only while all finer
+  // date parts are known, since an unknown day leaves a placeholder.
+  changeTimeZone(zone) {
+    if (zone === this.TimeZone) {
+      return;
+    }
+
+    const anchor = this.timeAnchor();
+    const toLocal = isTimeZoneLocal(zone);
+    const taken =
+      anchor.fromUTC && !toLocal
+        ? DateTime.fromISO(anchor.TakenAt, { zone: "UTC" }).setZone(zone)
+        : DateTime.fromISO(anchor.TakenAtLocal, { zone: "UTC" }).setZone(toLocal ? "UTC" : zone, { keepLocalTime: true });
+
+    if (!taken.isValid) {
+      return;
+    }
+
+    this.TimeZone = zone;
+    this.TakenAtLocal = localTimeString(taken);
+    this.TakenAt = taken.toUTC().toISO({ suppressMilliseconds: true });
+
+    if (this.Day > 0) {
+      this.Day = taken.day;
+      if (this.Month > 0) {
+        this.Month = taken.month;
+        if (this.Year > 0) {
+          this.Year = taken.year;
+        }
+      }
+    }
+  }
+
+  currentTimeZoneUTC() {
+    return isTimeZoneUTC(this.getTimeZone());
+  }
+
+  // originalTimeZoneUTC reports whether the saved time zone is UTC.
+  originalTimeZoneUTC() {
+    return isTimeZoneUTC(this.originalValue("TimeZone"));
   }
 
   localDate(time) {
@@ -319,14 +371,11 @@ export class Photo extends RestModel {
       return this.utcDate();
     }
 
-    let iso = this.localDateString(time);
-    let zone = this.getTimeZone();
+    const iso = this.localDateString(time);
+    const zone = this.getTimeZone();
 
-    if (zone === "") {
-      zone = "UTC";
-    }
-
-    return DateTime.fromISO(iso, { zone });
+    // A Local wall time is naive, so it is read as UTC rather than in the browser's zone.
+    return DateTime.fromISO(iso, { zone: isTimeZoneLocal(zone) ? "UTC" : zone });
   }
 
   utcDate() {
@@ -337,16 +386,48 @@ export class Photo extends RestModel {
     return DateTime.fromISO(takenAt).toUTC();
   });
 
+  getOriginalName() {
+    const file = this.originalFile();
+    return this.generateOriginalName(file);
+  }
+
+  generateOriginalName = memoizeOne((file) => {
+    let name = "";
+
+    if (file) {
+      if (file.OriginalName) {
+        name = file.OriginalName;
+      } else if (file.Name) {
+        name = file.Name;
+      }
+    }
+
+    if (!name) {
+      if (this.OriginalName) {
+        name = this.OriginalName;
+      } else if (this.FileName) {
+        name = this.FileName;
+      } else if (this.Name) {
+        name = this.Name;
+      } else {
+        return $gettext("Unknown");
+      }
+    }
+
+    return this.fileBase(name);
+  });
+
   baseName(truncate) {
-    let result = this.fileBase(this.FileName ? this.FileName : this.mainFile().Name);
+    let result = this.fileBase(this.FileName ? this.FileName : this.primaryFile().Name);
 
     if (truncate) {
-      result = Util.truncate(result, truncate, "…");
+      result = $util.truncate(result, truncate, "…");
     }
 
     return result;
   }
 
+  // fileBase returns the last element of a file path, without bidi and other control characters.
   fileBase(name) {
     let result = name;
     const slash = result.lastIndexOf("/");
@@ -355,12 +436,37 @@ export class Photo extends RestModel {
       result = name.substring(slash + 1);
     }
 
-    return result;
+    return $util.stripBidiControls(result);
   }
 
   getEntityName() {
     return this.Title;
   }
+
+  getHiddenReason = () => {
+    return this.generateHiddenReason(this.FileError, this.Files);
+  };
+
+  generateHiddenReason = memoizeOne((fileError, files) => {
+    if (fileError && typeof fileError === "string" && fileError.trim()) {
+      return fileError.trim();
+    }
+
+    if (!Array.isArray(files) || files.length < 1) {
+      return "";
+    }
+
+    let file = files.find((f) => !!f.Primary && f.Error);
+    if (!file) {
+      file = files.find((f) => !!f.Error);
+    }
+
+    if (!file || !file.Error) {
+      return "";
+    }
+
+    return String(file.Error).trim();
+  });
 
   getTitle() {
     return this.Title;
@@ -371,7 +477,7 @@ export class Photo extends RestModel {
   }
 
   refreshFileAttr() {
-    const file = this.mainFile();
+    const file = this.primaryFile();
 
     if (!file || !file.Hash) {
       return;
@@ -387,13 +493,37 @@ export class Photo extends RestModel {
   }
 
   generateIsPlayable = memoizeOne((type, files) => {
-    if (type === MediaAnimated) {
+    if (type === media.Animated || type === media.Audio) {
       return true;
     } else if (!files) {
       return false;
     }
 
     return files.some((f) => f.Video);
+  });
+
+  isStack() {
+    return this.generateIsStack(this.Type, this.Files);
+  }
+
+  generateIsStack = memoizeOne((type, files) => {
+    if (type !== media.Image) {
+      return false;
+    } else if (!files) {
+      return false;
+    } else if (files.length < 2) {
+      return false;
+    }
+
+    let jpegs = 0;
+
+    this.Files.forEach((f) => {
+      if (f && f.FileType === media.FormatJpeg) {
+        jpegs++;
+      }
+    });
+
+    return jpegs > 1;
   });
 
   videoParams() {
@@ -403,7 +533,7 @@ export class Photo extends RestModel {
       return { error: "no video selected" };
     }
 
-    let main = this.mainFile();
+    let main = this.primaryFile();
     let file = this.videoFile();
 
     if (!file) {
@@ -431,19 +561,19 @@ export class Photo extends RestModel {
     let width = actualWidth;
     let height = actualHeight;
 
-    if (vw < width + 80) {
-      let newWidth = vw - 90;
-      height = Math.round(newWidth * (actualHeight / actualWidth));
+    if (vw < width + 90) {
+      let newWidth = vw - 100;
+      height = Math.ceil(newWidth * (actualHeight / actualWidth));
       width = newWidth;
     }
 
-    if (vh < height + 100) {
-      let newHeight = vh - 160;
-      width = Math.round(newHeight * (actualWidth / actualHeight));
+    if (vh < height + 90) {
+      let newHeight = vh - 100;
+      width = Math.ceil(newHeight * (actualWidth / actualHeight));
       height = newHeight;
     }
 
-    const loop = this.Type === MediaAnimated || (file.Duration >= 0 && file.Duration <= 5000000000);
+    const loop = this.Type === media.Animated || (file.Duration >= 0 && file.Duration <= 5000000000);
     const poster = this.thumbnailUrl("fit_720");
     const error = false;
 
@@ -459,10 +589,10 @@ export class Photo extends RestModel {
       return false;
     }
 
-    let file = files.find((f) => f.Codec === CodecAvc1);
+    let file = files.find((f) => f.Codec === media.CodecAvc1);
 
     if (!file) {
-      file = files.find((f) => f.FileType === FormatMp4);
+      file = files.find((f) => f.FileType === media.FormatMp4);
     }
 
     if (!file) {
@@ -481,51 +611,113 @@ export class Photo extends RestModel {
       return false;
     }
 
-    return this.Files.find((f) => f.FileType === FormatGif || !!f.Frames || !!f.Duration);
+    return this.Files.find((f) => f.FileType === media.FormatGif || !!f.Frames || !!f.Duration);
+  }
+
+  videoContentType() {
+    const file = this.videoFile();
+
+    if (file) {
+      return $util.videoContentType(file?.Codec, file?.Mime);
+    } else {
+      return media.ContentTypeMp4AvcMain;
+    }
+  }
+
+  videoCodec() {
+    const file = this.videoFile();
+
+    if (file) {
+      return file?.Codec;
+    } else {
+      return "";
+    }
   }
 
   videoUrl() {
-    let file = this.videoFile();
+    const file = this.videoFile();
 
-    if (file) {
-      let videoFormat = FormatAvc;
-
-      if (canUseHevc && file.Codec === CodecHvc1) {
-        videoFormat = FormatHevc;
-      } else if (canUseOGV && file.Codec === CodecOGV) {
-        videoFormat = CodecOGV;
-      } else if (canUseVP8 && file.Codec === CodecVP8) {
-        videoFormat = CodecVP8;
-      } else if (canUseVP9 && file.Codec === CodecVP9) {
-        videoFormat = CodecVP9;
-      } else if (canUseAv1 && file.Codec === CodecAv1) {
-        videoFormat = FormatAv1;
-      } else if (canUseWebM && file.FileType === FormatWebM) {
-        videoFormat = FormatWebM;
-      }
-
-      return `${config.videoUri}/videos/${file.Hash}/${config.previewToken}/${videoFormat}`;
-    }
-
-    return `${config.videoUri}/videos/${this.Hash}/${config.previewToken}/${FormatAvc}`;
+    return $util.videoUrl(file ? file.Hash : this.Hash, file?.Codec, file?.Mime);
   }
 
-  mainFile() {
-    return this.getMainFileFromFiles(this.Files);
+  primaryFile() {
+    return this.generatePrimaryFile(this.Files);
   }
 
-  getMainFileFromFiles = memoizeOne((files) => {
+  generatePrimaryFile = memoizeOne((files) => {
     if (!files) {
       return this;
     }
 
+    // Return the primary image, if found.
     let file = files.find((f) => !!f.Primary);
 
+    // Found?
     if (file) {
       return file;
     }
 
-    return files.find((f) => f.FileType === FormatJpeg || f.FileType === FormatPng);
+    // Find and return the first JPEG or PNG image otherwise.
+    file = files.find((f) => f.FileType === media.FormatJpeg || f.FileType === media.FormatPng);
+
+    // Found?
+    if (file) {
+      return file;
+    }
+
+    return files.find((f) => !f.Sidecar);
+  });
+
+  originalFile() {
+    // Default to main file if there is only one.
+    if (this.Files?.length < 2) {
+      return this.primaryFile();
+    }
+
+    // If there are multiple files, find the first one with
+    // a format other than JPEG, e.g. RAW or Live.
+    return this.generateOriginalFile(this.Files);
+  }
+
+  generateOriginalFile = memoizeOne((files) => {
+    if (!files) {
+      return this;
+    }
+
+    let file;
+
+    // Find file with matching media type.
+    switch (this.Type) {
+      case media.Animated:
+        file = files.find((f) => f.MediaType === media.Image && f.Root === "/");
+        break;
+      case media.Live:
+        file = files.find((f) => (f.MediaType === media.Video || f.MediaType === media.Live || f.Video) && f.Root === "/");
+        break;
+      case media.Video:
+        file = files.find((f) => (f.MediaType === media.Video || f.Video) && f.Root === "/");
+        break;
+      case media.Raw:
+      case media.Vector:
+        file = files.find((f) => f.MediaType === this.Type && f.Root === "/");
+        break;
+    }
+
+    // Found?
+    if (file) {
+      return file;
+    }
+
+    // Find first original media file with a format other than JPEG.
+    file = files.find((f) => !f.Sidecar && f.FileType !== media.FormatJpeg && f.Root === "/");
+
+    // Found?
+    if (file) {
+      return file;
+    }
+
+    // Find and return the primary JPEG or PNG otherwise.
+    return this.generatePrimaryFile(files);
   });
 
   jpegFiles() {
@@ -533,23 +725,50 @@ export class Photo extends RestModel {
       return [this];
     }
 
-    return this.Files.filter((f) => f.FileType === FormatJpeg || f.FileType === FormatPng);
+    return this.Files.filter((f) => f.FileType === media.FormatJpeg || f.FileType === media.FormatPng);
   }
 
-  mainFileHash() {
-    return this.generateMainFileHash(this.mainFile(), this.Hash);
+  // Returns the primary file hash if it exists,
+  // otherwise the best matching non-sidecar file hash.
+  fileHash() {
+    return this.generateFileHash(this.Files, this.Hash);
   }
 
-  generateMainFileHash = memoizeOne((mainFile, hash) => {
-    if (this.Files) {
-      if (mainFile && mainFile.Hash) {
-        return mainFile.Hash;
+  generateFileHash = memoizeOne((files, hash) => {
+    // Get hash from file properties if a list of files exists and is not empty.
+    if (files && files.length > 0) {
+      // Use primary file hash, if exists.
+      let file = files.find((f) => !!f.Primary && f.Hash);
+      if (file) {
+        return file.Hash;
       }
-    } else if (hash) {
-      return hash;
+
+      // Use first JPEG or PNG file hash, if exists.
+      file = files.find((f) => (f.FileType === media.FormatJpeg || f.FileType === media.FormatPng) && !f.Missing && f.Hash);
+      if (file) {
+        return file.Hash;
+      }
+
+      // Use first video file hash, if exists.
+      file = files.find((f) => !!f.Video && !f.Missing && f.Hash);
+      if (file) {
+        return file.Hash;
+      }
+
+      // Use first non sidecar file hash, if exists.
+      file = files.find((f) => !f.Sidecar && !f.Missing && f.Hash);
+      if (file) {
+        return file.Hash;
+      }
     }
 
-    return "";
+    // Return an empty string if hash is not a string.
+    if (typeof hash !== "string") {
+      return "";
+    }
+
+    // Default to the photo's hash property (can be empty).
+    return hash;
   });
 
   fileModels() {
@@ -563,7 +782,19 @@ export class Photo extends RestModel {
       result.push(new File(f));
     });
 
+    // Get main file UID so it can be sorted first.
+    const mainUID = this.originalFile()?.UID;
+
     result.sort((a, b) => {
+      if (mainUID) {
+        // Ensure that the main file is sorted first.
+        if (mainUID === a.UID) {
+          return -1;
+        } else if (mainUID === b.UID) {
+          return 1;
+        }
+      }
+
       if (a.Primary > b.Primary) {
         return -1;
       } else if (a.Primary < b.Primary) {
@@ -576,90 +807,118 @@ export class Photo extends RestModel {
     return result;
   }
 
+  // Returns the thumbnail URL of the primary file,
+  // or otherwise the best matching non-sidecar file.
   thumbnailUrl(size) {
-    return this.generateThumbnailUrl(
-      this.mainFileHash(),
-      this.videoFile(),
-      config.contentUri,
-      config.previewToken,
-      size
-    );
+    return this.generateThumbnailUrl(this.fileHash(), $config.staticUri, $config.contentUri, $config.previewToken, size);
   }
 
-  generateThumbnailUrl = memoizeOne((mainFileHash, videoFile, contentUri, previewToken, size) => {
-    let hash = mainFileHash;
-
-    if (!hash) {
-      if (videoFile && videoFile.Hash) {
-        return `${contentUri}/t/${videoFile.Hash}/${previewToken}/${size}`;
-      }
-
-      return `${contentUri}/svg/photo`;
+  generateThumbnailUrl = memoizeOne((fileHash, staticUri, contentUri, previewToken, size) => {
+    if (!fileHash) {
+      return `${staticUri}/img/404.jpg`;
     }
 
-    return `${contentUri}/t/${hash}/${previewToken}/${size}`;
+    return `${contentUri}/t/${fileHash}/${previewToken}/${size}`;
   });
 
+  // Returns the download URL for the primary file if it is set in Files
+  // or if there is no list of files (otherwise the best matching image
+  // or video file).
   getDownloadUrl() {
-    return `${config.apiUri}/dl/${this.mainFileHash()}?t=${config.downloadToken}`;
+    return `${$config.apiUri}/dl/${this.fileHash()}?t=${$config.downloadToken}`;
   }
 
+  // isVideoFileKept checks if a file of a video is a video, a live photo part, or a metadata sidecar.
+  isVideoFileKept(file) {
+    return file.MediaType === media.Video || file.MediaType === media.Live || file.MediaType === media.Sidecar || !!file.Video || !!file.Sidecar;
+  }
+
+  // Downloads all related files if they exist and depending on the settings.
+  // Returns { downloaded, skipped } so callers can report the outcome.
   downloadAll() {
-    const s = config.settings();
+    const s = $config.getSettings();
 
     if (!s || !s.features || !s.download || !s.features.download || s.download.disabled) {
       console.log("download: disabled in settings", s.features, s.download);
-      return;
+      return { downloaded: 0, skipped: 0 };
     }
 
-    const token = config.downloadToken;
+    const token = $config.downloadToken;
 
     if (!this.Files) {
-      const hash = this.mainFileHash();
+      // Download primary file if no list of Files is specified.
+      const hash = this.fileHash();
 
       if (hash) {
-        download(`/${config.apiUri}/dl/${hash}?t=${token}`, this.baseName(false));
-      } else if (config.debug) {
+        download(`${$config.apiUri}/dl/${hash}?t=${token}`, this.baseName(false));
+        return { downloaded: 1, skipped: 0 };
+      } else if ($config.debug) {
         console.log("download: failed, empty file hash", this);
       }
 
-      return;
+      return { downloaded: 0, skipped: 0 };
     }
 
-    this.Files.forEach((file) => {
+    let downloaded = 0;
+    let skipped = 0;
+
+    let files = this.Files;
+
+    // Start the video files of a video first, since some browsers keep only the first of several downloads.
+    if (this.Type === media.Video) {
+      const isVideo = (file) => !!file && (file.MediaType === media.Video || !!file.Video);
+      files = [...files.filter(isVideo), ...files.filter((file) => !isVideo(file))];
+    }
+
+    files.forEach((file) => {
       if (!file || !file.Hash) {
         return;
       }
 
       // Originals only?
-      if (s.download.originals && file.Root.length > 1) {
+      if (s.download.originals && file.Root !== "/") {
         // Don't download broken files and sidecars.
-        if (config.debug) console.log(`download: skipped ${file.Root} file ${file.Name}`);
+        if ($config.debug) {
+          console.log(`download: skipped ${file.Root} file ${file.Name}`);
+        }
+        skipped++;
         return;
       }
 
       // Skip metadata sidecar files?
-      if (!s.download.mediaSidecar && (file.MediaType === MediaSidecar || file.Sidecar)) {
+      if (!s.download.mediaSidecar && (file.MediaType === media.Sidecar || file.Sidecar)) {
         // Don't download broken files and sidecars.
-        if (config.debug) console.log(`download: skipped sidecar file ${file.Name}`);
+        if ($config.debug) {
+          console.log(`download: skipped sidecar file ${file.Name}`);
+        }
+        skipped++;
         return;
       }
 
       // Skip RAW images?
-      if (!s.download.mediaRaw && (file.MediaType === MediaRaw || file.FileType === MediaRaw)) {
-        if (config.debug) console.log(`download: skipped raw file ${file.Name}`);
+      if (!s.download.mediaRaw && (file.MediaType === media.Raw || file.FileType === media.Raw)) {
+        if ($config.debug) {
+          console.log(`download: skipped raw file ${file.Name}`);
+        }
+        skipped++;
         return;
       }
 
-      // If this is a video, always skip stacked images...
-      // see https://github.com/photoprism/photoprism/issues/1436
-      if (this.Type === MediaVideo && !(file.MediaType === MediaVideo || file.Video)) {
-        if (config.debug) console.log(`download: skipped video sidecar ${file.Name}`);
+      // Skip generated still images of videos, i.e. files outside the originals folder that
+      // are neither a video, a live photo part, nor a metadata sidecar.
+      if (this.Type === media.Video && typeof file.Root === "string" && file.Root !== "/" && !this.isVideoFileKept(file)) {
+        if ($config.debug) {
+          console.log(`download: skipped video still ${file.Name}`);
+        }
+        skipped++;
         return;
       }
 
-      download(`${config.apiUri}/dl/${file.Hash}?t=${token}`, this.fileBase(file.Name));
+      download(`${$config.apiUri}/dl/${file.Hash}?t=${token}`, this.fileBase(file.Name));
+      downloaded++;
     });
+
+    return { downloaded, skipped };
   }
 
   calculateSize(width, height) {
@@ -675,24 +934,17 @@ export class Photo extends RestModel {
 
     if (srcAspectRatio > maxAspectRatio) {
       newW = width;
-      newH = Math.round(newW / srcAspectRatio);
+      newH = Math.ceil(newW / srcAspectRatio);
     } else {
       newH = height;
-      newW = Math.round(newH * srcAspectRatio);
+      newW = Math.ceil(newH * srcAspectRatio);
     }
 
     return { width: newW, height: newH };
   }
 
   getDateString(showTimeZone) {
-    return this.generateDateString(
-      showTimeZone,
-      this.TakenAt,
-      this.Year,
-      this.Month,
-      this.Day,
-      this.TimeZone
-    );
+    return this.generateDateString(showTimeZone, this.TakenAt, this.Year, this.Month, this.Day, this.TimeZone);
   }
 
   generateDateString = memoizeOne((showTimeZone, takenAt, year, month, day, timeZone) => {
@@ -702,11 +954,15 @@ export class Photo extends RestModel {
       return this.localYearString();
     } else if (day === DayUnknown) {
       return this.localDate().toLocaleString({
-        month: long,
-        year: num,
+        month: formats.long,
+        year: formats.num,
       });
-    } else if (timeZone) {
-      return this.localDate().toLocaleString(showTimeZone ? DATE_FULL_TZ : DATE_FULL);
+    } else if (timeZone && timeZone !== TimeZoneLocal) {
+      if (showTimeZone) {
+        return this.localDate().toLocaleString(formats.DATETIME_LONG_TZ);
+      } else {
+        return this.localDate().toLocaleString(formats.DATETIME_LONG);
+      }
     }
 
     return this.localDate().toLocaleString(DateTime.DATE_HUGE);
@@ -725,7 +981,7 @@ export class Photo extends RestModel {
       return this.localDate().toLocaleString({ month: "long", year: "numeric" });
     }
 
-    return this.localDate().toLocaleString(DateTime.DATE_MED);
+    return this.localDate().toLocaleString({ day: "numeric", month: "numeric", year: "numeric" });
   });
 
   hasLocation() {
@@ -744,22 +1000,38 @@ export class Photo extends RestModel {
     return $gettext("Unknown");
   }
 
-  locationInfo = () => {
-    return this.generateLocationInfo(this.PlaceID, this.Country, this.Place, this.PlaceLabel);
-  };
+  // Localized location label with the "Unknown" fallback — for views
+  // that render the placeholder as an edit prompt (cards, list, edit
+  // dialog). Read-only renderers should use `placeName()`.
+  locationInfo() {
+    return this.placeName() || $gettext("Unknown");
+  }
 
-  generateLocationInfo = memoizeOne((placeId, countryCode, place, placeLabel) => {
-    if (placeId === "zz" && countryCode !== "zz") {
+  // Returns the place label, or "" when the photo has no real
+  // geocoding data. Read-only callers gate row visibility on this.
+  placeName() {
+    return this.generatePlaceName(this.PlaceID, this.Country, this.Place, this.PlaceLabel);
+  }
+
+  generatePlaceName = memoizeOne((placeId, countryCode, place, placeLabel) => {
+    let label = "";
+
+    if (placeId === "zz" && countryCode && countryCode !== "zz") {
       const country = countries.find((c) => c.Code === countryCode);
-
       if (country) {
         return country.Name;
       }
     } else if (place && place.Label) {
-      return place.Label;
+      label = place.Label;
     }
 
-    return placeLabel ? placeLabel : $gettext("Unknown");
+    if (!label) {
+      label = placeLabel || "";
+    }
+
+    // Strip the DB literal from UnknownPlace (`internal/entity/place.go`).
+    // Backend-set, not translated — safe to compare.
+    return label === "Unknown" ? "" : label;
   });
 
   addSizeInfo(file, info) {
@@ -767,24 +1039,26 @@ export class Photo extends RestModel {
       return;
     }
 
-    if (file.Width && file.Height) {
-      info.push(file.Width + " × " + file.Height);
-    } else if (!file.Primary) {
-      let main = this.mainFile();
-      if (main && main.Width && main.Height) {
-        info.push(main.Width + " × " + main.Height);
+    if (file?.Pages > 0) {
+      info.push(file.Pages + " " + $gettext("Pages"));
+    }
+
+    if (file?.MediaType !== media.Document) {
+      if (file.Width && file.Height) {
+        info.push(file.Width + " × " + file.Height);
+      } else if (!file.Primary) {
+        let primary = this.primaryFile();
+        if (primary && primary.Width && primary.Height) {
+          info.push(primary.Width + " × " + primary.Height);
+        }
       }
     }
 
-    if (file.Size > 102400) {
-      const size = Number.parseFloat(file.Size) / 1048576;
-
-      info.push(size.toFixed(1) + " MB");
-    } else if (file.Size) {
-      const size = Number.parseFloat(file.Size) / 1024;
-
-      info.push(size.toFixed(1) + " KB");
+    if (!file.Size) {
+      return;
     }
+
+    info.push($util.formatBytes(file.Size));
   }
 
   vectorFile() {
@@ -792,25 +1066,25 @@ export class Photo extends RestModel {
       return this;
     }
 
-    return this.Files.find((f) => f.MediaType === MediaVector || f.FileType === FormatSvg);
+    return this.Files.find((f) => f.MediaType === media.Document || f.MediaType === media.Vector || f.FileType === media.FormatSVG);
   }
 
   getVectorInfo = () => {
-    let file = this.vectorFile() || this.mainFile();
+    let file = this.vectorFile() || this.primaryFile();
     return this.generateVectorInfo(file);
   };
 
   generateVectorInfo = memoizeOne((file) => {
     if (!file) {
-      return $gettext("Vector");
+      return $gettext("Unknown");
     }
 
     const info = [];
 
-    if (file.MediaType === MediaVector) {
-      info.push(Util.fileType(file.FileType));
+    if (file.MediaType === media.Vector || file.MediaType === media.Document) {
+      info.push($util.fileType(file.FileType));
     } else {
-      info.push($gettext("Vector"));
+      info.push($gettext("Unknown"));
     }
 
     this.addSizeInfo(file, info);
@@ -818,12 +1092,13 @@ export class Photo extends RestModel {
     return info.join(", ");
   });
 
+  // Example: 1:03:46, HEVC, 1440 × 1920, 4.2 MB
   getVideoInfo = () => {
-    let file = this.videoFile() || this.mainFile();
-    return this.generateVideoInfo(file);
+    let file = this.videoFile() || this.primaryFile();
+    return this.generateVideoInfo(this.Camera, this.CameraID, this.CameraMake, this.CameraModel, file);
   };
 
-  generateVideoInfo = memoizeOne((file) => {
+  generateVideoInfo = memoizeOne((camera, cameraId, cameraMake, cameraModel, file) => {
     if (!file) {
       return $gettext("Video");
     }
@@ -831,11 +1106,13 @@ export class Photo extends RestModel {
     const info = [];
 
     if (file.Duration > 0) {
-      info.push(Util.duration(file.Duration));
+      info.push($util.formatDuration(file.Duration));
     }
 
     if (file.Codec) {
-      info.push(file.Codec.toUpperCase());
+      info.push($util.formatCodec(file.Codec));
+    } else if (file.FileType) {
+      info.push($util.formatCodec(file.FileType));
     }
 
     this.addSizeInfo(file, info);
@@ -847,34 +1124,65 @@ export class Photo extends RestModel {
     return info.join(", ");
   });
 
-  getPhotoInfo = () => {
-    let file = this.videoFile();
-    if (!file || !file.Width) {
-      file = this.mainFile();
-    }
-
-    return this.generatePhotoInfo(this.Camera, this.CameraModel, this.CameraMake, file);
+  // Example: 1:03:46
+  getDurationInfo = () => {
+    let file = this.videoFile() || this.primaryFile();
+    return this.generateDurationInfo(file);
   };
 
-  generatePhotoInfo = memoizeOne((camera, cameraModel, cameraMake, file) => {
-    let info = [];
-
-    if (camera) {
-      if (camera.Model.length > 7) {
-        info.push(camera.Model);
-      } else {
-        info.push(camera.Make + " " + camera.Model);
-      }
-    } else if (cameraModel && cameraMake) {
-      if (cameraModel.length > 7) {
-        info.push(cameraModel);
-      } else {
-        info.push(cameraMake + " " + cameraModel);
-      }
+  generateDurationInfo = memoizeOne((file) => {
+    if (!file) {
+      return "▶";
+    } else if (file.Duration && file.Duration > 0) {
+      return $util.formatDuration(file.Duration);
     }
 
+    if (file.Codec) {
+      return $util.formatCodec(file.Codec);
+    } else if (file.FileType) {
+      return $util.formatCodec(file.FileType);
+    }
+
+    return "▶";
+  });
+
+  // Example: Apple iPhone 12 Pro Max, DNG, 4032 × 3024, 32.9 MB
+  getCameraInfo() {
+    return this.generateCameraInfo(this.Camera, this.CameraID, this.CameraMake, this.CameraModel, this.Iso, this.Exposure);
+  }
+
+  generateCameraInfo = memoizeOne((camera, cameraId, cameraMake, cameraModel, iso, exposure) => {
+    let info = [];
+
+    // Return only the complete camera name if the original is or contains a video.
+    info.push($util.formatCamera(camera, cameraId, cameraMake, cameraModel, true));
+
+    if (iso) {
+      info.push("ISO " + iso);
+    }
+
+    if (exposure) {
+      info.push(exposure);
+    }
+
+    if (!info.length) {
+      return $gettext("Unknown");
+    }
+
+    return info.join(", ");
+  });
+
+  // Example: DNG, 4032 × 3024, 32.9 MB
+  getImageInfo = () => {
+    let file = this.originalFile() || this.videoFile();
+    return this.generateImageInfo(file);
+  };
+
+  generateImageInfo = memoizeOne((file) => {
+    let info = [];
+
     if (file && file.Width && file.Codec) {
-      info.push(file.Codec.toUpperCase());
+      info.push($util.formatCodec(file.Codec));
     }
 
     this.addSizeInfo(file, info);
@@ -886,6 +1194,60 @@ export class Photo extends RestModel {
     return info.join(", ");
   });
 
+  // Example: iPhone 12 Pro Max 5.1mm ƒ/1.6, 26mm, ISO32, 1/4525
+  getLensInfo() {
+    return this.generateLensInfo(this.Lens, this.LensID, this.LensMake, this.LensModel, this.CameraModel, this.FNumber, this.FocalLength);
+  }
+
+  generateLensInfo = memoizeOne((lens, lensId, lensMake, lensModel, cameraModel, fNumber, focalLength) => {
+    let info = [];
+    const id = lensId ? lensId : lens && lens.ID ? lens.ID : 1;
+    const make = lensMake ? lensMake : lens && lens.Make ? lens.Make : "";
+    const model = (lensModel ? lensModel : lens && lens.Model ? lens.Model : "").replace("f/", "ƒ/");
+
+    // Example: EF-S18-55mm f/3.5-5.6 IS STM
+    if (id > 1) {
+      if (!model && !!make) {
+        info.push(make);
+      } else if (model.length > 45) {
+        return model;
+      } else if (model) {
+        info.push(model);
+      }
+    }
+
+    if (focalLength) {
+      info.push(focalLength + "mm");
+    }
+
+    if (fNumber && (!model || !model.endsWith(fNumber.toString()))) {
+      info.push("ƒ/" + fNumber);
+    }
+
+    if (!info.length) {
+      return $gettext("Unknown");
+    }
+
+    return info.join(", ");
+  });
+
+  getExifInfo() {
+    const parts = [];
+    if (this.FocalLength) {
+      parts.push(this.FocalLength + "mm");
+    }
+    if (this.FNumber) {
+      parts.push("\u0192/" + this.FNumber);
+    }
+    if (this.Iso) {
+      parts.push("ISO " + this.Iso);
+    }
+    if (this.Exposure) {
+      parts.push(this.Exposure);
+    }
+    return parts.join(" \u2022 ");
+  }
+
   getCamera() {
     if (this.Camera) {
       return this.Camera.Make + " " + this.Camera.Model;
@@ -896,12 +1258,15 @@ export class Photo extends RestModel {
     return $gettext("Unknown");
   }
 
+  // archive moves the photo to the archive (soft delete). No local flag flip:
+  // Photo consumers don't read .Archived (Thumb carries that state); the grid
+  // refreshes via the photos.archived WS handler.
   archive() {
-    return Api.post("batch/photos/archive", { photos: [this.getId()] });
+    return $api.post("batch/photos/archive", { photos: [this.getId()] });
   }
 
   approve() {
-    return Api.post(this.getEntityResource() + "/approve");
+    return $api.post(this.getEntityResource() + "/approve");
   }
 
   toggleLike() {
@@ -910,35 +1275,29 @@ export class Photo extends RestModel {
 
     if (favorite) {
       elements.forEach((el) => el.classList.add("is-favorite"));
-      return Api.post(this.getEntityResource() + "/like");
+      return $api.post(this.getEntityResource() + "/like");
     } else {
       elements.forEach((el) => el.classList.remove("is-favorite"));
-      return Api.delete(this.getEntityResource() + "/like");
+      return $api.delete(this.getEntityResource() + "/like");
     }
   }
 
   togglePrivate() {
     this.Private = !this.Private;
 
-    return Api.put(this.getEntityResource(), { Private: this.Private });
+    return $api.put(this.getEntityResource(), { Private: this.Private });
   }
 
-  primaryFile(fileUID) {
-    return Api.post(`${this.getEntityResource()}/files/${fileUID}/primary`).then((r) =>
-      Promise.resolve(this.setValues(r.data))
-    );
+  setPrimaryFile(fileUID) {
+    return $api.post(`${this.getEntityResource()}/files/${fileUID}/primary`).then((r) => Promise.resolve(this.setValues(r.data)));
   }
 
   unstackFile(fileUID) {
-    return Api.post(`${this.getEntityResource()}/files/${fileUID}/unstack`).then((r) =>
-      Promise.resolve(this.setValues(r.data))
-    );
+    return $api.post(`${this.getEntityResource()}/files/${fileUID}/unstack`).then((r) => Promise.resolve(this.setValues(r.data)));
   }
 
   deleteFile(fileUID) {
-    return Api.delete(`${this.getEntityResource()}/files/${fileUID}`).then((r) =>
-      Promise.resolve(this.setValues(r.data))
-    );
+    return $api.delete(`${this.getEntityResource()}/files/${fileUID}`).then((r) => Promise.resolve(this.setValues(r.data)));
   }
 
   changeFileOrientation(file) {
@@ -956,43 +1315,64 @@ export class Photo extends RestModel {
     }
 
     // Change file orientation.
-    return Api.put(`${this.getEntityResource()}/files/${file.UID}/orientation`, values).then((r) =>
-      Promise.resolve(this.setValues(r.data))
-    );
+    return $api.put(`${this.getEntityResource()}/files/${file.UID}/orientation`, values).then((r) => Promise.resolve(this.setValues(r.data)));
   }
 
   like() {
     this.Favorite = true;
-    return Api.post(this.getEntityResource() + "/like");
+    return $api.post(this.getEntityResource() + "/like");
   }
 
   unlike() {
     this.Favorite = false;
-    return Api.delete(this.getEntityResource() + "/like");
+    return $api.delete(this.getEntityResource() + "/like");
   }
 
   addLabel(name) {
-    return Api.post(this.getEntityResource() + "/label", { Name: name, Priority: 10 }).then((r) =>
-      Promise.resolve(this.setValues(r.data))
-    );
+    return $api.post(this.getEntityResource() + "/label", { Name: name, Priority: 10 }).then((r) => Promise.resolve(this.setValues(r.data)));
   }
 
   activateLabel(id) {
-    return Api.put(this.getEntityResource() + "/label/" + id, { Uncertainty: 0 }).then((r) =>
-      Promise.resolve(this.setValues(r.data))
-    );
+    return $api.put(this.getEntityResource() + "/label/" + id, { Uncertainty: 0 }).then((r) => Promise.resolve(this.setValues(r.data)));
   }
 
   renameLabel(id, name) {
-    return Api.put(this.getEntityResource() + "/label/" + id, { Label: { Name: name } }).then((r) =>
-      Promise.resolve(this.setValues(r.data))
-    );
+    return $api.put(this.getEntityResource() + "/label/" + id, { Label: { Name: name } }).then((r) => Promise.resolve(this.setValues(r.data)));
   }
 
   removeLabel(id) {
-    return Api.delete(this.getEntityResource() + "/label/" + id).then((r) =>
-      Promise.resolve(this.setValues(r.data))
-    );
+    return $api.delete(this.getEntityResource() + "/label/" + id).then((r) => Promise.resolve(this.setValues(r.data)));
+  }
+
+  // addToAlbum adds this photo to the album, then evicts and refetches so
+  // this.Albums reflects the saved state without waiting on a WS round-trip.
+  // Distinct from Thumb.addToAlbum (grid layer, Removed flag); both contracts
+  // are pinned in tests.
+  addToAlbum(albumUID) {
+    if (!albumUID) {
+      return Promise.resolve(this);
+    }
+    return $api
+      .post(`albums/${albumUID}/photos`, { photos: [this.UID] })
+      .then(() => {
+        Photo.evictCache(this.UID);
+        return this.find(this.UID);
+      })
+      .then((photo) => Promise.resolve(this.setValues(photo.getValues())));
+  }
+
+  // removeFromAlbum mirrors addToAlbum's evict + refind pattern.
+  removeFromAlbum(albumUID) {
+    if (!albumUID) {
+      return Promise.resolve(this);
+    }
+    return $api
+      .delete(`albums/${albumUID}/photos`, { data: { photos: [this.UID] } })
+      .then(() => {
+        Photo.evictCache(this.UID);
+        return this.find(this.UID);
+      })
+      .then((photo) => Promise.resolve(this.setValues(photo.getValues())));
   }
 
   getMarkers(valid) {
@@ -1015,10 +1395,63 @@ export class Photo extends RestModel {
     return result;
   }
 
+  // trimInputs strips whitespace from MaxLength fields; Subject/Artist/etc. live under Details.
+  trimInputs() {
+    for (const key of Object.keys(MaxLength)) {
+      if (typeof this[key] === "string") {
+        this[key] = this[key].trim();
+        continue;
+      }
+      if (this.Details && typeof this.Details[key] === "string") {
+        this.Details[key] = this.Details[key].trim();
+      }
+    }
+  }
+
+  // mergeUnchanged copies the editable text fields and their sources from values into fields without
+  // unsaved edits and records them as saved, so a refresh from the server never discards local edits.
+  mergeUnchanged(values) {
+    if (!values) {
+      return;
+    }
+
+    const changes = {};
+
+    for (const key of ["Title", "Caption"]) {
+      if (this[key] === this.originalValue(key)) {
+        for (const field of [key, `${key}Src`]) {
+          if (values[field] !== undefined) {
+            changes[field] = values[field];
+          }
+        }
+      }
+    }
+
+    this.setValues(changes, true);
+
+    const details = this.Details;
+    const saved = this.__originalValues.Details;
+
+    if (!details || !saved || !values.Details) {
+      return;
+    }
+
+    for (const key of ["Subject", "Artist", "Copyright", "License", "Keywords", "Notes"]) {
+      if (details[key] === saved[key]) {
+        for (const field of [key, `${key}Src`]) {
+          if (values.Details[field] !== undefined) {
+            details[field] = saved[field] = values.Details[field];
+          }
+        }
+      }
+    }
+  }
+
   update() {
+    this.trimInputs();
     const values = this.getValues(true);
 
-    if (values.Title) {
+    if (typeof values.Title === "string") {
       values.TitleSrc = src.Manual;
     }
 
@@ -1026,66 +1459,52 @@ export class Photo extends RestModel {
       values.TypeSrc = src.Manual;
     }
 
-    if (values.Description) {
-      values.DescriptionSrc = src.Manual;
+    if (typeof values.Caption === "string") {
+      values.CaptionSrc = src.Manual;
     }
 
     if (values.Lat || values.Lng || values.Country) {
       values.PlaceSrc = src.Manual;
     }
 
-    if (
-      values.TakenAt ||
-      values.TakenAtLocal ||
-      values.TimeZone ||
-      values.Day ||
-      values.Month ||
-      values.Year
-    ) {
+    if (values.TakenAt || values.TakenAtLocal || values.TimeZone || values.Day || values.Month || values.Year) {
       values.TakenSrc = src.Manual;
     }
 
-    if (
-      values.CameraID ||
-      values.LensID ||
-      values.FocalLength ||
-      values.FNumber ||
-      values.Iso ||
-      values.Exposure
-    ) {
+    if (values.CameraID || values.LensID || values.FocalLength || values.FNumber || values.Iso || values.Exposure) {
       values.CameraSrc = src.Manual;
     }
 
     // Update details source if needed.
     if (values.Details) {
-      if (values.Details.Keywords) {
+      if (values.Details.Keywords !== this.__originalValues.Details.Keywords) {
         values.Details.KeywordsSrc = src.Manual;
       }
 
-      if (values.Details.Notes) {
+      if (values.Details.Notes !== this.__originalValues.Details.Notes) {
         values.Details.NotesSrc = src.Manual;
       }
 
-      if (values.Details.Subject) {
+      if (values.Details.Subject !== this.__originalValues.Details.Subject) {
         values.Details.SubjectSrc = src.Manual;
       }
 
-      if (values.Details.Artist) {
+      if (values.Details.Artist !== this.__originalValues.Details.Artist) {
         values.Details.ArtistSrc = src.Manual;
       }
 
-      if (values.Details.Copyright) {
+      if (values.Details.Copyright !== this.__originalValues.Details.Copyright) {
         values.Details.CopyrightSrc = src.Manual;
       }
 
-      if (values.Details.License) {
+      if (values.Details.License !== this.__originalValues.Details.License) {
         values.Details.LicenseSrc = src.Manual;
       }
     }
 
-    return Api.put(this.getEntityResource(), values).then((resp) => {
+    return $api.put(this.getEntityResource(), values).then((resp) => {
       if (values.Type || values.Lat) {
-        config.update();
+        $config.update();
       }
 
       return Promise.resolve(this.setValues(resp.data));
@@ -1111,6 +1530,63 @@ export class Photo extends RestModel {
     return $gettext("Photo");
   }
 
+  // Module-level Photo cache. Per-subclass scoping (rather than a shared
+  // static on Rest) keeps Photo's size budget and invalidation surface
+  // independent from other model caches. Snapshot via getValues so type
+  // coercion through getDefaults() is applied; hydrate by constructing
+  // a fresh Photo from the cached values.
+  static _cache = new ModelCache({
+    max: 50,
+    ttl: 0,
+    snapshot: (photo) => (photo instanceof Photo ? photo.getValues(false) : photo),
+    hydrate: (values) => new Photo(values),
+  });
+
+  // getCache exposes the ModelCache so the inherited Rest.findCached and
+  // Rest.prefetch helpers can route through it. Subclasses that don't want
+  // caching simply don't override Rest.getCache() (default: null).
+  static getCache() {
+    return Photo._cache;
+  }
+
+  // evictCache drops a photo from the LRU. Mutating methods rely on the
+  // photos.* WS subscriptions below; this stays as an escape hatch for flows
+  // that mutate a photo without a matching event (e.g. album-membership).
+  static evictCache(uid) {
+    if (uid) {
+      Photo._cache.evict(uid);
+    }
+  }
+
+  // clearCache drops every cached photo and rejects in-flight fetches via the
+  // session-epoch gate so metadata fetched under one role cannot reach another.
+  static clearCache() {
+    Photo._cache.clear();
+  }
+
+  // Warms the cache for the slides around `index` so the next/previous
+  // sidebar open hits a cached entity. Defaults match the lightbox's
+  // current policy (one slide forward, none back). Each prefetch is
+  // fire-and-forget; rejections are absorbed via Promise.allSettled.
+  static prefetchAround(models, index, { before = 0, after = 1 } = {}) {
+    if (!Array.isArray(models) || typeof index !== "number" || index < 0) {
+      return Promise.resolve([]);
+    }
+    const tasks = [];
+    const start = Math.max(0, index - before);
+    const end = Math.min(models.length - 1, index + after);
+    for (let i = start; i <= end; i++) {
+      if (i === index) {
+        continue;
+      }
+      const uid = models[i]?.UID;
+      if (uid) {
+        tasks.push(Photo.prefetch(uid));
+      }
+    }
+    return Promise.allSettled(tasks);
+  }
+
   static mergeResponse(results, response) {
     if (response.offset === 0 || results.length === 0) {
       return response.models;
@@ -1128,5 +1604,25 @@ export class Photo extends RestModel {
     return results.concat(response.models);
   }
 }
+
+// evictCachedFromEntities drops cached entries from a WS payload, accepting
+// both bare-UID arrays and legacy entity-object payloads. Events are
+// evict-only signals; the next read goes back through /photos/:uid for the
+// full record.
+function evictCachedFromEntities(data) {
+  if (!data || !Array.isArray(data.entities)) {
+    return;
+  }
+  data.entities.forEach((entity) => {
+    if (typeof entity === "string" && entity) {
+      Photo._cache.evict(entity);
+    } else if (entity && typeof entity === "object" && entity.UID) {
+      Photo._cache.evict(entity.UID);
+    }
+  });
+}
+
+// Evict cache entries on any standard mutation verb in the photos namespace.
+subscribeEntityActions("photos", (_ev, data) => evictCachedFromEntities(data));
 
 export default Photo;

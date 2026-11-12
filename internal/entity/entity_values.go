@@ -1,23 +1,24 @@
 package entity
 
 import (
+	"encoding/json"
 	"fmt"
 	"reflect"
+	"slices"
 )
 
-// Values is a shortcut for map[string]interface{}
-type Values map[string]interface{}
+// Values is a shorthand alias for map[string]interface{}.
+type Values = map[string]any
 
-// ModelValues extracts Values from an entity model.
-func ModelValues(m interface{}, omit ...string) (result Values, omitted []interface{}, err error) {
+// Map is retained for backward compatibility.
+// TODO: Remove when no longer needed.
+type Map = Values
+
+// ModelValues extracts exported struct fields into a Values map, optionally omitting selected names.
+// Byte slices such as json.RawMessage columns are included; other slices, maps, and relations are not.
+func ModelValues(m any, omit ...string) (result Values, omitted []any, err error) {
 	mustOmit := func(name string) bool {
-		for _, s := range omit {
-			if name == s {
-				return true
-			}
-		}
-
-		return false
+		return slices.Contains(omit, name)
 	}
 
 	r := reflect.ValueOf(m)
@@ -35,11 +36,11 @@ func ModelValues(m interface{}, omit ...string) (result Values, omitted []interf
 	t := values.Type()
 	num := t.NumField()
 
-	omitted = make([]interface{}, 0, len(omit))
-	result = make(map[string]interface{}, num)
+	omitted = make([]any, 0, len(omit))
+	result = make(Values, num)
 
 	// Add exported fields to result.
-	for i := 0; i < num; i++ {
+	for i := range num {
 		field := t.Field(i)
 
 		// Skip non-exported fields.
@@ -57,10 +58,15 @@ func ModelValues(m interface{}, omit ...string) (result Values, omitted []interf
 		v := values.Field(i)
 
 		switch v.Kind() {
-		case reflect.Slice, reflect.Chan, reflect.Func, reflect.Map, reflect.UnsafePointer:
+		case reflect.Slice:
+			if v.Type().Elem().Kind() != reflect.Uint8 {
+				continue
+			}
+		case reflect.Chan, reflect.Func, reflect.Map, reflect.UnsafePointer:
 			continue
 		case reflect.Struct:
-			if v.IsZero() {
+			// A soft delete timestamp is kept when it is not set, so that it is cleared.
+			if v.IsZero() && v.Type() != deletedAtType {
 				continue
 			}
 		}
@@ -87,4 +93,20 @@ func ModelValues(m interface{}, omit ...string) (result Values, omitted []interf
 	}
 
 	return result, omitted, nil
+}
+
+// deletedAtType is the type of soft delete timestamps.
+var deletedAtType = reflect.TypeOf(DeletedAt{})
+
+// reportValue formats a model value for a report, showing byte slices such as JSON columns as text.
+func reportValue(v any) string {
+	if b, ok := v.([]byte); ok {
+		return string(b)
+	} else if b, ok := v.(json.RawMessage); ok {
+		return string(b)
+	} else if d, ok := v.(DeletedAt); ok {
+		return fmt.Sprintf("%#v", d.Ptr())
+	}
+
+	return fmt.Sprintf("%#v", v)
 }

@@ -1,0 +1,648 @@
+package api
+
+import (
+	"errors"
+	"fmt"
+	"net/http"
+	"strings"
+
+	"github.com/dustin/go-humanize/english"
+	"github.com/gin-gonic/gin"
+
+	"github.com/photoprism/photoprism/internal/auth/acl"
+	"github.com/photoprism/photoprism/internal/auth/oidc"
+	"github.com/photoprism/photoprism/internal/config"
+	"github.com/photoprism/photoprism/internal/entity"
+	"github.com/photoprism/photoprism/internal/event"
+	"github.com/photoprism/photoprism/internal/photoprism/get"
+	"github.com/photoprism/photoprism/internal/server/limiter"
+	"github.com/photoprism/photoprism/internal/thumb/avatar"
+	"github.com/photoprism/photoprism/pkg/authn"
+	"github.com/photoprism/photoprism/pkg/clean"
+	"github.com/photoprism/photoprism/pkg/http/header"
+	"github.com/photoprism/photoprism/pkg/i18n"
+	"github.com/photoprism/photoprism/pkg/log/status"
+	"github.com/photoprism/photoprism/pkg/rnd"
+	"github.com/photoprism/photoprism/pkg/time/tz"
+	"github.com/photoprism/photoprism/pkg/time/unix"
+	"github.com/photoprism/photoprism/pkg/txt"
+)
+
+// oidcRedirectErrorMessage maps a standard OAuth/OIDC error code received on the
+// RP callback to a branded, translatable message shown to the user.
+func oidcRedirectErrorMessage(code string) i18n.Message {
+	switch code {
+	case "access_denied":
+		return i18n.ErrForbidden
+	case "login_required":
+		return i18n.ErrUnauthorized
+	case "server_error", "temporarily_unavailable":
+		// Provider-side failures are operational, not credential problems.
+		return i18n.ErrUnexpected
+	default:
+		return i18n.ErrInvalidCredentials
+	}
+}
+
+// oidcReconcileHint returns an operator-facing message explaining how to adopt a
+// pre-existing account into the OIDC identity it collided with at login. Linking
+// stays manual on purpose: auto-binding an OIDC subject onto an existing local or
+// 2FA account would be an account-takeover vector.
+func oidcReconcileHint(userName, provider, subject string) string {
+	if provider == "" {
+		provider = authn.ProviderDefault.String()
+	}
+
+	return fmt.Sprintf("account %s uses %s authentication and must be linked before it can sign in via oidc; adopt it with 'photoprism users mod %s --auth oidc --auth-id %s' or sign in locally",
+		clean.LogQuote(userName), clean.LogQuote(provider), userName, clean.Log(subject))
+}
+
+// auditOidcSkippedClaim records that a username claim with characters other than ASCII was skipped when
+// registering an account.
+func auditOidcSkippedClaim(clientIp string, skipped bool) {
+	if skipped {
+		event.AuditWarn([]string{clientIp, "create session", "oidc", "create user", "username claim", authn.ErrNotASCII.Error(), status.Skipped})
+	}
+}
+
+// oidcUsernameAvailable reports whether a new account can take the username, i.e. it is not reserved and no
+// account, as the database compares names, has it.
+func oidcUsernameAvailable(userName string) bool {
+	if _, err := authn.Username(userName); errors.Is(err, authn.ErrReserved) {
+		return false
+	}
+
+	return entity.FindUserByName(userName) == nil
+}
+
+// oidcSuffixedUsername appends a random six-digit number to the username, shortening it first so that the
+// result fits the length a login accepts.
+func oidcSuffixedUsername(userName string) string {
+	const suffixLength = 6
+
+	if maxLength := txt.ClipUsername - suffixLength; len(userName) > maxLength {
+		userName = userName[:maxLength]
+	}
+
+	return userName + rnd.Base10(suffixLength)
+}
+
+// oidcEmailUsername reports whether the username of a new account is its verified email address, as with the
+// email username claim, and whether the address is a valid username as it is.
+func oidcEmailUsername(claim, name, verifiedEmail string) (fromEmail, valid bool) {
+	if claim != authn.OidcClaimEmail || verifiedEmail == "" || name != verifiedEmail {
+		return false, false
+	}
+
+	return true, clean.Username(name) == name
+}
+
+// OIDCRedirect completes the OIDC flow, creates a session, and renders a page that stores the token client-side.
+//
+//	@Summary	complete OIDC login (callback)
+//	@Id			OIDCRedirect
+//	@Tags		Authentication
+//	@Produce	html
+//	@Param		state		query		string	true	"opaque OAuth2 state value"
+//	@Param		code		query		string	true	"authorization code"
+//	@Success	200			{string}	string	"HTML page bootstrapping token storage"
+//	@Failure	401,403,429	{string}	string	"rendered error page"
+//	@Router		/api/v1/oidc/redirect [get]
+func OIDCRedirect(router *gin.RouterGroup) {
+	router.GET("/oidc/redirect", func(c *gin.Context) {
+		// Prevent CDNs from caching this endpoint.
+		if header.IsCdn(c.Request) {
+			AbortNotFound(c)
+			return
+		}
+
+		// Disable caching of responses.
+		c.Header(header.CacheControl, header.CacheControlNoStore)
+
+		// Get client IP address for logs and rate limiting checks.
+		clientIp := ClientIP(c)
+		userAgent := UserAgent(c)
+		userName := "unknown user"
+
+		// Get global config.
+		conf := get.Config()
+
+		// Abort in public mode and if OIDC is disabled.
+		if get.Config().Public() {
+			event.AuditErr([]string{clientIp, "create session", "oidc", authn.ErrDisabledInPublicMode.Error()})
+			c.Redirect(http.StatusTemporaryRedirect, conf.LoginUri())
+			return
+		} else if !conf.OIDCEnabled() {
+			event.AuditErr([]string{clientIp, "create session", "oidc", authn.ErrAuthenticationDisabled.Error()})
+			c.Redirect(http.StatusTemporaryRedirect, conf.LoginUri())
+			return
+		}
+
+		// Check request rate limit.
+		r := limiter.Login.Request(clientIp)
+
+		// Abort if failure rate limit is exceeded.
+		if r.Reject() || limiter.Auth.Reject(clientIp) {
+			c.HTML(http.StatusTooManyRequests, "auth.gohtml", CreateSessionError(http.StatusTooManyRequests, i18n.ErrTooManyRequests))
+			return
+		}
+
+		// The provider may redirect back with an OAuth error instead of a code (e.g.
+		// access_denied). Surface it in the instance's branded UI, not a silent bounce.
+		if oauthErr := c.Query("error"); oauthErr != "" {
+			event.AuditWarn([]string{clientIp, "create session", "oidc", "provider returned error", clean.Log(oauthErr), clean.Log(c.Query("error_description"))})
+			c.HTML(http.StatusUnauthorized, "auth.gohtml", CreateSessionError(http.StatusUnauthorized, oidcRedirectErrorMessage(oauthErr)))
+			return
+		}
+
+		// Check if the required request parameters are present and the code is within its length limit.
+		if code := c.Query("code"); c.Query("state") == "" || code == "" || len(code) > MaxOIDCCodeLength {
+			event.AuditErr([]string{clientIp, "create session", "oidc", authn.ErrAuthCodeRequired.Error()})
+			c.Redirect(http.StatusTemporaryRedirect, conf.LoginUri())
+			return
+		}
+
+		// Get OIDC provider.
+		provider := get.OIDC()
+
+		if provider == nil {
+			event.AuditErr([]string{clientIp, "create session", "oidc", authn.ErrInvalidProviderConfiguration.Error()})
+			c.HTML(http.StatusUnauthorized, "auth.gohtml", CreateSessionError(http.StatusUnauthorized, i18n.ErrInvalidCredentials))
+			return
+		}
+
+		// Check the auth request and, if successful, get user information and tokens.
+		userInfo, tokens, claimErr := provider.CodeExchangeUserInfo(c)
+
+		if claimErr != nil {
+			// The code exchange failed (e.g. a missing/expired state cookie). Render a
+			// branded page that returns the user to login instead of leaving them on a
+			// raw, dead-end error with no way forward.
+			event.AuditErr([]string{clientIp, "create session", "oidc", status.Error(claimErr)})
+			event.LoginError(clientIp, "oidc", userName, userAgent, clean.Error(claimErr))
+			c.HTML(http.StatusUnauthorized, "auth.gohtml", CreateSessionError(http.StatusUnauthorized, i18n.ErrUnexpected))
+			return
+		}
+
+		groupClaim := conf.OIDCGroupClaim()
+
+		var idTokenClaims map[string]any
+
+		if tokens != nil && tokens.IDTokenClaims != nil {
+			idTokenClaims = tokens.IDTokenClaims.Claims
+		}
+
+		groups, groupOverage := oidc.GroupsFromClaims(idTokenClaims, groupClaim)
+		moreGroups, moreOverage := oidc.GroupsFromClaims(userInfo.Claims, groupClaim)
+
+		// Merge groups, since some IDPs split memberships across ID tokens and user info.
+		// Appending is safe because downstream helpers normalize and deduplicate.
+		if len(moreGroups) > 0 {
+			groups = append(groups, moreGroups...)
+		}
+
+		// "Overage" means the IdP omitted some or all groups because the user has too many; tokens carry a marker (`_claim_names.groups`).
+		if moreOverage {
+			groupOverage = true
+		}
+
+		requiredGroups := conf.OIDCGroup()
+
+		if len(requiredGroups) > 0 || conf.OIDCGroupSet() {
+			switch {
+			case len(requiredGroups) == 0:
+				message := "required groups are not valid group IDs"
+				event.AuditErr([]string{clientIp, "create session", "oidc", message})
+				event.LoginError(clientIp, "oidc", userName, userAgent, message)
+				c.HTML(http.StatusUnauthorized, "auth.gohtml", CreateSessionError(http.StatusUnauthorized, i18n.ErrForbidden))
+				return
+			case groupOverage && len(groups) == 0:
+				message := "IdP omitted some or all groups; cannot validate required groups"
+				event.AuditErr([]string{clientIp, "create session", "oidc", message})
+				event.LoginError(clientIp, "oidc", userName, userAgent, message)
+				c.HTML(http.StatusUnauthorized, "auth.gohtml", CreateSessionError(http.StatusUnauthorized, i18n.ErrForbidden))
+				return
+			case !oidc.HasAnyGroup(groups, requiredGroups):
+				message := "missing required group membership"
+				event.AuditErr([]string{clientIp, "create session", "oidc", message})
+				event.LoginError(clientIp, "oidc", userName, userAgent, message)
+				c.HTML(http.StatusUnauthorized, "auth.gohtml", CreateSessionError(http.StatusUnauthorized, i18n.ErrForbidden))
+				return
+			}
+		}
+
+		mappedRole, hasMappedRole := oidc.MapGroupsToRole(groups, conf.OIDCGroupRoles())
+		defaultRole := conf.OIDCRole()
+
+		// A PhotoPrism Portal OP grants the instance login role via the pp_role
+		// claim (gated by pp_issuer_kind); prefer the verified ID token, then user
+		// info. It takes precedence over the group mapping below.
+		portalClaims := idTokenClaims
+		portalRole, hasPortalRole := oidc.PortalGrantedRole(portalClaims)
+		if !hasPortalRole {
+			portalClaims = userInfo.Claims
+			portalRole, hasPortalRole = oidc.PortalGrantedRole(portalClaims)
+		}
+
+		if granted := oidc.PortalRoleClaim(portalClaims); !hasPortalRole || granted == portalRole.String() {
+			// The granted role applies as is.
+		} else if granted == "" {
+			event.AuditWarn([]string{clientIp, "create session", "oidc", "portal role is invalid, applying %s"}, portalRole.String())
+		} else {
+			event.AuditWarn([]string{clientIp, "create session", "oidc", "portal role %s is not available, applying %s"}, clean.LogQuote(granted), portalRole.String())
+		}
+
+		// The role a new account receives: a Portal-granted role, then a federatable
+		// group-mapped role, else the configured default.
+		newUserRole := defaultRole
+		switch {
+		case hasPortalRole:
+			newUserRole = portalRole
+		case hasMappedRole && acl.IsFederatedRole(mappedRole):
+			newUserRole = mappedRole
+		}
+
+		// Step 1: Create user account if it does not exist yet.
+		var user *entity.User
+		var err error
+
+		userEmail := clean.Email(userInfo.Email)
+
+		// Optionally check if the email domain matches.
+		if domain := conf.OIDCDomain(); domain == "" {
+			// Do nothing.
+		} else if _, emailDomain, _ := strings.Cut(oidc.VerifiedEmail(userInfo), "@"); emailDomain == "" {
+			event.AuditErr([]string{clientIp, "create session", "oidc", authn.ErrVerifiedEmailRequired.Error()})
+			event.LoginError(clientIp, "oidc", userEmail, userAgent, authn.ErrVerifiedEmailRequired.Error())
+			c.HTML(http.StatusUnauthorized, "auth.gohtml", CreateSessionError(http.StatusUnauthorized, i18n.ErrVerifiedEmailRequired))
+			return
+		} else if !strings.HasSuffix("."+emailDomain, "."+domain) {
+			message := fmt.Sprintf("domain must match '%s'", domain)
+			event.AuditErr([]string{clientIp, "create session", "oidc", userEmail, message})
+			event.LoginError(clientIp, "oidc", userEmail, userAgent, message)
+			c.HTML(http.StatusUnauthorized, "auth.gohtml", CreateSessionError(http.StatusUnauthorized, i18n.ErrForbidden))
+			return
+		}
+
+		// Find existing user record and update it, if necessary.
+		if oidcUser := entity.OidcUser(userInfo, provider.Issuer(), oidc.Username(userInfo, conf.OIDCUsername())); authn.ProviderOIDC.NotEqual(oidcUser.AuthProvider) {
+			event.AuditErr([]string{clientIp, "create session", "oidc", authn.ErrAuthProviderIsNotOIDC.Error()})
+			event.LoginError(clientIp, "oidc", oidcUser.UserName, userAgent, authn.ErrAuthProviderIsNotOIDC.Error())
+			c.HTML(http.StatusUnauthorized, "auth.gohtml", CreateSessionError(http.StatusUnauthorized, i18n.ErrInvalidCredentials))
+			return
+		} else if oidcUser.UserName == "" && entity.FindUser(oidcUser) == nil {
+			auditOidcSkippedClaim(clientIp, conf.OIDCRegister() && oidc.SkipsClaim(userInfo, conf.OIDCUsername()))
+			event.AuditErr([]string{clientIp, "create session", "oidc", authn.ErrUsernameRequiredToRegister.Error()})
+			event.LoginError(clientIp, "oidc", oidcUser.UserName, userAgent, authn.ErrUsernameRequiredToRegister.Error())
+			c.HTML(http.StatusUnauthorized, "auth.gohtml", CreateSessionError(http.StatusUnauthorized, i18n.ErrInvalidCredentials))
+			return
+		} else if user = entity.FindUser(oidcUser); user != nil {
+			// Ensure user has a username.
+			if user.Username() == "" {
+				event.AuditErr([]string{clientIp, "create session", "oidc", clean.LogQuote(oidcUser.UserName), authn.ErrUsernameRequired.Error()})
+				event.LoginError(clientIp, "oidc", oidcUser.UserName, userAgent, authn.ErrUsernameRequired.Error())
+				c.HTML(http.StatusUnauthorized, "auth.gohtml", CreateSessionError(http.StatusUnauthorized, i18n.ErrInvalidCredentials))
+				return
+			}
+
+			userName = user.Username()
+			event.AuditInfo([]string{clientIp, "create session", "oidc", "found user", clean.LogQuote(userName)})
+
+			// Check if the account is enabled and the OIDC Subject ID matches.
+			switch {
+			case !user.CanLogIn():
+				event.AuditErr([]string{clientIp, "create session", "oidc", clean.LogQuote(userName), authn.ErrAccountDisabled.Error()})
+				event.LoginError(clientIp, "oidc", userName, userAgent, authn.ErrAccountDisabled.Error())
+				c.HTML(http.StatusUnauthorized, "auth.gohtml", CreateSessionError(http.StatusUnauthorized, i18n.ErrInvalidCredentials))
+				return
+			case authn.ProviderOIDC.NotEqual(user.AuthProvider):
+				// Claimable collision: a non-OIDC account matched the login. Log the
+				// specific remedy so the denial is actionable instead of a bare
+				// "provider is not oidc"; the user-facing message stays generic to
+				// avoid disclosing the account exists.
+				hint := oidcReconcileHint(userName, user.AuthProvider, oidcUser.AuthID)
+				event.AuditErr([]string{clientIp, "create session", "oidc", clean.LogQuote(userName), authn.ErrAuthProviderIsNotOIDC.Error(), hint})
+				event.LoginError(clientIp, "oidc", userName, userAgent, authn.ErrAuthProviderIsNotOIDC.Error()+": "+hint)
+				c.HTML(http.StatusUnauthorized, "auth.gohtml", CreateSessionError(http.StatusUnauthorized, i18n.ErrInvalidCredentials))
+				return
+			case user.AuthID == "" || oidcUser.AuthID == "" || user.AuthID != oidcUser.AuthID:
+				event.AuditErr([]string{clientIp, "create session", "oidc", clean.LogQuote(userName), authn.ErrInvalidAuthID.Error()})
+				event.LoginError(clientIp, "oidc", userName, userAgent, authn.ErrInvalidAuthID.Error())
+				c.HTML(http.StatusUnauthorized, "auth.gohtml", CreateSessionError(http.StatusUnauthorized, i18n.ErrInvalidCredentials))
+				return
+			}
+
+			// Update user profile information.
+			details := user.Details()
+			emailChanged := false
+
+			// Update user display name.
+			if entity.SrcPriority[details.NameSrc] <= entity.SrcPriority[entity.SrcOIDC] {
+				user.SetDisplayName(userInfo.Name, entity.SrcOIDC)
+				user.SetGivenName(userInfo.GivenName)
+				user.SetFamilyName(userInfo.FamilyName)
+				details.UserGender = clean.Name(string(userInfo.Gender))
+			}
+
+			// Update nickname.
+			if name := clean.Name(userInfo.Nickname); name != "" {
+				details.NickName = clean.Name(userInfo.Nickname)
+			}
+
+			// Update profile URL.
+			if u := clean.Uri(userInfo.Profile); u != "" {
+				details.ProfileURL = u
+			}
+
+			// Update website URL.
+			if u := clean.Uri(userInfo.Website); u != "" {
+				details.SiteURL = u
+			}
+
+			// Update UI locale.
+			user.Settings().UILanguage = clean.Locale(userInfo.Locale.String(), user.Settings().UILanguage)
+
+			// Update UI timezone.
+			if zone := oidcTimeZone(userInfo.Zoneinfo); zone != "" && zone != tz.UTC {
+				user.Settings().UITimeZone = zone
+			}
+
+			// Update user location, if available.
+			if addr := userInfo.GetAddress(); addr != nil {
+				user.Details().UserLocation = clean.Name(addr.Locality)
+				user.Details().UserCountry = clean.TypeLowerUnderscore(addr.Country)
+			}
+
+			// Update birthday, if available.
+			if birthDate := txt.ParseTime(userInfo.Birthdate, oidcTimeZone(userInfo.Zoneinfo)); !birthDate.IsZero() {
+				user.BornAt = &birthDate
+				user.Details().BirthDay = birthDate.Day()
+				user.Details().BirthMonth = int(birthDate.Month())
+				user.Details().BirthYear = birthDate.Year()
+			}
+
+			// Update email only when the IdP marks it verified; the Portal OP forwards
+			// real verification state, so unverified cluster emails are not stored.
+			if email := oidc.VerifiedEmail(userInfo); email != "" {
+				emailChanged = email != user.UserEmail
+				user.UserEmail = email
+				user.VerifiedAt = entity.TimeStamp()
+			}
+
+			// Apply a federated role only when federation may set it: super admins and existing
+			// cluster_admin/visitor accounts keep their role, and the IdP can never escalate to a
+			// non-federatable role. A Portal-granted pp_role takes precedence over the group mapping.
+			prevRole := user.AclRole()
+			var role acl.Role
+			var update bool
+
+			if user.SuperAdmin {
+				// Do nothing.
+			} else if hasPortalRole {
+				role, update = acl.FederatedRoleUpdate(prevRole, portalRole)
+			} else if hasMappedRole {
+				role, update = acl.FederatedRoleUpdate(prevRole, mappedRole)
+			}
+
+			// A role that counts toward the user quota is not applied while the quota is reached.
+			if update && !conf.UsersQuotaReached(prevRole) && conf.UsersQuotaReached(role) {
+				event.AuditWarn([]string{clientIp, "create session", "oidc", "update user %s", "role %s not applied", authn.ErrUsersQuotaExceeded.Error()}, clean.LogQuote(userName), role.String())
+				update = false
+			}
+
+			if update {
+				user.SetRole(role.String())
+			}
+
+			// Update Subject ID and Issuer URI.
+			user.SetAuthID(userInfo.Subject, provider.Issuer())
+
+			// Update existing user account.
+			if err = user.Save(); err != nil {
+				event.AuditErr([]string{clientIp, "create session", "oidc", clean.LogQuote(userName), authn.ErrAccountUpdateFailed.Error(), status.Error(err)})
+				event.LoginError(clientIp, "oidc", userName, userAgent, authn.ErrAccountUpdateFailed.Error()+" ("+clean.Error(err)+")")
+				c.HTML(http.StatusUnauthorized, "auth.gohtml", CreateSessionError(http.StatusUnauthorized, i18n.ErrInvalidCredentials))
+				return
+			} else if emailChanged {
+				user.ReportSharedEmail()
+			}
+
+			if update {
+				config.FlushUsageCache()
+				event.AuditInfo([]string{clientIp, "create session", "oidc", "update user %s", "role %s changed to %s", status.Updated}, clean.LogQuote(userName), prevRole.String(), role.String())
+			}
+
+			// Set user avatar image?
+			if avatarUrl := userInfo.Picture; avatarUrl != "" && !user.HasAvatar() {
+				if err = avatar.SetUserImageURL(user, avatarUrl, entity.SrcOIDC, conf.ThumbCachePath()); err != nil {
+					event.AuditWarn([]string{clientIp, "create session", "oidc", clean.LogQuote(userName), "failed to set avatar image", status.Error(err)})
+				}
+			}
+		} else if conf.UsersQuotaReached(newUserRole) { //nolint:gocritic
+			userName = oidcUser.Username()
+			event.AuditWarn([]string{clientIp, "create session", "oidc", "create user", clean.LogQuote(userName), authn.ErrUsersQuotaExceeded.Error()})
+			event.LoginError(clientIp, "oidc", userName, userAgent, authn.ErrUsersQuotaExceeded.Error())
+			c.HTML(http.StatusUnauthorized, "auth.gohtml", CreateSessionError(http.StatusUnauthorized, i18n.ErrQuotaExceeded))
+			return
+		} else if conf.OIDCRegister() {
+			// Create new user record.
+			user = &oidcUser
+
+			userName = oidcUser.Username()
+			auditOidcSkippedClaim(clientIp, oidc.SkipsClaim(userInfo, conf.OIDCUsername()))
+
+			// A username taken from the email address must match it, so it is never changed to resolve a conflict.
+			emailUsername, validEmailUsername := oidcEmailUsername(conf.OIDCUsername(), oidcUser.UserName, oidc.VerifiedEmail(userInfo))
+
+			if emailUsername && !validEmailUsername {
+				event.AuditWarn([]string{clientIp, "create session", "oidc", "create user %s", authn.ErrInvalidUsername.Error()}, clean.LogQuote(userName))
+				event.LoginError(clientIp, "oidc", userName, userAgent, authn.ErrInvalidUsername.Error())
+				c.HTML(http.StatusUnauthorized, "auth.gohtml", CreateSessionError(http.StatusUnauthorized, i18n.ErrInvalidCredentials))
+				return
+			} else if oidcUsernameAvailable(userName) {
+				// The username is available.
+			} else if emailUsername {
+				event.AuditWarn([]string{clientIp, "create session", "oidc", "create user %s", authn.ErrUsernameAlreadyExists.Error()}, clean.LogQuote(userName))
+				event.LoginError(clientIp, "oidc", userName, userAgent, authn.ErrUsernameAlreadyExists.Error())
+				c.HTML(http.StatusUnauthorized, "auth.gohtml", CreateSessionError(http.StatusUnauthorized, i18n.ErrInvalidCredentials))
+				return
+			} else {
+				// Resolve the naming conflict by adding a random number to the username.
+				userName = oidcSuffixedUsername(userName)
+			}
+
+			// An email address used as username must not be assigned to another account.
+			if emailUsername {
+				if count, _, err := oidcUser.OtherEmailHolders(); err != nil {
+					event.AuditErr([]string{clientIp, "create session", "oidc", "create user %s", authn.ErrAccountCreateFailed.Error(), status.Error(err)}, clean.LogQuote(userName))
+					event.LoginError(clientIp, "oidc", userName, userAgent, authn.ErrAccountCreateFailed.Error())
+					c.HTML(http.StatusUnauthorized, "auth.gohtml", CreateSessionError(http.StatusUnauthorized, i18n.ErrInvalidCredentials))
+					return
+				} else if count > 0 {
+					event.AuditWarn([]string{clientIp, "create session", "oidc", "create user %s", authn.ErrEmailAlreadyExists.Error()}, clean.LogQuote(userName))
+					event.LoginError(clientIp, "oidc", userName, userAgent, authn.ErrEmailAlreadyExists.Error())
+					c.HTML(http.StatusUnauthorized, "auth.gohtml", CreateSessionError(http.StatusUnauthorized, i18n.ErrInvalidCredentials))
+					return
+				}
+			}
+
+			event.AuditInfo([]string{clientIp, "create session", "oidc", "create user", clean.LogQuote(userName)})
+
+			user.UserName = userName
+
+			// Set user profile information.
+			user.SetDisplayName(userInfo.Name, entity.SrcOIDC)
+			user.SetGivenName(userInfo.GivenName)
+			user.SetFamilyName(userInfo.FamilyName)
+			user.Details().UserGender = clean.Name(string(userInfo.Gender))
+			user.Details().NickName = clean.Name(userInfo.Nickname)
+
+			// Set user profile URL.
+			user.Details().ProfileURL = clean.Uri(userInfo.Profile)
+
+			// Set user site URL.
+			user.Details().SiteURL = clean.Uri(userInfo.Website)
+
+			// Set UI locale.
+			user.Settings().UILanguage = clean.Locale(userInfo.Locale.String(), "")
+
+			// Set UI timezone.
+			user.Settings().UITimeZone = oidcTimeZone(userInfo.Zoneinfo)
+
+			// Set user location, if available.
+			if addr := userInfo.GetAddress(); addr != nil {
+				user.Details().UserLocation = clean.Name(addr.Locality)
+				user.Details().UserCountry = clean.TypeLowerUnderscore(addr.Country)
+			}
+
+			// Set birthday, if available.
+			if birthDate := txt.ParseTime(userInfo.Birthdate, oidcTimeZone(userInfo.Zoneinfo)); !birthDate.IsZero() {
+				user.BornAt = &birthDate
+				user.Details().BirthDay = birthDate.Day()
+				user.Details().BirthMonth = int(birthDate.Month())
+				user.Details().BirthYear = birthDate.Year()
+			}
+
+			// Mark the email verified, which it only holds if the IdP has verified it.
+			if email := oidc.VerifiedEmail(userInfo); email != "" {
+				user.UserEmail = email
+				user.VerifiedAt = entity.TimeStamp()
+			}
+
+			// Set user role and permissions.
+			user.SetRole(newUserRole.String())
+			user.CanLogin = true
+			user.WebDAV = conf.OIDCWebDAV()
+
+			// Create new user account, and then update the Subject ID to make sure it is unique.
+			if err = user.Create(); err != nil {
+				event.AuditErr([]string{clientIp, "create session", "oidc", clean.LogQuote(userName), authn.ErrAccountCreateFailed.Error(), status.Error(err)})
+				event.LoginError(clientIp, "oidc", userName, userAgent, authn.ErrAccountCreateFailed.Error()+" ("+clean.Error(err)+")")
+				c.HTML(http.StatusUnauthorized, "auth.gohtml", CreateSessionError(http.StatusUnauthorized, i18n.ErrInvalidCredentials))
+				return
+			} else if err = user.UpdateAuthID(userInfo.Subject, provider.Issuer()); err != nil {
+				event.AuditErr([]string{clientIp, "create session", "oidc", clean.LogQuote(userName), authn.ErrAccountUpdateFailed.Error(), status.Error(err)})
+				event.LoginError(clientIp, "oidc", userName, userAgent, authn.ErrAccountUpdateFailed.Error()+" ("+clean.Error(err)+")")
+				c.HTML(http.StatusUnauthorized, "auth.gohtml", CreateSessionError(http.StatusUnauthorized, i18n.ErrInvalidCredentials))
+				return
+			}
+
+			config.FlushUsageCache()
+
+			// Report an email address that other accounts also hold.
+			if count, _ := user.ReportSharedEmail(); count > 0 {
+				event.AuditWarn([]string{clientIp, "create session", "oidc", "create user %s", "email is also assigned to %s"}, clean.LogQuote(userName), english.Plural(count, "other account", "other accounts"))
+			}
+
+			// Set user avatar image.
+			if avatarUrl := userInfo.Picture; avatarUrl == "" {
+				event.AuditDebug([]string{clientIp, "create session", "oidc", clean.LogQuote(userName), "no avatar image provided"})
+			} else if err = avatar.SetUserImageURL(user, avatarUrl, entity.SrcOIDC, conf.ThumbCachePath()); err != nil {
+				event.AuditWarn([]string{clientIp, "create session", "oidc", clean.LogQuote(userName), "failed to set avatar image", status.Error(err)})
+			}
+		} else {
+			event.AuditErr([]string{clientIp, "create session", "oidc", clean.LogQuote(userName), authn.ErrRegistrationDisabled.Error()})
+			event.LoginError(clientIp, "oidc", userName, userAgent, authn.ErrRegistrationDisabled.Error())
+			c.HTML(http.StatusUnauthorized, "auth.gohtml", CreateSessionError(http.StatusUnauthorized, i18n.ErrRegistrationDisabled))
+			return
+		}
+
+		// Check if login is allowed.
+		if !user.CanLogIn() {
+			event.AuditErr([]string{clientIp, "create session", "oidc", clean.LogQuote(userName), authn.ErrAccountDisabled.Error()})
+			event.LoginError(clientIp, "oidc", userName, userAgent, authn.ErrAccountDisabled.Error())
+			c.HTML(http.StatusUnauthorized, "auth.gohtml", CreateSessionError(http.StatusUnauthorized, i18n.ErrInvalidCredentials))
+			return
+		}
+
+		// Step 2: Create user session.
+		sess := get.Session().New(c)
+		sess.SetProvider(authn.ProviderOIDC)
+		sess.SetMethod(authn.MethodDefault)
+		sess.SetAuthID(user.AuthID, provider.Issuer())
+		sess.SetUser(user)
+		sess.SetGrantType(authn.GrantAuthorizationCode)
+
+		// On Portal builds, persist the normalized login-time group set on the
+		// session so group-based instance access resolves at authorize time
+		// without a second IdP round-trip. Overage with no groups stores an
+		// empty set, so group-based grants deny rather than admit blindly.
+		// Instance/CE sessions don't store groups — they have no resolver and
+		// the session API must not become a group-membership side channel.
+		if conf.Portal() {
+			if merged := oidc.MergeGroups(groups); len(merged) > 0 {
+				sess.SetData(sess.GetData().SetGroups(merged))
+			}
+		}
+
+		// Store the ID token for RP-initiated logout (id_token_hint) when it fits the id_token
+		// column. With the 4096-byte column only extreme role/group-heavy tokens exceed it.
+		var idTokenDropped bool
+		if sess.IdToken, idTokenDropped = entity.UsableIdToken(tokens.IDToken); idTokenDropped {
+			event.AuditWarn([]string{clientIp, "create session", "oidc", clean.LogQuote(userName), "id token exceeds storage limit, single logout ends at the login page"})
+		}
+
+		// Set session expiration and timeout.
+		sess.SetExpiresIn(unix.Day)
+		sess.SetTimeout(-1)
+
+		// Save session after successful authentication.
+		if sess, err = get.Session().Save(sess); err != nil {
+			event.AuditErr([]string{clientIp, "create session", "oidc", clean.LogQuote(userName), status.Error(err)})
+			c.HTML(http.StatusUnauthorized, "auth.gohtml", CreateSessionError(http.StatusUnauthorized, i18n.ErrInvalidCredentials))
+			return
+		} else if sess == nil {
+			event.AuditErr([]string{clientIp, "create session", "oidc", clean.LogQuote(userName), status.Failed})
+			c.HTML(http.StatusUnauthorized, "auth.gohtml", CreateSessionError(http.StatusUnauthorized, i18n.ErrUnexpected))
+			return
+		}
+
+		// Return the reserved request rate limit token after successful authentication.
+		r.Success()
+
+		// Response includes user data, session data, and client config values.
+		response := CreateSessionResponse(sess.AuthToken(), sess, conf.ClientSession(sess))
+
+		// Log session created event.
+		event.AuditInfo([]string{clientIp, "session %s", "oidc", "%s", status.Created}, sess.RefID, clean.LogQuote(userName))
+
+		// Log session expiration time.
+		if expires := sess.ExpiresAt(); !expires.IsZero() {
+			event.AuditDebug([]string{clientIp, "session %s", "oidc", "%s", "expires at %s"}, sess.RefID, clean.LogQuote(userName), txt.DateTime(&expires))
+		}
+
+		// Log successful login.
+		event.LoginInfo(clientIp, "oidc", userName, userAgent)
+
+		// Update login timestamp.
+		user.UpdateLoginTime()
+
+		// Step 3: Render HTML template to set the access token in localStorage.
+		c.HTML(http.StatusOK, "auth.gohtml", response)
+	})
+}
+
+// oidcTimeZone returns the normalized time zone of a zoneinfo claim, or an empty string if it is not a valid name.
+func oidcTimeZone(zoneinfo string) string {
+	return tz.Sanitize(zoneinfo)
+}

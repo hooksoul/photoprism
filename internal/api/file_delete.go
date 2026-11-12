@@ -6,22 +6,28 @@ import (
 
 	"github.com/gin-gonic/gin"
 
-	"github.com/photoprism/photoprism/internal/acl"
+	"github.com/photoprism/photoprism/internal/auth/acl"
+	"github.com/photoprism/photoprism/internal/entity/query"
+	"github.com/photoprism/photoprism/internal/entity/search"
 	"github.com/photoprism/photoprism/internal/event"
-	"github.com/photoprism/photoprism/internal/get"
-	"github.com/photoprism/photoprism/internal/i18n"
 	"github.com/photoprism/photoprism/internal/photoprism"
-	"github.com/photoprism/photoprism/internal/query"
+	"github.com/photoprism/photoprism/internal/photoprism/get"
 	"github.com/photoprism/photoprism/pkg/clean"
+	"github.com/photoprism/photoprism/pkg/i18n"
 )
 
 // DeleteFile removes a file from storage.
-// DELETE /api/v1/photos/:uid/files/:file_uid
 //
-// Parameters:
-//
-//	uid: string Photo UID as returned by the API
-//	file_uid: string File UID as returned by the API
+//	@Summary	removes a file from storage
+//	@Id			DeleteFile
+//	@Tags		Files
+//	@Accept		json
+//	@Produce	json
+//	@Success	200					{object}	entity.Photo
+//	@Failure	401,403,404,429,500	{object}	i18n.Response
+//	@Param		uid					path		string	true	"photo uid"
+//	@Param		fileuid				path		string	true	"file uid"
+//	@Router		/api/v1/photos/{uid}/files/{fileuid} [delete]
 func DeleteFile(router *gin.RouterGroup) {
 	router.DELETE("/photos/:uid/files/:file_uid", func(c *gin.Context) {
 		s := Auth(c, acl.ResourceFiles, acl.ActionDelete)
@@ -49,6 +55,15 @@ func DeleteFile(router *gin.RouterGroup) {
 			return
 		}
 
+		// Limit the deletion to the file's photo within the session's shared scope. Gating on the
+		// file's own PhotoUID (not the path :uid) prevents pairing an in-scope :uid with an out-of-scope file.
+		if !search.PhotoSessionSeesEverything(s) {
+			if visible, vErr := search.PhotoVisibleToSession(file.PhotoUID, s); vErr != nil || !visible {
+				AbortForbidden(c)
+				return
+			}
+		}
+
 		// Primary file?
 		if file.FilePrimary {
 			log.Errorf("files: cannot delete primary file")
@@ -69,7 +84,7 @@ func DeleteFile(router *gin.RouterGroup) {
 		}
 
 		// Report file deletion.
-		event.AuditWarn([]string{ClientIP(c), s.UserName, "delete", file.FileName})
+		event.AuditWarn([]string{ClientIP(c), clean.LogQuote(s.UserName), "delete", clean.Log(file.FileName)})
 
 		// Remove file from storage.
 		if err = mediaFile.Remove(); err != nil {
@@ -88,7 +103,7 @@ func DeleteFile(router *gin.RouterGroup) {
 		}
 
 		// Notify clients by publishing events.
-		PublishPhotoEvent(EntityUpdated, photoUid, c)
+		PublishPhotoEvent(StatusUpdated, photoUid)
 
 		// Show translated success message.
 		event.SuccessMsg(i18n.MsgFileDeleted)
@@ -97,6 +112,7 @@ func DeleteFile(router *gin.RouterGroup) {
 			AbortEntityNotFound(c)
 			return
 		} else {
+			p.RedactForSession(s)
 			c.JSON(http.StatusOK, p)
 		}
 	})

@@ -2,45 +2,54 @@ package api
 
 import (
 	"net/http"
-	"path/filepath"
 
 	"github.com/gin-gonic/gin"
 
-	"github.com/photoprism/photoprism/internal/acl"
+	"github.com/photoprism/photoprism/internal/auth/acl"
 	"github.com/photoprism/photoprism/internal/entity"
+	"github.com/photoprism/photoprism/internal/entity/query"
+	"github.com/photoprism/photoprism/internal/entity/search"
 	"github.com/photoprism/photoprism/internal/event"
 	"github.com/photoprism/photoprism/internal/form"
-	"github.com/photoprism/photoprism/internal/get"
-	"github.com/photoprism/photoprism/internal/i18n"
 	"github.com/photoprism/photoprism/internal/photoprism"
-	"github.com/photoprism/photoprism/internal/query"
+	"github.com/photoprism/photoprism/internal/photoprism/get"
+	"github.com/photoprism/photoprism/internal/server/limiter"
 	"github.com/photoprism/photoprism/pkg/clean"
 	"github.com/photoprism/photoprism/pkg/fs"
+	"github.com/photoprism/photoprism/pkg/i18n"
 )
 
-// SavePhotoAsYaml saves photo data as YAML file.
-func SavePhotoAsYaml(p entity.Photo) {
-	c := get.Config()
-
-	// Write YAML sidecar file (optional).
-	if !c.BackupYaml() {
+// SaveSidecarYaml saves the photo metadata to a YAML sidecar file.
+func SaveSidecarYaml(photo *entity.Photo) {
+	if photo == nil {
+		log.Debugf("api: photo is nil (update yaml)")
+		return
+	} else if !photo.HasID() {
+		log.Debugf("api: photo has no ID (update yaml)")
 		return
 	}
 
-	fileName := p.YamlFileName(c.OriginalsPath(), c.SidecarPath())
+	conf := get.Config()
 
-	if err := p.SaveAsYaml(fileName); err != nil {
-		log.Errorf("photo: %s (update yaml)", err)
-	} else {
-		log.Debugf("photo: updated yaml file %s", clean.Log(filepath.Base(fileName)))
+	// Check if saving YAML sidecar files is enabled.
+	if !conf.SidecarYaml() {
+		return
 	}
+
+	// Write photo metadata to YAML sidecar file.
+	_ = photo.SaveSidecarYaml(conf.OriginalsPath(), conf.SidecarPath())
 }
 
-// GetPhoto returns photo details as JSON.
+// GetPhoto returns picture details as JSON.
 //
-// Route : GET /api/v1/photos/:uid
-// Params:
-// - uid (string) PhotoUID as returned by the API
+//	@Summary	returns picture details as JSON
+//	@Id			GetPhoto
+//	@Tags		Photos
+//	@Produce	json
+//	@Success	200				{object}	entity.Photo
+//	@Failure	401,403,404,429	{object}	i18n.Response
+//	@Param		uid				path		string	true	"Photo UID"
+//	@Router		/api/v1/photos/{uid} [get]
 func GetPhoto(router *gin.RouterGroup) {
 	router.GET("/photos/:uid", func(c *gin.Context) {
 		s := Auth(c, acl.ResourcePhotos, acl.ActionView)
@@ -49,20 +58,42 @@ func GetPhoto(router *gin.RouterGroup) {
 			return
 		}
 
-		p, err := query.PhotoPreloadByUID(clean.UID(c.Param("uid")))
+		uid := clean.UID(c.Param("uid"))
+
+		// Limit access to pictures within the session's shared scope, consistent with how photo
+		// search filters results. Pictures outside the scope are reported as not found.
+		if visible, err := search.PhotoVisibleToSession(uid, s); err != nil || !visible {
+			AbortEntityNotFound(c)
+			return
+		}
+
+		p, err := query.PhotoPreloadByUID(uid)
 
 		if err != nil {
 			AbortEntityNotFound(c)
 			return
 		}
 
+		// Limit the response to what the session is entitled to see; shared-only sessions get a
+		// reduced view (full-access sessions are unaffected).
+		p.RedactForSession(s)
+
 		c.IndentedJSON(http.StatusOK, p)
 	})
 }
 
-// UpdatePhoto updates photo details and returns them as JSON.
+// UpdatePhoto updates picture details and returns them as JSON.
 //
-// PUT /api/v1/photos/:uid
+//	@Summary	updates picture details and returns them as JSON
+//	@Id			UpdatePhoto
+//	@Tags		Photos
+//	@Accept		json
+//	@Produce	json
+//	@Success	200							{object}	entity.Photo
+//	@Failure	400,401,403,404,413,429,500	{object}	i18n.Response
+//	@Param		uid							path		string		true	"Photo UID"
+//	@Param		photo						body		form.Photo	true	"properties to be updated (only submit values that should be changed)"
+//	@Router		/api/v1/photos/{uid} [put]
 func UpdatePhoto(router *gin.RouterGroup) {
 	router.PUT("/photos/:uid", func(c *gin.Context) {
 		s := Auth(c, acl.ResourcePhotos, acl.ActionUpdate)
@@ -72,6 +103,18 @@ func UpdatePhoto(router *gin.RouterGroup) {
 		}
 
 		uid := clean.UID(c.Param("uid"))
+
+		// Limit access to pictures within the session's shared scope, mirroring album updates. This
+		// runs before the lookup and form binding so out-of-scope requests have no side effects.
+		// PhotoSessionSeesEverything is query-free and client and user role aware, so full-access
+		// sessions skip the per-photo check and restricted sessions stay within their shared scope.
+		if !search.PhotoSessionSeesEverything(s) {
+			if visible, vErr := search.PhotoVisibleToSession(uid, s); vErr != nil || !visible {
+				AbortForbidden(c)
+				return
+			}
+		}
+
 		m, err := query.PhotoByUID(uid)
 
 		if err != nil {
@@ -80,28 +123,35 @@ func UpdatePhoto(router *gin.RouterGroup) {
 		}
 
 		// 1) Init form with model values
-		f, err := form.NewPhoto(m)
+		frm, err := form.NewPhoto(m)
 
 		if err != nil {
 			Abort(c, http.StatusInternalServerError, i18n.ErrSaveFailed)
 			return
 		}
 
-		// 2) Update form with values from request
-		if err := c.BindJSON(&f); err != nil {
+		// 2) Assign and validate request form values.
+		LimitRequestBodyBytes(c, MaxMutationRequestBytes)
+
+		if err = c.BindJSON(&frm); err != nil {
+			if IsRequestBodyTooLarge(err) {
+				AbortRequestTooLarge(c, i18n.ErrBadRequest)
+				return
+			}
+
 			Abort(c, http.StatusBadRequest, i18n.ErrBadRequest)
 			return
 		}
 
 		// 3) Save model with values from form
-		if err := entity.SavePhotoForm(m, f); err != nil {
+		if err = entity.SavePhotoForm(&m, frm); err != nil {
 			Abort(c, http.StatusInternalServerError, i18n.ErrSaveFailed)
 			return
-		} else if f.PhotoPrivate {
+		} else if frm.PhotoPrivate {
 			FlushCoverCache()
 		}
 
-		PublishPhotoEvent(EntityUpdated, uid, c)
+		PublishPhotoEvent(StatusUpdated, uid)
 
 		event.SuccessMsg(i18n.MsgChangesSaved)
 
@@ -112,29 +162,50 @@ func UpdatePhoto(router *gin.RouterGroup) {
 			return
 		}
 
-		SavePhotoAsYaml(p)
+		SaveSidecarYaml(&p)
 
 		UpdateClientConfig()
 
+		p.RedactForSession(s)
 		c.JSON(http.StatusOK, p)
 	})
 }
 
 // GetPhotoDownload returns the primary file matching that belongs to the photo.
 //
-// Route :GET /api/v1/photos/:uid/dl
-// Params:
-// - uid (string) PhotoUID as returned by the API
+//	@Summary	returns the primary file matching that belongs to the photo
+//	@Id			GetPhotoDownload
+//	@Tags		Images, Files
+//	@Produce	application/octet-stream
+//	@Failure	403,404	{file}		image/svg+xml
+//	@Failure	429		{object}	i18n.Response
+//	@Success	200		{file}		application/octet-stream
+//	@Param		uid		path		string	true	"photo uid"
+//	@Router		/api/v1/photos/{uid}/dl [get]
 func GetPhotoDownload(router *gin.RouterGroup) {
 	router.GET("/photos/:uid/dl", func(c *gin.Context) {
-		if InvalidDownloadToken(c) {
+		sess, valid := AuthDownload(c, acl.Resources{acl.ResourcePhotos})
+		if !valid && DownloadRateLimited(c) {
+			limiter.AbortJSON(c)
+			return
+		} else if !valid {
 			c.Data(http.StatusForbidden, "image/svg+xml", brokenIconSvg)
 			return
 		}
 
-		f, err := query.FileByPhotoUID(clean.UID(c.Param("uid")))
+		uid := clean.UID(c.Param("uid"))
 
-		if err != nil {
+		// Withhold photos the session may not see, reported as not found so a token holder cannot probe
+		// arbitrary photos by UID. PhotoDownloadable scopes an identified session and limits a coarse
+		// token to public content.
+		if visible, vErr := search.PhotoDownloadable(uid, sess); vErr != nil || !visible {
+			c.Data(http.StatusNotFound, "image/svg+xml", photoIconSvg)
+			return
+		}
+
+		f, err := query.FileByPhotoUID(uid)
+
+		if err != nil || !f.Exportable(sess) {
 			c.Data(http.StatusNotFound, "image/svg+xml", photoIconSvg)
 			return
 		}
@@ -146,7 +217,7 @@ func GetPhotoDownload(router *gin.RouterGroup) {
 			c.Data(http.StatusNotFound, "image/svg+xml", photoIconSvg)
 
 			// Set missing flag so that the file doesn't show up in search results anymore.
-			logError("photo", f.Update("FileMissing", true))
+			logErr("photo", f.Update("FileMissing", true))
 
 			return
 		}
@@ -155,21 +226,38 @@ func GetPhotoDownload(router *gin.RouterGroup) {
 	})
 }
 
-// GetPhotoYaml returns photo details as YAML.
+// GetPhotoYaml returns picture details as YAML.
 //
-// GET /api/v1/photos/:uid/yaml
-// Params:
-//
-//	uid: string PhotoUID as returned by the API
+//	@Summary	returns picture details as YAML
+//	@Id			GetPhotoYaml
+//	@Tags		Photos
+//	@Produce	text/x-yaml
+//	@Failure	401,403,404,429,500	{object}	i18n.Response
+//	@Success	200					{file}		text/x-yaml
+//	@Param		uid					path		string	true	"photo uid"
+//	@Router		/api/v1/photos/{uid}/yaml [get]
 func GetPhotoYaml(router *gin.RouterGroup) {
 	router.GET("/photos/:uid/yaml", func(c *gin.Context) {
-		s := Auth(c, acl.ResourcePhotos, acl.AccessAll)
+		s := AuthAccess(c, acl.ResourcePhotos, acl.ActionView, acl.Permissions{acl.AccessAll})
 
 		if s.Abort(c) {
 			return
 		}
 
-		p, err := query.PhotoPreloadByUID(clean.UID(c.Param("uid")))
+		if !s.SeesAnyDetail(acl.ResourcePhotos) {
+			AbortForbidden(c)
+			return
+		}
+
+		uid := clean.UID(c.Param("uid"))
+
+		// Limit access to pictures within the session's shared scope, consistent with photo search.
+		if visible, err := search.PhotoVisibleToSession(uid, s); err != nil || !visible {
+			c.AbortWithStatus(http.StatusNotFound)
+			return
+		}
+
+		p, err := query.PhotoPreloadByUID(uid)
 
 		if err != nil {
 			c.AbortWithStatus(http.StatusNotFound)
@@ -184,7 +272,7 @@ func GetPhotoYaml(router *gin.RouterGroup) {
 		}
 
 		if c.Query("download") != "" {
-			AddDownloadHeader(c, clean.UID(c.Param("uid"))+fs.ExtYAML)
+			AddDownloadHeader(c, clean.UID(c.Param("uid"))+fs.ExtYml)
 		}
 
 		c.Data(http.StatusOK, "text/x-yaml; charset=utf-8", data)
@@ -193,10 +281,15 @@ func GetPhotoYaml(router *gin.RouterGroup) {
 
 // ApprovePhoto marks a photo in review as approved.
 //
-// POST /api/v1/photos/:uid/approve
-// Params:
-//
-//	uid: string PhotoUID as returned by the API
+//	@Summary	marks a photo in review as approved
+//	@Id			ApprovePhoto
+//	@Tags		Photos
+//	@Accept		json
+//	@Produce	json
+//	@Success	200					{object}	gin.H
+//	@Failure	401,403,404,429,500	{object}	i18n.Response
+//	@Param		uid					path		string	true	"photo uid"
+//	@Router		/api/v1/photos/{uid}/approve [post]
 func ApprovePhoto(router *gin.RouterGroup) {
 	router.POST("/photos/:uid/approve", func(c *gin.Context) {
 		s := Auth(c, acl.ResourcePhotos, acl.ActionUpdate)
@@ -206,6 +299,17 @@ func ApprovePhoto(router *gin.RouterGroup) {
 		}
 
 		id := clean.UID(c.Param("uid"))
+
+		// Limit access to pictures within the session's shared scope, mirroring photo and album
+		// updates. The query-free PhotoSessionSeesEverything check lets full-access sessions skip the
+		// per-photo lookup; restricted sessions (client and user role aware) stay within their scope.
+		if !search.PhotoSessionSeesEverything(s) {
+			if visible, vErr := search.PhotoVisibleToSession(id, s); vErr != nil || !visible {
+				AbortForbidden(c)
+				return
+			}
+		}
+
 		m, err := query.PhotoByUID(id)
 
 		if err != nil {
@@ -219,9 +323,13 @@ func ApprovePhoto(router *gin.RouterGroup) {
 			return
 		}
 
-		SavePhotoAsYaml(m)
+		SaveSidecarYaml(&m)
 
-		PublishPhotoEvent(EntityUpdated, id, c)
+		PublishPhotoEvent(StatusUpdated, id)
+
+		// Shaped like every other picture response. This loader preloads no files, so there is no
+		// marker to withhold here yet - the reduction it applies is the shared-only one.
+		m.RedactForSession(s)
 
 		c.JSON(http.StatusOK, gin.H{"photo": m})
 	})
@@ -229,11 +337,16 @@ func ApprovePhoto(router *gin.RouterGroup) {
 
 // PhotoPrimary sets the primary file for a photo.
 //
-// POST /photos/:uid/files/:file_uid/primary
-// Params:
-//
-//	uid: string PhotoUID as returned by the API
-//	file_uid: string File UID as returned by the API
+//	@Summary	sets the primary file for a photo
+//	@Id			PhotoPrimary
+//	@Tags		Photos, Stacks
+//	@Accept		json
+//	@Produce	json
+//	@Success	200					{object}	entity.Photo
+//	@Failure	401,403,404,429,500	{object}	i18n.Response
+//	@Param		uid					path		string	true	"photo uid"
+//	@Param		fileuid				path		string	true	"file uid"
+//	@Router		/api/v1/photos/{uid}/files/{fileuid}/primary [post]
 func PhotoPrimary(router *gin.RouterGroup) {
 	router.POST("/photos/:uid/files/:file_uid/primary", func(c *gin.Context) {
 		s := Auth(c, acl.ResourcePhotos, acl.ActionUpdate)
@@ -244,6 +357,16 @@ func PhotoPrimary(router *gin.RouterGroup) {
 
 		uid := clean.UID(c.Param("uid"))
 		fileUid := clean.UID(c.Param("file_uid"))
+
+		// Limit access to pictures within the session's shared scope. Full-access sessions skip the
+		// query-free PhotoSessionSeesEverything check; restricted sessions stay within their scope.
+		if !search.PhotoSessionSeesEverything(s) {
+			if visible, vErr := search.PhotoVisibleToSession(uid, s); vErr != nil || !visible {
+				AbortForbidden(c)
+				return
+			}
+		}
+
 		err := query.SetPhotoPrimary(uid, fileUid)
 
 		if err != nil {
@@ -251,7 +374,7 @@ func PhotoPrimary(router *gin.RouterGroup) {
 			return
 		}
 
-		PublishPhotoEvent(EntityUpdated, uid, c)
+		PublishPhotoEvent(StatusUpdated, uid)
 
 		event.SuccessMsg(i18n.MsgChangesSaved)
 
@@ -262,6 +385,7 @@ func PhotoPrimary(router *gin.RouterGroup) {
 			return
 		}
 
+		p.RedactForSession(s)
 		c.JSON(http.StatusOK, p)
 	})
 }

@@ -1,0 +1,110 @@
+package api
+
+import (
+	"net/http"
+
+	"github.com/gin-gonic/gin"
+
+	"github.com/photoprism/photoprism/internal/ai/face"
+	"github.com/photoprism/photoprism/internal/ai/vision"
+	"github.com/photoprism/photoprism/internal/auth/acl"
+	"github.com/photoprism/photoprism/pkg/http/header"
+	"github.com/photoprism/photoprism/pkg/http/scheme"
+	"github.com/photoprism/photoprism/pkg/media"
+)
+
+// PostVisionFace returns the embeddings of a face.
+//
+//	@Summary	returns the embeddings of a face image
+//	@Id			PostVisionFace
+//	@Tags		Vision
+//	@Produce	json
+//	@Success	200		{object}	vision.ApiResponse
+//	@Failure	400,413	{object}	vision.ApiResponse
+//	@Failure	403		{object}	vision.ApiResponse	"Vision API disabled; permission errors return i18n.Response"
+//	@Failure	401,429	{object}	i18n.Response
+//	@Param		images	body		vision.ApiRequest	true	"list of image file urls"
+//	@Router		/api/v1/vision/face [post]
+func PostVisionFace(router *gin.RouterGroup) {
+	router.POST("/vision/face", func(c *gin.Context) {
+		s := Auth(c, acl.ResourceVision, acl.ActionUse)
+
+		// Abort if permission is not granted.
+		if s.Abort(c) {
+			return
+		}
+
+		// Abort if the Computer Vision API is disabled.
+		if abortVisionApiDisabled(c) {
+			return
+		}
+
+		var request vision.ApiRequest
+
+		// File uploads are not currently supported for this API endpoint.
+		if header.HasContentType(&c.Request.Header, header.ContentTypeMultipart) {
+			c.JSON(http.StatusBadRequest, vision.NewApiError(request.GetId(), http.StatusBadRequest))
+			return
+		}
+
+		// Assign and validate request form values.
+		LimitRequestBodyBytes(c, MaxVisionRequestBytes)
+
+		if err := c.BindJSON(&request); err != nil {
+			if IsRequestBodyTooLarge(err) {
+				c.JSON(http.StatusRequestEntityTooLarge, vision.NewApiError(request.GetId(), http.StatusRequestEntityTooLarge))
+				return
+			}
+
+			c.JSON(http.StatusBadRequest, vision.NewApiError(request.GetId(), http.StatusBadRequest))
+			return
+		}
+
+		// Return if no thumbnail filenames were given.
+		if len(request.Images) == 0 {
+			log.Errorf("vision: at least one image required (run face embeddings)")
+			c.JSON(http.StatusBadRequest, vision.NewApiError(request.GetId(), http.StatusBadRequest))
+			return
+		}
+
+		// Run inference to find matching labels.
+		results := make([]face.Embeddings, len(request.Images))
+
+		for i := range request.Images {
+			// ReadUrlImage restricts references to https/data URLs, rejecting local paths and
+			// file: schemes before any read so this endpoint cannot read arbitrary local files.
+			data, err := media.ReadUrlImage(request.Images[i], scheme.HttpsData)
+
+			// A rejected reference fails closed with 400, mirroring the labels endpoint.
+			if err != nil {
+				logVisionErr("face image", err)
+				c.JSON(http.StatusBadRequest, vision.NewApiError(request.GetId(), http.StatusBadRequest))
+				return
+			}
+
+			// Undecodable data fails closed with 400, mirroring the labels and nsfw endpoints.
+			// An image with no detectable face is not an error and still yields 200 with
+			// empty embeddings. A configuration that hands out no embedder answers 400 too,
+			// so a client that gets one on valid input should check "faces status".
+			result, faceErr := vision.GenerateFaceEmbeddings(data)
+
+			if faceErr != nil {
+				logVisionErr("face embeddings", faceErr)
+				c.JSON(http.StatusBadRequest, vision.NewApiError(request.GetId(), http.StatusBadRequest))
+				return
+			}
+
+			results[i] = result
+		}
+
+		// Generate Vision API service response.
+		response := vision.ApiResponse{
+			Id:     request.GetId(),
+			Code:   http.StatusOK,
+			Model:  &vision.Model{Type: vision.ModelTypeFace},
+			Result: vision.ApiResult{Embeddings: results},
+		}
+
+		c.JSON(http.StatusOK, response)
+	})
+}

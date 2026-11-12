@@ -3,35 +3,66 @@ import { Selector, t } from "testcafe";
 export default class Page {
   constructor() {
     this.generalTab = Selector("#tab-settings_general");
-    this.languageInput = Selector(".input-language input");
-    this.languageOpenSelection = Selector(".input-language div.v-select__selections");
-    this.uploadCheckbox = Selector(".input-upload div.v-input--selection-controls__ripple");
-    this.downloadCheckbox = Selector(".input-download div.v-input--selection-controls__ripple");
-    this.importCheckbox = Selector(".input-import div.v-input--selection-controls__ripple");
-    this.archiveCheckbox = Selector(".input-archive div.v-input--selection-controls__ripple");
-    this.editCheckbox = Selector(".input-edit div.v-input--selection-controls__ripple");
-    this.filesCheckbox = Selector(".input-files div.v-input--selection-controls__ripple");
-    this.momentsCheckbox = Selector(".input-moments div.v-input--selection-controls__ripple");
-    this.labelsCheckbox = Selector(".input-labels div.v-input--selection-controls__ripple");
-    this.logsCheckbox = Selector(".input-logs div.v-input--selection-controls__ripple");
-    this.shareCheckbox = Selector(".input-share div.v-input--selection-controls__ripple");
-    this.placesCheckbox = Selector(".input-places div.v-input--selection-controls__ripple");
-    this.privateCheckbox = Selector(
-      'input[aria-label="Private"] + div.v-input--selection-controls__ripple'
-    );
-    this.peopleCheckbox = Selector(".input-people div.v-input--selection-controls__ripple");
-    this.deleteCheckbox = Selector(".input-delete div.v-input--selection-controls__ripple");
-    this.libraryCheckbox = Selector(".input-library div.v-input--selection-controls__ripple");
+    this.languageInput = Selector(".input-language input:not([type='hidden'])");
+    this.languageOpenSelection = Selector(".input-language div.v-input__control");
+    this.startpageOpenSelection = Selector(".input-startpage div.v-input__control");
+    this.uploadCheckbox = Selector(".input-upload div.v-selection-control__input");
+    this.downloadCheckbox = Selector(".input-download div.v-selection-control__input");
+    this.exportCheckbox = Selector(".input-export div.v-selection-control__input");
+    this.importCheckbox = Selector(".input-import div.v-selection-control__input");
+    this.archiveCheckbox = Selector(".input-archive div.v-selection-control__input");
+    this.editCheckbox = Selector(".input-edit div.v-selection-control__input");
+    this.batchCheckbox = Selector(".input-batch-edit div.v-selection-control__input");
+    this.filesCheckbox = Selector(".input-files div.v-selection-control__input");
+    this.momentsCheckbox = Selector(".input-moments div.v-selection-control__input");
+    this.calendarCheckbox = Selector(".input-calendar div.v-selection-control__input");
+    this.accountCheckbox = Selector(".input-account div.v-selection-control__input");
+    this.servicesCheckbox = Selector(".input-services div.v-selection-control__input");
+    this.labelsCheckbox = Selector(".input-labels div.v-selection-control__input");
+    this.logsCheckbox = Selector(".input-logs div.v-selection-control__input");
+    this.shareCheckbox = Selector(".input-share div.v-selection-control__input");
+    this.placesCheckbox = Selector(".input-places div.v-selection-control__input");
+    this.privateCheckbox = Selector(".input-private div.v-selection-control__input");
+    this.peopleCheckbox = Selector(".input-people div.v-selection-control__input");
+    this.deleteCheckbox = Selector(".input-delete div.v-selection-control__input");
+    this.libraryCheckbox = Selector(".input-library div.v-selection-control__input");
+    this.albumsCheckbox = Selector(".input-albums div.v-selection-control__input");
+    this.favoritesCheckbox = Selector(".input-favorites div.v-selection-control__input");
+    this.foldersCheckbox = Selector(".input-folders div.v-selection-control__input");
+    this.videosCheckbox = Selector(".input-videos div.v-selection-control__input");
+    this.zoomCheckbox = Selector(".input-zoom div.v-selection-control__input");
+    this.openOnHoverCheckbox = Selector(".input-open-on-hover div.v-selection-control__input");
+    this.hideScrollbarCheckbox = Selector(".input-hide-scrollbar div.v-selection-control__input");
+    this.reduceMotionCheckbox = Selector(".input-reduce-motion div.v-selection-control__input");
 
-    this.libraryTab = Selector("#tab-settings_media");
-    this.reviewCheckbox = Selector(".input-review div.v-input--selection-controls__ripple");
-    this.convertCheckbox = Selector(".input-convert div.v-input--selection-controls__ripple");
-    this.estimatesCheckbox = Selector(".input-estimates div.v-input--selection-controls__ripple");
-    this.dateTimeStacksCheckbox = Selector(
-      ".input-stack-meta div.v-input--selection-controls__ripple"
-    );
-    this.uuidStacksCheckbox = Selector(".input-stack-uuid div.v-input--selection-controls__ripple");
-    this.nameStacksCheckbox = Selector(".input-stack-name div.v-input--selection-controls__ripple");
+    this.libraryTab = Selector("#tab-settings_content");
+    this.collectionsTab = Selector("#tab-settings_collections");
+    this.reviewCheckbox = Selector(".input-review div.v-selection-control__input");
+    this.convertCheckbox = Selector(".input-convert div.v-selection-control__input");
+    this.estimatesCheckbox = Selector(".input-estimates div.v-selection-control__input");
+    this.dateTimeStacksCheckbox = Selector(".input-stack-meta div.v-selection-control__input");
+    this.uuidStacksCheckbox = Selector(".input-stack-uuid div.v-selection-control__input");
+    this.nameStacksCheckbox = Selector(".input-stack-name div.v-selection-control__input");
+    this.hideTitlesCheckbox = Selector(".input-search-titles div.v-selection-control__input");
+    this.hideCaptionsCheckbox = Selector(".input-search-captions div.v-selection-control__input");
+    this.hideListViewCheckbox = Selector(".input-search-listview div.v-selection-control__input");
+
+    this.downloadNameSelect = Selector(".input-download-name div.v-input__control");
+    this.downloadOriginalsCheckbox = Selector(".input-download-originals div.v-selection-control__input");
+    this.downloadRawCheckbox = Selector(".input-download-raw div.v-selection-control__input");
+    this.downloadSidecarCheckbox = Selector(".input-download-sidecar div.v-selection-control__input");
+
+    this.albumDownloadDisabledCheckbox = Selector(".input-album-download-disabled div.v-selection-control__input");
+    this.albumDownloadNameSelect = Selector(".input-album-download-name div.v-input__control");
+    this.albumDownloadOriginalsCheckbox = Selector(".input-album-download-originals div.v-selection-control__input");
+    this.albumDownloadRawCheckbox = Selector(".input-album-download-raw div.v-selection-control__input");
+    this.albumDownloadSidecarCheckbox = Selector(".input-album-download-sidecar div.v-selection-control__input");
+
+    this.albumOrderSelect = Selector(".input-album-order div.v-input__control");
+    this.folderOrderSelect = Selector(".input-folder-order div.v-input__control");
+    this.momentOrderSelect = Selector(".input-moment-order div.v-input__control");
+    this.stateOrderSelect = Selector(".input-state-order div.v-input__control");
+    this.monthOrderSelect = Selector(".input-month-order div.v-input__control");
 
     this.advancedTab = Selector("#tab-settings_advanced");
     this.debugCheckbox = Selector("label").withText("Debug Logs");
@@ -42,6 +73,5 @@ export default class Page {
     this.readOnlyCheckbox = Selector("label").withText("Read-Only Mode");
 
     this.accountTab = Selector("#tab-settings_account");
-    this.servicesTab = Selector("#tab-settings_services");
   }
 }

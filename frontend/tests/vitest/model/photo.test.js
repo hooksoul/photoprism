@@ -1,0 +1,3088 @@
+import { describe, it, expect, beforeEach, vi } from "vitest";
+import { DateTime } from "luxon";
+import "../fixtures";
+import * as media from "common/media";
+import { Photo, isTimeZoneLocal, isTimeZoneUTC, BatchSize, MaxLength } from "model/photo";
+import $event from "common/event";
+import { $config } from "app/session";
+
+// Drains the pubsub-js async queue so subscribers configured as `async: true`
+// have run by the time the test asserts.
+const flushEvents = () => new Promise((resolve) => setTimeout(resolve, 0));
+
+describe("model/photo", () => {
+  // Pins the per-field length caps to the backend VARCHAR + clip ceilings.
+  // If a backend bump (internal/entity/photo.go or details.go) changes any
+  // of these, this test fails on purpose so the frontend cap moves with it.
+  it("MaxLength mirrors the backend VARCHAR + clip caps", () => {
+    expect(MaxLength).toEqual({
+      Title: 200,
+      Caption: 4096,
+      Subject: 1024,
+      Artist: 1024,
+      Copyright: 1024,
+      License: 1024,
+      Keywords: 2048,
+      Notes: 2048,
+      Exposure: 64,
+    });
+    // Frozen so consumers can't accidentally mutate per-field caps.
+    expect(Object.isFrozen(MaxLength)).toBe(true);
+  });
+
+  // Title, Caption, and Exposure live directly on the Photo; the Details
+  // fields (Subject, Artist, etc.) live one level down — the override
+  // must handle both shapes without crashing on a Photo without Details.
+  it("trimInputs() trims both direct fields and Details nested fields", () => {
+    const photo = new Photo({
+      Title: "  Sunset  ",
+      Caption: "\tBeach\n",
+      Exposure: " 1/250s ",
+      Details: {
+        Subject: " woman walking ",
+        Artist: "\tAnsel Adams ",
+        Copyright: "  © 2026 ",
+        License: " CC-BY ",
+        Keywords: " sunset,beach ",
+        Notes: "  scenic view  ",
+      },
+      Slug: " untouched ",
+    });
+
+    photo.trimInputs();
+
+    expect(photo.Title).toBe("Sunset");
+    expect(photo.Caption).toBe("Beach");
+    expect(photo.Exposure).toBe("1/250s");
+    expect(photo.Details.Subject).toBe("woman walking");
+    expect(photo.Details.Artist).toBe("Ansel Adams");
+    expect(photo.Details.Copyright).toBe("© 2026");
+    expect(photo.Details.License).toBe("CC-BY");
+    expect(photo.Details.Keywords).toBe("sunset,beach");
+    expect(photo.Details.Notes).toBe("scenic view");
+    // Slug isn't in MaxLength — passes through.
+    expect(photo.Slug).toBe(" untouched ");
+  });
+
+  describe("mergeUnchanged", () => {
+    // saved returns a photo as loaded from the server, with all editable text fields set.
+    const saved = () =>
+      new Photo({
+        UID: "ps6sg6be2lvl0yh7",
+        Title: "Saved Title",
+        TitleSrc: "auto",
+        Caption: "Saved caption",
+        CaptionSrc: "",
+        Details: { Subject: "Saved subject", SubjectSrc: "", Notes: "Saved notes", NotesSrc: "", Keywords: "saved", KeywordsSrc: "" },
+      });
+
+    // server returns the refetched photo with every editable text field changed.
+    const server = () =>
+      new Photo({
+        UID: "ps6sg6be2lvl0yh7",
+        Title: "Server Title",
+        TitleSrc: "ollama",
+        Caption: "Server caption",
+        CaptionSrc: "ollama",
+        Details: {
+          Subject: "Server subject",
+          SubjectSrc: "manual",
+          Artist: "Server artist",
+          ArtistSrc: "manual",
+          Copyright: "Server copyright",
+          CopyrightSrc: "manual",
+          License: "Server license",
+          LicenseSrc: "manual",
+          Keywords: "server",
+          KeywordsSrc: "manual",
+          Notes: "Server notes",
+          NotesSrc: "manual",
+        },
+      });
+
+    it("updates fields without unsaved edits and records them as saved", () => {
+      const photo = saved();
+
+      photo.mergeUnchanged(server());
+
+      expect(photo.Title).toBe("Server Title");
+      expect(photo.TitleSrc).toBe("ollama");
+      expect(photo.Caption).toBe("Server caption");
+      expect(photo.CaptionSrc).toBe("ollama");
+      expect(photo.Details.Subject).toBe("Server subject");
+      expect(photo.Details.SubjectSrc).toBe("manual");
+      expect(photo.Details.Artist).toBe("Server artist");
+      expect(photo.Details.Copyright).toBe("Server copyright");
+      expect(photo.Details.License).toBe("Server license");
+      expect(photo.Details.Keywords).toBe("server");
+      expect(photo.Details.Notes).toBe("Server notes");
+      expect(photo.Details.NotesSrc).toBe("manual");
+      expect(photo.wasChanged()).toBe(false);
+    });
+
+    it("keeps unsaved edits of top-level and Details fields", () => {
+      const photo = saved();
+      photo.Caption = "Typed caption";
+      photo.Details.Subject = "Typed subject";
+
+      photo.mergeUnchanged(server());
+
+      expect(photo.Caption).toBe("Typed caption");
+      expect(photo.CaptionSrc).toBe("");
+      expect(photo.originalValue("Caption")).toBe("Saved caption");
+      expect(photo.Details.Subject).toBe("Typed subject");
+      expect(photo.Details.SubjectSrc).toBe("");
+      expect(photo.originalValue("Details").Subject).toBe("Saved subject");
+      expect(photo.Title).toBe("Server Title");
+      expect(photo.Details.Notes).toBe("Server notes");
+
+      // Saving sends the typed edits; the merged server values count as unchanged.
+      const values = photo.getValues(true);
+      expect(values.Caption).toBe("Typed caption");
+      expect(values.Title).toBeUndefined();
+      expect(values.Details.Subject).toBe("Typed subject");
+      expect(values.Details.Notes).toBe("Server notes");
+    });
+
+    it("skips fields the response does not contain", () => {
+      const photo = saved();
+
+      photo.mergeUnchanged({ Title: "Server Title", Details: { Notes: "Server notes" } });
+
+      expect(photo.Title).toBe("Server Title");
+      expect(photo.TitleSrc).toBe("auto");
+      expect(photo.Caption).toBe("Saved caption");
+      expect(photo.Details.Notes).toBe("Server notes");
+      expect(photo.Details.Subject).toBe("Saved subject");
+      expect(photo.wasChanged()).toBe(false);
+    });
+
+    it("is a no-op without values", () => {
+      const photo = saved();
+
+      photo.mergeUnchanged(null);
+
+      expect(photo.Title).toBe("Saved Title");
+      expect(photo.wasChanged()).toBe(false);
+    });
+
+    it("updates top-level fields when the server returns no Details", () => {
+      const photo = saved();
+
+      photo.mergeUnchanged({ Title: "Server Title", TitleSrc: "manual", Caption: "Server caption", CaptionSrc: "manual" });
+
+      expect(photo.Title).toBe("Server Title");
+      expect(photo.Details.Subject).toBe("Saved subject");
+    });
+  });
+
+  it("trimInputs() is safe to call on a Photo without Details", () => {
+    const photo = new Photo({ Title: " bare " });
+    expect(() => photo.trimInputs()).not.toThrow();
+    expect(photo.Title).toBe("bare");
+  });
+
+  it("should get photo entity name", () => {
+    const values = { UID: 5, Title: "Crazy Cat" };
+    const photo = new Photo(values);
+    const result = photo.getEntityName();
+    expect(result).toBe("Crazy Cat");
+  });
+
+  it("should get hidden reason from file error", () => {
+    const photo = new Photo({ FileError: "unsupported raw format" });
+    expect(photo.getHiddenReason()).toBe("unsupported raw format");
+  });
+
+  it("should get hidden reason from primary file error", () => {
+    const photo = new Photo({
+      Files: [
+        { Primary: true, Error: "failed to decode image" },
+        { Primary: false, Error: "secondary error" },
+      ],
+    });
+
+    expect(photo.getHiddenReason()).toBe("failed to decode image");
+  });
+
+  it("should get photo uuid", () => {
+    const values = { ID: 5, Title: "Crazy Cat", UID: 789 };
+    const photo = new Photo(values);
+    const result = photo.getId();
+    expect(result).toBe(789);
+  });
+
+  it("should get photo title", () => {
+    const values = { ID: 5, Title: "Crazy Cat", UID: 789 };
+    const photo = new Photo(values);
+    const result = photo.getTitle();
+    expect(result).toBe("Crazy Cat");
+  });
+
+  it("should get photo maps link", () => {
+    const values = { ID: 5, Title: "Crazy Cat", Lat: 36.442881666666665, Lng: 28.229493333333334 };
+    const photo = new Photo(values);
+    const result = photo.getGoogleMapsLink();
+    expect(result).toBe("https://www.google.com/maps/place/36.442881666666665,28.229493333333334");
+  });
+
+  it("should get photo thumbnail url", () => {
+    const values = { ID: 5, Title: "Crazy Cat", Hash: "97b8cf7b3710bec95f6609487bbdd62489b95fb2" };
+    const photo = new Photo(values);
+    const result = photo.thumbnailUrl("tile500");
+    expect(result).toBe("/api/v1/t/97b8cf7b3710bec95f6609487bbdd62489b95fb2/public/tile500");
+    const values2 = {
+      ID: 10,
+      UID: "ABC127",
+      Files: [
+        {
+          UID: "123fgb",
+          Name: "1980/01/superCuteKitten.mp4",
+          Primary: false,
+          FileType: "mp4",
+          Width: 500,
+          Height: 600,
+          Hash: "be651a4fffd699196cfd5dd14b6ec9cb10a8531a",
+        },
+      ],
+    };
+    const photo2 = new Photo(values2);
+    const result2 = photo2.thumbnailUrl("tile500");
+    expect(result2).toBe("/api/v1/t/be651a4fffd699196cfd5dd14b6ec9cb10a8531a/public/tile500");
+    const values3 = {
+      ID: 10,
+      UID: "ABC127",
+      Files: [
+        {
+          UID: "123fgb",
+          Name: "1980/01/superCuteKitten.mp4",
+          Primary: false,
+          FileType: "mp4",
+          Width: 500,
+          Height: 600,
+        },
+      ],
+    };
+    const photo3 = new Photo(values3);
+    const result3 = photo3.thumbnailUrl("tile500");
+    expect(result3).toBe("/static/img/404.jpg");
+  });
+
+  it("should get classes", () => {
+    const values2 = {
+      ID: 10,
+      UID: "ABC127",
+      Type: "video",
+      Portrait: true,
+      Favorite: true,
+      Private: true,
+      Files: [
+        {
+          UID: "123fgb",
+          Name: "1980/01/superCuteKitten.mp4",
+          Primary: false,
+          FileType: "mp4",
+          Video: true,
+          Width: 500,
+          Height: 600,
+          Hash: "1xxbgdt55",
+        },
+        {
+          UID: "123fde",
+          Name: "1980/01/superCuteKitten.mp4",
+          Primary: false,
+          FileType: "mp4",
+          Width: 500,
+          Height: 600,
+          Hash: "1xxbgdkkk",
+        },
+      ],
+    };
+    const photo2 = new Photo(values2);
+    const result2 = photo2.classes();
+    expect(result2).toContain("is-photo");
+    expect(result2).toContain("uid-ABC127");
+    expect(result2).toContain("type-video");
+    expect(result2).toContain("is-portrait");
+    expect(result2).toContain("is-favorite");
+    expect(result2).toContain("is-private");
+    expect(result2).not.toContain("is-stack");
+    expect(result2).toContain("is-playable");
+  });
+
+  it("should get photo download url", () => {
+    const values = { ID: 5, Title: "Crazy Cat", Hash: "97b8cf7b3710bec95f6609487bbdd62489b95fb2" };
+    const photo = new Photo(values);
+    const result = photo.getDownloadUrl();
+    expect(result).toBe("/api/v1/dl/97b8cf7b3710bec95f6609487bbdd62489b95fb2?t=2lbh9x09");
+  });
+
+  it("should check if a file of a video is kept", () => {
+    const photo = new Photo({ UID: "pt9x2vksm3p4q8ft", Type: "video" });
+    expect(photo.isVideoFileKept({ MediaType: "video" })).toBe(true);
+    expect(photo.isVideoFileKept({ MediaType: "live" })).toBe(true);
+    expect(photo.isVideoFileKept({ MediaType: "sidecar" })).toBe(true);
+    expect(photo.isVideoFileKept({ MediaType: "image", Video: true })).toBe(true);
+    expect(photo.isVideoFileKept({ MediaType: "image", Sidecar: true })).toBe(true);
+    expect(photo.isVideoFileKept({ MediaType: "image" })).toBe(false);
+    expect(photo.isVideoFileKept({ MediaType: "raw" })).toBe(false);
+    expect(photo.isVideoFileKept({})).toBe(false);
+  });
+
+  describe("downloadAll", () => {
+    const allowAll = (overrides = {}) => ({
+      features: { download: true },
+      download: { name: "file", mediaRaw: true, mediaSidecar: true, ...overrides },
+    });
+
+    const mockSettings = (settings) => vi.spyOn($config, "getSettings").mockReturnValue(settings);
+    const jpg = (hash, name = "1980/01/kitten.jpg") => ({ Hash: hash, Name: name, Root: "/", FileType: "jpg", MediaType: "image" });
+    const raw = (hash, name = "1980/01/kitten.cr2") => ({ Hash: hash, Name: name, Root: "/", FileType: "cr2", MediaType: "raw" });
+
+    // common/download() renders each started download as a hidden <a
+    // download> click. Spying on the anchor click observes those requests
+    // (and their URLs / file names) without hitting the network.
+    let clicks;
+
+    const hrefs = () => clicks.map((c) => c.href);
+
+    beforeEach(() => {
+      clicks = [];
+      vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(function () {
+        clicks.push({ href: this.getAttribute("href"), name: this.getAttribute("download") });
+      });
+    });
+
+    it("downloads eligible files and reports the counts", () => {
+      mockSettings(allowAll());
+      const photo = new Photo({ UID: "pt9x2vksm3p4q8ft", Type: "image", Files: [jpg("f1"), jpg("f2", "1980/01/second.jpg")] });
+
+      expect(photo.downloadAll()).toEqual({ downloaded: 2, skipped: 0 });
+      expect(clicks).toHaveLength(2);
+      expect(hrefs()).toEqual(["/api/v1/dl/f1?t=2lbh9x09", "/api/v1/dl/f2?t=2lbh9x09"]);
+      expect(clicks.map((c) => c.name)).toEqual(["kitten.jpg", "second.jpg"]);
+    });
+
+    it("downloads the primary file when no file list exists", () => {
+      mockSettings(allowAll());
+      const photo = new Photo({ UID: "pt9x2vksm3p4q8ft", Hash: "primary1", FileName: "1980/01/tiger.jpg" });
+
+      expect(photo.downloadAll()).toEqual({ downloaded: 1, skipped: 0 });
+      expect(clicks).toHaveLength(1);
+      expect(clicks[0].href).toBe("/api/v1/dl/primary1?t=2lbh9x09");
+      expect(clicks[0].name).toBe("tiger.jpg");
+    });
+
+    it("reports every file as skipped when the settings exclude them all", () => {
+      mockSettings(allowAll({ mediaRaw: false }));
+      const dng = { Hash: "r2", Name: "1980/01/kitten.dng", Root: "/", FileType: "raw", MediaType: "image" };
+      const photo = new Photo({ UID: "pt9x2vksm3p4q8ft", Type: "image", Files: [raw("r1"), dng] });
+
+      expect(photo.downloadAll()).toEqual({ downloaded: 0, skipped: 2 });
+      expect(clicks).toHaveLength(0);
+    });
+
+    it("reports mixed results when only some files are excluded", () => {
+      mockSettings(allowAll({ mediaRaw: false }));
+      const photo = new Photo({ UID: "pt9x2vksm3p4q8ft", Type: "image", Files: [jpg("f1"), raw("r1")] });
+
+      expect(photo.downloadAll()).toEqual({ downloaded: 1, skipped: 1 });
+      expect(hrefs()).toEqual(["/api/v1/dl/f1?t=2lbh9x09"]);
+    });
+
+    it("skips sidecar files unless sidecar downloads are enabled", () => {
+      const xmp = { Hash: "s1", Name: "1980/01/kitten.xmp", Root: "/", FileType: "xmp", MediaType: "sidecar" };
+      const json = { Hash: "s2", Name: "1980/01/kitten.json", Root: "/", FileType: "json", MediaType: "", Sidecar: true };
+      const photo = new Photo({ UID: "pt9x2vksm3p4q8ft", Type: "image", Files: [jpg("f1"), xmp, json] });
+
+      mockSettings(allowAll({ mediaSidecar: false }));
+      expect(photo.downloadAll()).toEqual({ downloaded: 1, skipped: 2 });
+      expect(hrefs()).toEqual(["/api/v1/dl/f1?t=2lbh9x09"]);
+
+      clicks = [];
+      mockSettings(allowAll({ mediaSidecar: true }));
+      expect(photo.downloadAll()).toEqual({ downloaded: 3, skipped: 0 });
+      expect(hrefs()).toEqual(["/api/v1/dl/f1?t=2lbh9x09", "/api/v1/dl/s1?t=2lbh9x09", "/api/v1/dl/s2?t=2lbh9x09"]);
+    });
+
+    it("skips files outside the originals root when only originals are downloaded", () => {
+      const generated = { Hash: "g1", Name: "1980/01/kitten.cr2.jpg", Root: "sidecar", FileType: "jpg", MediaType: "image" };
+      const photo = new Photo({ UID: "pt9x2vksm3p4q8ft", Type: "image", Files: [jpg("f1"), generated] });
+
+      mockSettings(allowAll({ originals: true }));
+      expect(photo.downloadAll()).toEqual({ downloaded: 1, skipped: 1 });
+      expect(hrefs()).toEqual(["/api/v1/dl/f1?t=2lbh9x09"]);
+
+      clicks = [];
+      mockSettings(allowAll({ originals: false }));
+      expect(photo.downloadAll()).toEqual({ downloaded: 2, skipped: 0 });
+      expect(hrefs()).toEqual(["/api/v1/dl/f1?t=2lbh9x09", "/api/v1/dl/g1?t=2lbh9x09"]);
+    });
+
+    it("skips the generated still images of a video", () => {
+      const mp4 = { Hash: "v1", Name: "1980/01/clip.mp4", Root: "/", FileType: "mp4", MediaType: "video" };
+      const still = { Hash: "j1", Name: "1980/01/clip.mp4.jpg", Root: "sidecar", FileType: "jpg", MediaType: "image" };
+      const photo = new Photo({ UID: "pt9x2vksm3p4q8ft", Type: "video", Files: [mp4, still] });
+
+      mockSettings(allowAll({ originals: false }));
+      expect(photo.downloadAll()).toEqual({ downloaded: 1, skipped: 1 });
+      expect(hrefs()).toEqual(["/api/v1/dl/v1?t=2lbh9x09"]);
+    });
+
+    it("keeps the videos, live parts and sidecars of a video outside the originals folder", () => {
+      const sidecar = (hash, name, extra) => ({ Hash: hash, Name: name, Root: "sidecar", FileType: "jpg", MediaType: "image", ...extra });
+      const photo = new Photo({
+        UID: "pt9x2vksm3p4q8ft",
+        Type: "video",
+        Files: [
+          sidecar("a1", "1980/01/clip.avc", { FileType: "avc", MediaType: "video" }),
+          sidecar("a2", "1980/01/clip.hevc.mp4", { FileType: "mp4", Video: true }),
+          sidecar("a3", "1980/01/clip.live.jpg", { MediaType: "live" }),
+          sidecar("a4", "1980/01/clip.mp4.json", { FileType: "json", MediaType: "sidecar" }),
+          sidecar("a5", "1980/01/clip.mp4.yml", { FileType: "yml", Sidecar: true }),
+        ],
+      });
+
+      mockSettings(allowAll({ originals: false }));
+      expect(photo.downloadAll()).toEqual({ downloaded: 5, skipped: 0 });
+      expect(hrefs()).toEqual(["a1", "a2", "a3", "a4", "a5"].map((h) => `/api/v1/dl/${h}?t=2lbh9x09`));
+    });
+
+    it("keeps the original images and sidecars of a video", () => {
+      const mp4 = { Hash: "v1", Name: "1980/01/clip.mp4", Root: "/", FileType: "mp4", MediaType: "video", Video: true };
+      const xmp = { Hash: "x1", Name: "1980/01/clip.xmp", Root: "/", FileType: "xmp", MediaType: "sidecar", Sidecar: true };
+      const photo = new Photo({ UID: "pt9x2vksm3p4q8ft", Type: "video", Files: [mp4, jpg("j1", "1980/01/clip.jpg"), xmp] });
+
+      mockSettings(allowAll({ originals: true }));
+      expect(photo.downloadAll()).toEqual({ downloaded: 3, skipped: 0 });
+      expect(hrefs()).toEqual(["/api/v1/dl/v1?t=2lbh9x09", "/api/v1/dl/j1?t=2lbh9x09", "/api/v1/dl/x1?t=2lbh9x09"]);
+
+      clicks = [];
+      mockSettings(allowAll({ originals: true, mediaSidecar: false }));
+      expect(photo.downloadAll()).toEqual({ downloaded: 2, skipped: 1 });
+      expect(hrefs()).toEqual(["/api/v1/dl/v1?t=2lbh9x09", "/api/v1/dl/j1?t=2lbh9x09"]);
+    });
+
+    it("downloads a JPEG-only photo whose type is video", () => {
+      const photo = new Photo({ UID: "pt9x2vksm3p4q8ft", Type: "video", Files: [jpg("j1", "1980/01/clip.jpg")] });
+
+      mockSettings(allowAll({ originals: true }));
+      expect(photo.downloadAll()).toEqual({ downloaded: 1, skipped: 0 });
+      expect(hrefs()).toEqual(["/api/v1/dl/j1?t=2lbh9x09"]);
+    });
+
+    it("starts the video files of a video first", () => {
+      const file = (hash, name, mediaType) => ({ Hash: hash, Name: name, Root: "/", FileType: name.split(".").pop().toLowerCase(), MediaType: mediaType });
+      mockSettings(allowAll({ originals: true }));
+
+      const mp4 = new Photo({ UID: "pt9x2vksm3p4q8ft", Type: "video", Files: [file("j1", "1980/01/clip.jpg", "image"), file("v1", "1980/01/clip.MP4", "video")] });
+      expect(mp4.downloadAll()).toEqual({ downloaded: 2, skipped: 0 });
+      expect(hrefs()).toEqual(["/api/v1/dl/v1?t=2lbh9x09", "/api/v1/dl/j1?t=2lbh9x09"]);
+
+      clicks = [];
+      const mov = { ...file("v2", "1980/01/IMG_1.MOV", ""), Video: true };
+      const xmp = file("x2", "1980/01/IMG_1.xmp", "sidecar");
+      const photo = new Photo({ UID: "pt9x2vksm3p4q8ft", Type: "video", Files: [xmp, file("j2", "1980/01/IMG_1.jpg", "image"), mov] });
+      expect(photo.downloadAll()).toEqual({ downloaded: 3, skipped: 0 });
+      expect(hrefs()).toEqual(["/api/v1/dl/v2?t=2lbh9x09", "/api/v1/dl/x2?t=2lbh9x09", "/api/v1/dl/j2?t=2lbh9x09"]);
+    });
+
+    it("skips null entries and excluded videos after moving videos first", () => {
+      const mp4 = { Hash: "v1", Name: "1980/01/clip.mp4", Root: "/", FileType: "mp4", MediaType: "video" };
+      const avc = { Hash: "v2", Name: "1980/01/clip.avc", Root: "sidecar", FileType: "avc", MediaType: "video" };
+      const photo = new Photo({ UID: "pt9x2vksm3p4q8ft", Type: "video", Files: [null, jpg("j1", "1980/01/clip.jpg"), avc, mp4] });
+
+      mockSettings(allowAll({ originals: true }));
+      expect(photo.downloadAll()).toEqual({ downloaded: 2, skipped: 1 });
+      expect(hrefs()).toEqual(["/api/v1/dl/v1?t=2lbh9x09", "/api/v1/dl/j1?t=2lbh9x09"]);
+    });
+
+    it("keeps the file order of a live photo", () => {
+      const heic = { Hash: "l1", Name: "1980/01/live.heic", Root: "/", FileType: "heic", MediaType: "image" };
+      const mov = { Hash: "l2", Name: "1980/01/live.MOV", Root: "/", FileType: "mov", MediaType: "video", Video: true };
+      const photo = new Photo({ UID: "pt9x2vksm3p4q8ft", Type: "live", Files: [heic, mov] });
+
+      mockSettings(allowAll({ originals: true }));
+      expect(photo.downloadAll()).toEqual({ downloaded: 2, skipped: 0 });
+      expect(hrefs()).toEqual(["/api/v1/dl/l1?t=2lbh9x09", "/api/v1/dl/l2?t=2lbh9x09"]);
+    });
+
+    it("reports a skip when a video has only generated still images", () => {
+      const still = { Hash: "j1", Name: "1980/01/clip.mp4.jpg", Root: "sidecar", FileType: "jpg", MediaType: "image" };
+      const photo = new Photo({ UID: "pt9x2vksm3p4q8ft", Type: "video", Files: [still] });
+
+      mockSettings(allowAll({ originals: false }));
+      expect(photo.downloadAll()).toEqual({ downloaded: 0, skipped: 1 });
+      expect(clicks).toHaveLength(0);
+    });
+
+    it("keeps both parts and the generated still of a live photo", () => {
+      const heic = { Hash: "l1", Name: "1980/01/live.heic", Root: "/", FileType: "heic", MediaType: "image" };
+      const mov = { Hash: "l2", Name: "1980/01/live.mov", Root: "/", FileType: "mov", MediaType: "video", Video: true };
+      const still = { Hash: "l3", Name: "1980/01/live.heic.jpg", Root: "sidecar", FileType: "jpg", MediaType: "image" };
+      const photo = new Photo({ UID: "pt9x2vksm3p4q8ft", Type: "live", Files: [heic, mov, still] });
+
+      mockSettings(allowAll({ originals: false }));
+      expect(photo.downloadAll()).toEqual({ downloaded: 3, skipped: 0 });
+      expect(hrefs()).toEqual(["/api/v1/dl/l1?t=2lbh9x09", "/api/v1/dl/l2?t=2lbh9x09", "/api/v1/dl/l3?t=2lbh9x09"]);
+    });
+
+    it("keeps the generated still of an image", () => {
+      const heic = { Hash: "i1", Name: "1980/01/image.heic", Root: "/", FileType: "heic", MediaType: "image" };
+      const still = { Hash: "i2", Name: "1980/01/image.heic.jpg", Root: "sidecar", FileType: "jpg", MediaType: "image" };
+      const photo = new Photo({ UID: "pt9x2vksm3p4q8ft", Type: "image", Files: [heic, still] });
+
+      mockSettings(allowAll({ originals: false }));
+      expect(photo.downloadAll()).toEqual({ downloaded: 2, skipped: 0 });
+      expect(hrefs()).toEqual(["/api/v1/dl/i1?t=2lbh9x09", "/api/v1/dl/i2?t=2lbh9x09"]);
+    });
+
+    it("keeps a video file without a root and skips one with an empty root", () => {
+      const file = (hash, root) => ({ Hash: hash, Name: `1980/01/${hash}.mp4.jpg`, Root: root, FileType: "jpg", MediaType: "image" });
+      const photo = new Photo({ UID: "pt9x2vksm3p4q8ft", Type: "video", Files: [file("n1", undefined), file("n2", null), file("n3", "")] });
+
+      mockSettings(allowAll({ originals: false }));
+      expect(photo.downloadAll()).toEqual({ downloaded: 2, skipped: 1 });
+      expect(hrefs()).toEqual(["/api/v1/dl/n1?t=2lbh9x09", "/api/v1/dl/n2?t=2lbh9x09"]);
+    });
+
+    it("skips files without the originals root when only originals are downloaded", () => {
+      const file = (hash, root) => ({ Hash: hash, Name: `1980/01/${hash}.jpg`, Root: root, FileType: "jpg", MediaType: "image" });
+      const photo = new Photo({
+        UID: "pt9x2vksm3p4q8ft",
+        Type: "image",
+        Files: [file("o1", "/"), file("o2", undefined), file("o3", null), file("o4", ""), file("o5", "sidecar")],
+      });
+
+      mockSettings(allowAll({ originals: true }));
+      expect(photo.downloadAll()).toEqual({ downloaded: 1, skipped: 4 });
+      expect(hrefs()).toEqual(["/api/v1/dl/o1?t=2lbh9x09"]);
+    });
+
+    it("reports nothing downloaded when no file has a hash", () => {
+      const none = { downloaded: 0, skipped: 0 };
+      const hashless = { Name: "1980/01/kitten.jpg", Root: "/", FileType: "jpg", MediaType: "image" };
+      mockSettings(allowAll());
+
+      expect(new Photo({ UID: "pt9x2vksm3p4q8ft", FileName: "1980/01/tiger.jpg" }).downloadAll()).toEqual(none);
+      expect(new Photo({ UID: "pt9x2vksm3p4q8ft", Type: "image", Files: [hashless] }).downloadAll()).toEqual(none);
+      expect(clicks).toHaveLength(0);
+    });
+  });
+
+  it("should calculate photo size", () => {
+    const values = { ID: 5, Title: "Crazy Cat", Width: 500, Height: 200 };
+    const photo = new Photo(values);
+    const result = photo.calculateSize(500, 200);
+    expect(result.width).toBe(500);
+    expect(result.height).toBe(200);
+  });
+
+  it("should calculate photo size with srcAspectRatio < maxAspectRatio", () => {
+    const values = { ID: 5, Title: "Crazy Cat", Width: 500, Height: 200 };
+    const photo = new Photo(values);
+    const result = photo.calculateSize(300, 50);
+    expect(result.width).toBe(125);
+    expect(result.height).toBe(50);
+  });
+
+  it("should calculate photo size with srcAspectRatio > maxAspectRatio", () => {
+    const values = { ID: 5, Title: "Crazy Cat", Width: 500, Height: 200 };
+    const photo = new Photo(values);
+    const result = photo.calculateSize(400, 300);
+    expect(result.width).toBe(400);
+    expect(result.height).toBe(160);
+  });
+
+  it("should get local day string", () => {
+    const values = { ID: 5, Title: "Crazy Cat", TakenAt: "2012-07-08T14:45:39Z", TimeZone: "UTC" };
+    const photo = new Photo(values);
+    const result = photo.localDayString();
+    expect(result.length).toBe(2);
+    const values2 = {
+      ID: 5,
+      Title: "Crazy Cat",
+      TakenAtLocal: "2012-07-08T14:45:39Z",
+      TakenAt: "2012-07-08T14:45:39Z",
+      TimeZone: "UTC",
+      Day: 8,
+    };
+    const photo2 = new Photo(values2);
+    const result2 = photo2.localDayString();
+    expect(result2).toBe("08");
+    const values3 = {
+      ID: 5,
+      Title: "Crazy Cat",
+      TakenAtLocal: "2012-07-08T14:45:39Z",
+      TakenAt: "2012-07-08T14:45:39Z",
+      TimeZone: "UTC",
+      Day: -1,
+    };
+    const photo3 = new Photo(values3);
+    const result3 = photo3.localDayString();
+    expect(result3).toBe("01");
+  });
+
+  it("should get local month string", () => {
+    const values = { ID: 5, Title: "Crazy Cat", TakenAt: "2012-07-08T14:45:39Z", TimeZone: "UTC" };
+    const photo = new Photo(values);
+    const result = photo.localMonthString();
+    expect(result).toBe((new Date().getMonth() + 1).toString().padStart(2, "0"));
+    const values2 = {
+      ID: 5,
+      Title: "Crazy Cat",
+      TakenAtLocal: "2012-07-08T14:45:39Z",
+      TakenAt: "2012-07-08T14:45:39Z",
+      TimeZone: "UTC",
+      Month: 8,
+    };
+    const photo2 = new Photo(values2);
+    const result2 = photo2.localMonthString();
+    expect(result2).toBe("08");
+  });
+
+  it("should get local year string", () => {
+    const values = { ID: 5, Title: "Crazy Cat", TakenAt: "2012-07-08T14:45:39Z", TimeZone: "UTC" };
+    const photo = new Photo(values);
+    const result = photo.localYearString();
+    expect(result).toBe(new Date().getFullYear().toString().padStart(4, "0"));
+    const values2 = {
+      ID: 5,
+      Title: "Crazy Cat",
+      TakenAtLocal: "2012-07-08T14:45:39Z",
+      TakenAt: "2012-07-08T14:45:39Z",
+      TimeZone: "UTC",
+      Year: 2010,
+    };
+    const photo2 = new Photo(values2);
+    const result2 = photo2.localYearString();
+    expect(result2).toBe("2010");
+  });
+
+  describe("time zone helpers", () => {
+    it("isTimeZoneUTC matches UTC in any case only", () => {
+      expect([isTimeZoneUTC("UTC"), isTimeZoneUTC("utc"), isTimeZoneUTC("Europe/Berlin"), isTimeZoneUTC(""), isTimeZoneUTC(null)]).toEqual([true, true, false, false, false]);
+    });
+    it("isTimeZoneLocal matches Local and missing zones", () => {
+      expect([isTimeZoneLocal("Local"), isTimeZoneLocal(""), isTimeZoneLocal(null), isTimeZoneLocal("UTC"), isTimeZoneLocal("Europe/Berlin")]).toEqual([true, true, true, false, false]);
+    });
+  });
+
+  describe("changeTimeZone", () => {
+    // capture returns a complete, saved UTC photo near a year boundary.
+    const capture = (values = {}) =>
+      new Photo({
+        UID: "ps6sg6be2lvl0yh7",
+        TakenAt: "2020-01-01T00:30:00Z",
+        TakenAtLocal: "2020-01-01T00:30:00Z",
+        TimeZone: "UTC",
+        Year: 2020,
+        Month: 1,
+        Day: 1,
+        ...values,
+      });
+
+    // berlin returns a saved photo taken at 14:00 local time in Berlin.
+    const berlin = (values = {}) =>
+      capture({ TakenAt: "2025-06-30T12:00:00Z", TakenAtLocal: "2025-06-30T14:00:00Z", TimeZone: "Europe/Berlin", Year: 2025, Month: 6, Day: 30, ...values });
+
+    it("converts a saved UTC time to each selected zone", () => {
+      const photo = capture();
+      for (let round = 0; round < 10; round++) {
+        for (const zone of ["UTC-12", "Pacific/Kiritimati", "Europe/Berlin", "America/New_York", "UTC"]) {
+          photo.changeTimeZone(zone);
+          expect(photo.TakenAt).toBe("2020-01-01T00:30:00Z");
+          const projected = photo.utcDate().setZone(zone);
+          expect(photo.TakenAtLocal).toBe(projected.toISO({ suppressMilliseconds: true, includeOffset: false }) + "Z");
+          expect([photo.Year, photo.Month, photo.Day]).toEqual([projected.year, projected.month, projected.day]);
+          expect(photo.getDateTime().toFormat("HH:mm:ss")).toBe(projected.toFormat("HH:mm:ss"));
+        }
+      }
+      expect(photo.TakenAtLocal).toBe("2020-01-01T00:30:00Z");
+    });
+
+    it("keeps the local time of a saved named zone, including UTC as the new zone", () => {
+      const photo = berlin();
+      photo.changeTimeZone("America/New_York");
+      expect([photo.TakenAt, photo.TakenAtLocal]).toEqual(["2025-06-30T18:00:00Z", "2025-06-30T14:00:00Z"]);
+      photo.changeTimeZone("UTC");
+      expect([photo.TakenAt, photo.TakenAtLocal]).toEqual(["2025-06-30T14:00:00Z", "2025-06-30T14:00:00Z"]);
+      expect(photo.getDateTime().toFormat("HH:mm:ss")).toBe("14:00:00");
+      photo.changeTimeZone("Asia/Kathmandu");
+      expect([photo.TakenAt, photo.TakenAtLocal]).toEqual(["2025-06-30T08:15:00Z", "2025-06-30T14:00:00Z"]);
+      expect([photo.Year, photo.Month, photo.Day]).toEqual([2025, 6, 30]);
+    });
+
+    it("keeps the local time once a converted zone has been saved", () => {
+      const photo = capture({ TakenAt: "2025-06-30T23:30:00Z", TakenAtLocal: "2025-06-30T23:30:00Z", Year: 2025, Month: 6, Day: 30 });
+      photo.changeTimeZone("Europe/Berlin");
+      photo.setValues(photo.getValues());
+      photo.changeTimeZone("America/New_York");
+      expect([photo.TakenAt, photo.TakenAtLocal]).toEqual(["2025-07-01T05:30:00Z", "2025-07-01T01:30:00Z"]);
+      expect([photo.Year, photo.Month, photo.Day]).toEqual([2025, 7, 1]);
+    });
+
+    it("starts from the saved time when the selection passes through Local", () => {
+      const photo = capture({ TakenAt: "2025-06-30T23:30:00Z", TakenAtLocal: "2025-06-30T23:30:00Z", Year: 2025, Month: 6, Day: 30 });
+      photo.changeTimeZone("Europe/Berlin");
+      photo.changeTimeZone("Local");
+      expect([photo.TakenAt, photo.TakenAtLocal, photo.Day]).toEqual(["2025-06-30T23:30:00Z", "2025-06-30T23:30:00Z", 30]);
+      photo.changeTimeZone("Europe/Berlin");
+      expect([photo.TakenAt, photo.TakenAtLocal, photo.Day]).toEqual(["2025-06-30T23:30:00Z", "2025-07-01T01:30:00Z", 1]);
+      photo.changeTimeZone("UTC");
+      expect([photo.TakenAt, photo.TakenAtLocal, photo.Day]).toEqual(["2025-06-30T23:30:00Z", "2025-06-30T23:30:00Z", 30]);
+    });
+
+    it("keeps a manually entered local time for later zone changes", () => {
+      const photo = capture({ TakenAt: "2025-06-30T23:30:00Z", TakenAtLocal: "2025-06-30T23:30:00Z", Year: 2025, Month: 6, Day: 30 });
+      photo.changeTimeZone("Europe/Berlin");
+      expect(photo.setLocalTime("03:45:00").isValid).toBe(true);
+      expect([photo.TakenAt, photo.TakenAtLocal]).toEqual(["2025-07-01T01:45:00Z", "2025-07-01T03:45:00Z"]);
+      photo.changeTimeZone("America/New_York");
+      expect([photo.TakenAt, photo.TakenAtLocal]).toEqual(["2025-07-01T07:45:00Z", "2025-07-01T03:45:00Z"]);
+    });
+
+    it("keeps the time anchor when a refresh merges values without a time", () => {
+      const photo = capture({ TakenAt: "2025-06-30T23:30:00Z", TakenAtLocal: "2025-06-30T23:30:00Z", Year: 2025, Month: 6, Day: 30, Title: "", TitleSrc: "" });
+      photo.setLocalTime("10:00:00");
+      photo.changeTimeZone("Europe/Berlin");
+      photo.mergeUnchanged({ Title: "From the server", TitleSrc: "manual" });
+      photo.setValues({ Caption: "Saved caption" });
+      photo.changeTimeZone("America/New_York");
+      expect([photo.TakenAt, photo.TakenAtLocal, photo.Title]).toEqual(["2025-06-30T10:00:00Z", "2025-06-30T06:00:00Z", "From the server"]);
+    });
+
+    it("resets the time anchor when values are saved or rolled back", () => {
+      const photo = berlin();
+      photo.changeTimeZone("UTC");
+      photo.setLocalTime("10:00:00");
+      expect(photo.timeAnchor()).toEqual({ fromUTC: true, TakenAt: "2025-06-30T10:00:00Z", TakenAtLocal: "2025-06-30T10:00:00Z" });
+      photo.rollback();
+      expect(photo.timeAnchor()).toEqual({ fromUTC: false, TakenAt: "2025-06-30T12:00:00Z", TakenAtLocal: "2025-06-30T14:00:00Z" });
+      photo.setLocalTime("15:00:00");
+      photo.setValues({ TimeZone: "UTC", TakenAt: "2025-06-30T15:00:00Z", TakenAtLocal: "2025-06-30T15:00:00Z" });
+      expect(photo.timeAnchor()).toEqual({ fromUTC: true, TakenAt: "2025-06-30T15:00:00Z", TakenAtLocal: "2025-06-30T15:00:00Z" });
+    });
+
+    it.each([-1, 0])("preserves unknown calendar fields (%s)", (unknown) => {
+      const photo = capture({ Year: unknown, Month: unknown, Day: unknown });
+      photo.changeTimeZone("UTC-12");
+      expect([photo.Year, photo.Month, photo.Day]).toEqual([unknown, unknown, unknown]);
+      expect(photo.TakenAt).toBe("2020-01-01T00:30:00Z");
+      expect(photo.TakenAtLocal).toBe("2019-12-31T12:30:00Z");
+    });
+
+    it("updates known components while keeping an unknown year", () => {
+      const photo = capture({ Year: -1 });
+      photo.changeTimeZone("UTC-12");
+      expect([photo.Year, photo.Month, photo.Day]).toEqual([-1, 12, 31]);
+    });
+
+    it("keeps a known month and year when the day is unknown", () => {
+      const photo = capture({ TakenAt: "2020-01-01T03:00:00Z", TakenAtLocal: "2020-01-01T03:00:00Z", Day: -1 });
+      photo.changeTimeZone("America/New_York");
+      expect([photo.Year, photo.Month, photo.Day]).toEqual([2020, 1, -1]);
+      expect(photo.TakenAtLocal).toBe("2019-12-31T22:00:00Z");
+    });
+
+    it("keeps a known year when the month is unknown", () => {
+      const photo = capture({ Month: -1 });
+      photo.changeTimeZone("UTC-12");
+      expect([photo.Year, photo.Month, photo.Day]).toEqual([2020, -1, 31]);
+    });
+
+    it("interprets Local wall time when assigning a known zone", () => {
+      const photo = capture({ TimeZone: "Local" });
+      photo.changeTimeZone("Europe/Berlin");
+      expect(photo.TakenAtLocal).toBe("2020-01-01T00:30:00Z");
+      expect(photo.TakenAt).toBe("2019-12-31T23:30:00Z");
+    });
+
+    it("keeps wall time when removing the time zone", () => {
+      const photo = capture({ TimeZone: "Europe/Berlin", TakenAt: "2019-12-31T23:30:00Z" });
+      photo.changeTimeZone("Local");
+      expect(photo.TakenAtLocal).toBe("2020-01-01T00:30:00Z");
+      expect(photo.TakenAt).toBe("2020-01-01T00:30:00Z");
+    });
+
+    it("ignores invalid zones, missing timestamps and unchanged selections", () => {
+      const photo = capture();
+      photo.changeTimeZone("invalid/zone");
+      photo.changeTimeZone("UTC");
+      expect(photo.wasChanged()).toBe(false);
+      const missing = capture({ TakenAt: "", TakenAtLocal: "" });
+      missing.changeTimeZone("Europe/Berlin");
+      expect(missing.TimeZone).toBe("UTC");
+    });
+
+    it("rejects an invalid local time without changing the timestamps", () => {
+      const photo = berlin();
+      expect(photo.setLocalTime("25:99:00").isValid).toBe(false);
+      expect([photo.TakenAt, photo.TakenAtLocal]).toEqual(["2025-06-30T12:00:00Z", "2025-06-30T14:00:00Z"]);
+    });
+
+    it("reads a Local wall time without the browser's zone", () => {
+      const photo = capture({ TimeZone: "Local", TakenAt: "2025-03-30T02:30:00Z", TakenAtLocal: "2025-03-30T02:30:00Z", Year: 2025, Month: 3, Day: 30 });
+      const fromISO = vi.spyOn(DateTime, "fromISO");
+      try {
+        expect(photo.localDate().toFormat("yyyy-MM-dd HH:mm")).toBe("2025-03-30 02:30");
+        expect(fromISO).toHaveBeenLastCalledWith("2025-03-30T02:30:00", { zone: "UTC" });
+      } finally {
+        fromISO.mockRestore();
+      }
+    });
+
+    it("interprets a manual local date in the selected zone even when originally UTC", () => {
+      const photo = capture();
+      photo.changeTimeZone("Europe/Berlin");
+      photo.Year = 2025;
+      photo.Month = 7;
+      photo.Day = 2;
+      expect(photo.localDate("01:30:00").toUTC().toISO({ suppressMilliseconds: true })).toBe("2025-07-01T23:30:00Z");
+    });
+  });
+
+  it("should get local date string", () => {
+    const values = {
+      ID: 5,
+      Title: "Crazy Cat",
+      TakenAtLocal: "2012-07-08T14:45:39Z",
+      TakenAt: "2012-07-08T14:45:39Z",
+      TimeZone: "UTC",
+    };
+    const photo = new Photo(values);
+    const result = photo.localDateString();
+    expect(result).toBe("2012-07-08T14:45:39Z");
+  });
+
+  it("should get local date", () => {
+    const values = {
+      ID: 5,
+      Title: "Crazy Cat",
+      TakenAt: "2012-07-08T14:45:39Z",
+      TimeZone: "Indian/Reunion",
+    };
+    const photo = new Photo(values);
+    const result = photo.localDate();
+    expect(String(result)).toBe("2012-07-08T14:45:39.000Z");
+  });
+
+  it("UTC", () => {
+    const values = {
+      ID: 9999,
+      Title: "Video",
+      TakenAt: "2012-07-08T14:45:39Z",
+      TakenAtLocal: "2012-07-08T14:45:39Z",
+      TimeZone: "UTC",
+    };
+    const photo = new Photo(values);
+    expect(String(photo.localDateString("10:00:00"))).toBe("2012-07-08T10:00:00Z");
+    const result = photo.localDate();
+    expect(String(result)).toBe("2012-07-08T14:45:39.000Z");
+  });
+
+  it("should get date string", () => {
+    const values = {
+      ID: 5,
+      Title: "Crazy Cat",
+      TakenAtLocal: "2012-07-08T14:45:39Z",
+      TakenAt: "2012-07-08T12:45:39Z",
+      TimeZone: "Europe/Berlin",
+    };
+    const photo = new Photo(values);
+    const result = photo.getDateString(false).replaceAll("\u202f", " ");
+    expect(result.startsWith("Sunday, July 8, 2012")).toBe(true);
+    expect(result.endsWith("2:45 PM")).toBe(true);
+    const values2 = { ID: 5, Title: "Crazy Cat", TakenAtLocal: "", TakenAt: "", TimeZone: "UTC" };
+    const photo2 = new Photo(values2);
+    const result2 = photo2.getDateString();
+    expect(result2).toBe("Unknown");
+    const values3 = {
+      ID: 5,
+      Title: "Crazy Cat",
+      TakenAtLocal: "2012-07-08T14:45:39Z",
+      TakenAt: "2012-07-08T14:45:39Z",
+    };
+    const photo3 = new Photo(values3);
+    const result3 = photo3.getDateString();
+    expect(result3).toBe("Sunday, July 8, 2012");
+    const values4 = {
+      ID: 5,
+      Title: "Crazy Cat",
+      TakenAtLocal: "2012-07-08T14:45:39Z",
+      TakenAt: "2012-07-08T14:45:39Z",
+      Month: -1,
+    };
+    const photo4 = new Photo(values4);
+    const result4 = photo4.getDateString();
+    expect(result4).toBe("2012");
+    const values5 = {
+      ID: 5,
+      Title: "Crazy Cat",
+      TakenAtLocal: "2012-07-08T14:45:39Z",
+      TakenAt: "2012-07-08T14:45:39Z",
+      Day: -1,
+    };
+    const photo5 = new Photo(values5);
+    const result5 = photo5.getDateString();
+    expect(result5).toBe("July 2012");
+  });
+
+  it("should get short date string", () => {
+    const values = {
+      ID: 5,
+      Title: "Crazy Cat",
+      TakenAtLocal: "2012-07-08T14:45:39Z",
+      TakenAt: "2012-07-08T14:45:39Z",
+      TimeZone: "UTC",
+    };
+    const photo = new Photo(values);
+    const result = photo.shortDateString();
+    expect(result).toBe("7/8/2012");
+    const values2 = { ID: 5, Title: "Crazy Cat", TakenAtLocal: "", TakenAt: "", TimeZone: "UTC" };
+    const photo2 = new Photo(values2);
+    const result2 = photo2.shortDateString();
+    expect(result2).toBe("Unknown");
+    const values3 = {
+      ID: 5,
+      Title: "Crazy Cat",
+      TakenAtLocal: "2012-07-08T14:45:39Z",
+      TakenAt: "2012-07-08T14:45:39Z",
+    };
+    const photo3 = new Photo(values3);
+    const result3 = photo3.shortDateString();
+    expect(result3).toBe("7/8/2012");
+    const values4 = {
+      ID: 5,
+      Title: "Crazy Cat",
+      TakenAtLocal: "2012-07-08T14:45:39Z",
+      TakenAt: "2012-07-08T14:45:39Z",
+      Month: -1,
+    };
+    const photo4 = new Photo(values4);
+    const result4 = photo4.shortDateString();
+    expect(result4).toBe("2012");
+    const values5 = {
+      ID: 5,
+      Title: "Crazy Cat",
+      TakenAtLocal: "2012-07-08T14:45:39Z",
+      TakenAt: "2012-07-08T14:45:39Z",
+      Day: -1,
+    };
+    const photo5 = new Photo(values5);
+    const result5 = photo5.shortDateString();
+    expect(result5).toBe("July 2012");
+  });
+
+  it("should report hasLocation true for non-zero coordinates", () => {
+    const values = { ID: 5, Title: "Crazy Cat", Lat: 36.442881666666665, Lng: 28.229493333333334 };
+    const photo = new Photo(values);
+    const result = photo.hasLocation();
+    expect(result).toBe(true);
+  });
+
+  it("should report hasLocation false for zero coordinates", () => {
+    const values = { ID: 5, Title: "Crazy Cat", Lat: 0, Lng: 0 };
+    const photo = new Photo(values);
+    const result = photo.hasLocation();
+    expect(result).toBe(false);
+  });
+
+  it("should get primary location label with country", () => {
+    const values = {
+      ID: 5,
+      Title: "Crazy Cat",
+      CellID: 6,
+      CellCategory: "viewpoint",
+      PlaceLabel: "Cape Point, South Africa",
+      PlaceCountry: "South Africa",
+    };
+    const photo = new Photo(values);
+    const result = photo.locationInfo();
+    expect(result).toBe("Cape Point, South Africa");
+  });
+
+  it("should get full location with state and country", () => {
+    const values = {
+      ID: 5,
+      Title: "Crazy Cat",
+      CellID: 6,
+      CellCategory: "viewpoint",
+      PlaceLabel: "Cape Point, State, South Africa",
+      PlaceCountry: "South Africa",
+      PlaceCity: "Cape Town",
+      PlaceCounty: "County",
+      PlaceState: "State",
+    };
+    const photo = new Photo(values);
+    const result = photo.locationInfo();
+    expect(result).toBe("Cape Point, State, South Africa");
+  });
+
+  it("should return Unknown when country name does not match", () => {
+    const values = {
+      ID: 5,
+      Title: "Crazy Cat",
+      CellCategory: "viewpoint",
+      CellName: "Cape Point",
+      PlaceCountry: "Africa",
+      PlaceCity: "Cape Town",
+      PlaceCounty: "County",
+      PlaceState: "State",
+    };
+    const photo = new Photo(values);
+    const result = photo.locationInfo();
+    expect(result).toBe("Unknown");
+  });
+
+  it("should return Unknown when only country name is set", () => {
+    const values = { ID: 5, Title: "Crazy Cat", CountryName: "Africa", PlaceCity: "Cape Town" };
+    const photo = new Photo(values);
+    const result = photo.locationInfo();
+    expect(result).toBe("Unknown");
+  });
+
+  it("should get camera from model and file camera data", () => {
+    const values = { ID: 5, Title: "Crazy Cat", CameraModel: "EOSD10", CameraMake: "Canon" };
+    const photo = new Photo(values);
+    const result = photo.getCamera();
+    expect(result).toBe("Canon EOSD10");
+    const values2 = {
+      ID: 10,
+      UID: "ABC127",
+      Files: [
+        {
+          UID: "123fgb",
+          Name: "1980/01/superCuteKitten.jpg",
+          Primary: true,
+          FileType: "jpg",
+          Hash: "1xxbgdt55",
+        },
+      ],
+      Camera: {
+        Make: "Canon",
+        Model: "abc",
+      },
+    };
+    const photo2 = new Photo(values2);
+    expect(photo2.getCamera()).toBe("Canon abc");
+  });
+
+  it("should return Unknown when camera info is missing", () => {
+    const values = { ID: 5, Title: "Crazy Cat" };
+    const photo = new Photo(values);
+    const result = photo.getCamera();
+    expect(result).toBe("Unknown");
+  });
+
+  it("should get collection resource", () => {
+    const result = Photo.getCollectionResource();
+    expect(result).toBe("photos");
+  });
+
+  it("should return batch size", () => {
+    expect(Photo.batchSize()).toBe(BatchSize);
+  });
+
+  it("should get model name", () => {
+    const result = Photo.getModelName();
+    expect(result).toBe("Photo");
+  });
+
+  it("should like photo", () => {
+    const values = { ID: 5, Title: "Crazy Cat", CountryName: "Africa", Favorite: false };
+    const photo = new Photo(values);
+    expect(photo.Favorite).toBe(false);
+    photo.like();
+    expect(photo.Favorite).toBe(true);
+  });
+
+  it("should unlike photo", () => {
+    const values = {
+      ID: 5,
+      UID: "abc123",
+      Title: "Crazy Cat",
+      CountryName: "Africa",
+      Favorite: true,
+    };
+    const photo = new Photo(values);
+    expect(photo.Favorite).toBe(true);
+    photo.unlike();
+    expect(photo.Favorite).toBe(false);
+  });
+
+  it("should get photo defaults", () => {
+    const values = { ID: 5, UID: "ABC123" };
+    const photo = new Photo(values);
+    const result = photo.getDefaults();
+    expect(result.UID).toBe("");
+    expect(result.Color).toBe(-1);
+  });
+
+  it("should get photos base name", () => {
+    const values = {
+      ID: 8,
+      UID: "ABC123",
+      Filename: "1980/01/superCuteKitten.jpg",
+      FileUID: "123fgb",
+      Files: [
+        {
+          UID: "123fgb",
+          Name: "1980/01/superCuteKitten.jpg",
+          Primary: true,
+          FileType: "TypeJpeg",
+          Width: 500,
+          Height: 600,
+          Hash: "ca3e60b9825bd61ee6369fcefe22f4eb92631bb5",
+        },
+      ],
+    };
+    const photo = new Photo(values);
+    const result = photo.baseName();
+    expect(result).toBe("superCuteKitten.jpg");
+    const result2 = photo.baseName(5);
+    expect(result2).toBe("supe…");
+  });
+
+  it("should remove bidi controls from displayed file names", () => {
+    const photo = new Photo({ UID: "bidi1", FileName: "2026/photo\u202Eabc.jpg", OriginalName: "orig\u2066inal\u0000.jpg" });
+    expect(photo.baseName()).toBe("photoabc.jpg");
+    expect(photo.getOriginalName()).toBe("original.jpg");
+    expect(photo.fileBase("a/صورة 日本.jpg")).toBe("صورة 日本.jpg");
+  });
+
+  it("should refresh file attributes", () => {
+    const values2 = { ID: 5, UID: "ABC123" };
+    const photo2 = new Photo(values2);
+    photo2.refreshFileAttr();
+    expect(photo2.Width).toBeUndefined();
+    expect(photo2.Height).toBeUndefined();
+    expect(photo2.Hash).toBeUndefined();
+    const values = {
+      ID: 8,
+      UID: "ABC123",
+      Filename: "1980/01/superCuteKitten.jpg",
+      FileUID: "123fgb",
+      Files: [
+        {
+          UID: "123fgb",
+          Name: "1980/01/superCuteKitten.jpg",
+          Primary: true,
+          FileType: "TypeJpeg",
+          Width: 500,
+          Height: 600,
+          Hash: "ca3e60b9825bd61ee6369fcefe22f4eb92631bb5",
+        },
+      ],
+    };
+    const photo = new Photo(values);
+    expect(photo.Width).toBeUndefined();
+    expect(photo.Height).toBeUndefined();
+    expect(photo.Hash).toBeUndefined();
+    photo.refreshFileAttr();
+    expect(photo.Width).toBe(500);
+    expect(photo.Height).toBe(600);
+    expect(photo.Hash).toBe("ca3e60b9825bd61ee6369fcefe22f4eb92631bb5");
+  });
+
+  it("should return is playable", () => {
+    const values = {
+      ID: 8,
+      UID: "ABC123",
+      Filename: "1980/01/superCuteKitten.jpg",
+      FileUID: "123fgb",
+      Files: [
+        {
+          UID: "123fgb",
+          Name: "1980/01/superCuteKitten.jpg",
+          Primary: true,
+          FileType: "TypeJpeg",
+          Width: 500,
+          Height: 600,
+          Hash: "ca3e60b9825bd61ee6369fcefe22f4eb92631bb5",
+        },
+      ],
+    };
+    const photo = new Photo(values);
+    expect(photo.isPlayable()).toBe(false);
+    const values2 = { ID: 9, UID: "ABC163" };
+    const photo2 = new Photo(values2);
+    expect(photo2.isPlayable()).toBe(false);
+    const values3 = {
+      ID: 10,
+      UID: "ABC127",
+      Filename: "1980/01/superCuteKitten.mp4",
+      FileUID: "123fgb",
+      Files: [
+        {
+          UID: "123fgb",
+          Name: "1980/01/superCuteKitten.mp4",
+          Primary: false,
+          Video: true,
+          FileType: "mp4",
+          Width: 500,
+          Height: 600,
+          Hash: "c1e30d265eab968155082c8e86d85815a8389479",
+        },
+      ],
+    };
+    const photo3 = new Photo(values3);
+    expect(photo3.isPlayable()).toBe(true);
+    const values4 = {
+      ID: 1,
+      UID: "ABC128",
+      Filename: "1980/01/superCuteKitten.jpg",
+      FileUID: "123fgb",
+      Files: [
+        {
+          UID: "123fgb",
+          Name: "1980/01/superCuteKitten.jpg",
+          Primary: false,
+          Video: true,
+          FileType: "jpg",
+          Width: 500,
+          Height: 600,
+          Hash: "ca3e60b9825bd61ee6369fcefe22f4eb92631bb5",
+          Codec: "avc1",
+        },
+      ],
+    };
+    const photo4 = new Photo(values4);
+    expect(photo4.isPlayable()).toBe(true);
+  });
+
+  it("should return video params", () => {
+    const values3 = {
+      ID: 10,
+      UID: "ABC127",
+      Filename: "1980/01/superCuteKitten.mp4",
+      FileUID: "123fgb",
+      Files: [
+        {
+          UID: "123fgb",
+          Name: "1980/01/superCuteKitten.mp4",
+          Primary: false,
+          Video: true,
+          FileType: "mp4",
+          Width: 900,
+          Height: 600,
+          Hash: "c1e30d265eab968155082c8e86d85815a8389479",
+        },
+      ],
+    };
+    const photo3 = new Photo(values3);
+    const result = photo3.videoParams();
+    expect(result.height).toBeGreaterThan(340);
+    expect(result.width).toBeGreaterThan(510);
+    expect(result.loop).toBe(false);
+    expect(result.uri).toBe("/api/v1/videos/c1e30d265eab968155082c8e86d85815a8389479/public/avc");
+    const values = {
+      ID: 11,
+      UID: "ABC127",
+      Filename: "1980/01/superCuteKitten.mp4",
+      FileUID: "123fgb",
+      Files: [
+        {
+          UID: "123fgb",
+          Name: "1980/01/superCuteKitten.mp4",
+          Primary: false,
+          Video: true,
+          FileType: "mp4",
+          Width: 0,
+          Height: 0,
+          Hash: "c1e30d265eab968155082c8e86d85815a8389479",
+        },
+        {
+          UID: "123fpp",
+          Name: "1980/01/superCuteKitten.jpg",
+          Primary: true,
+          Width: 5000,
+          Height: 5000,
+          Hash: "ca3e60b9825bd61ee6369fcefe22f4eb92631bb5",
+        },
+      ],
+    };
+    const photo = new Photo(values);
+    const result2 = photo.videoParams();
+    expect(result2.height).toBeGreaterThan(340);
+    expect(result2.width).toBeGreaterThan(340);
+    expect(result2.loop).toBe(false);
+    expect(result2.uri).toBe("/api/v1/videos/c1e30d265eab968155082c8e86d85815a8389479/public/avc");
+  });
+
+  it("should return videofile", () => {
+    const values = {
+      ID: 8,
+      UID: "ABC123",
+      Filename: "1980/01/superCuteKitten.jpg",
+      FileUID: "123fgb",
+      Files: [
+        {
+          UID: "123fgb",
+          Name: "1980/01/superCuteKitten.jpg",
+          Primary: true,
+          FileType: "jpg",
+          Width: 500,
+          Height: 600,
+          Hash: "c1e30d265eab968155082c8e86d85815a8389479",
+        },
+      ],
+    };
+    const photo = new Photo(values);
+    expect(photo.videoFile()).toBeUndefined();
+    const values2 = { ID: 9, UID: "ABC163" };
+    const photo2 = new Photo(values2);
+    expect(photo2.videoFile()).toBe(false);
+    const values3 = {
+      ID: 10,
+      UID: "ABC127",
+      Filename: "1980/01/superCuteKitten.mp4",
+      FileUID: "123fgb",
+      Files: [
+        {
+          UID: "123fgb",
+          Name: "1980/01/superCuteKitten.mp4",
+          Primary: false,
+          FileType: "mp4",
+          Width: 500,
+          Height: 600,
+          Hash: "c1e30d265eab968155082c8e86d85815a8389479",
+        },
+      ],
+    };
+    const photo3 = new Photo(values3);
+    const file = photo3.videoFile();
+    expect(file.Name).toBe("1980/01/superCuteKitten.mp4");
+    const values4 = {
+      ID: 1,
+      UID: "ABC128",
+      Filename: "1980/01/superCuteKitten.jpg",
+      FileUID: "123fgb",
+      Files: [
+        {
+          UID: "123fgb",
+          Name: "1980/01/superCuteKitten.jpg",
+          Primary: false,
+          FileType: "jpg",
+          Width: 500,
+          Height: 600,
+          Hash: "1xxbgdt53",
+          Codec: "avc1",
+        },
+      ],
+    };
+    const photo4 = new Photo(values4);
+    expect(photo4.videoFile().Name).toBe("1980/01/superCuteKitten.jpg");
+  });
+
+  it("should return video url", () => {
+    const values = {
+      ID: 8,
+      UID: "ABC123",
+      Filename: "1980/01/superCuteKitten.jpg",
+      Hash: "703cf8f274fbb265d49c6262825780e1",
+      FileUID: "123fgb",
+      Files: [
+        {
+          UID: "123fgb",
+          Name: "1980/01/superCuteKitten.jpg",
+          Primary: true,
+          FileType: "jpg",
+          Width: 500,
+          Height: 600,
+          Hash: "1xxbgdt53",
+        },
+      ],
+    };
+    const photo = new Photo(values);
+    expect(photo.videoContentType()).toBe(media.ContentTypeMp4AvcMain);
+    expect(photo.videoUrl()).toBe("/api/v1/videos/703cf8f274fbb265d49c6262825780e1/public/avc");
+    const values2 = { ID: 9, UID: "ABC163", Hash: "2305e512e3b183ec982d60a8b608a8ca501973ba" };
+    const photo2 = new Photo(values2);
+    expect(photo2.videoUrl()).toBe("/api/v1/videos/2305e512e3b183ec982d60a8b608a8ca501973ba/public/avc");
+    const values3 = {
+      ID: 10,
+      UID: "ABC127",
+      Filename: "1980/01/superCuteKitten.mp4",
+      FileUID: "123fgb",
+      Files: [
+        {
+          UID: "123fgb",
+          Name: "1980/01/superCuteKitten.mp4",
+          Primary: false,
+          FileType: "mp4",
+          Width: 500,
+          Height: 600,
+          Hash: "1xxbgdt55",
+        },
+      ],
+    };
+    const photo3 = new Photo(values3);
+    expect(photo3.videoUrl()).toBe("/api/v1/videos/1xxbgdt55/public/avc");
+    const values4 = {
+      ID: 1,
+      UID: "ABC128",
+      Filename: "1980/01/superCuteKitten.jpg",
+      FileUID: "123fgb",
+      Files: [
+        {
+          UID: "123fgb",
+          Name: "1980/01/superCuteKitten.jpg",
+          Primary: false,
+          FileType: "jpg",
+          Width: 500,
+          Height: 600,
+          Hash: "1xxbgdt53",
+          Codec: "avc1",
+        },
+      ],
+    };
+    const photo4 = new Photo(values4);
+    expect(photo4.videoUrl()).toBe("/api/v1/videos/1xxbgdt53/public/avc");
+  });
+
+  it("should return main file", () => {
+    const values = { ID: 9, UID: "ABC163", Width: 111, Height: 222 };
+    const photo = new Photo(values);
+    expect(photo.primaryFile()).toBe(photo);
+    const values2 = {
+      ID: 10,
+      UID: "ABC127",
+      Files: [
+        {
+          UID: "123fgb",
+          Name: "1980/01/superCuteKitten.mp4",
+          Primary: false,
+          FileType: "mp4",
+          Width: 500,
+          Height: 600,
+          Hash: "1xxbgdt55",
+        },
+        {
+          UID: "123fgb",
+          Name: "1980/01/superCuteKitten.jpg",
+          Primary: false,
+          FileType: "jpg",
+          Width: 500,
+          Height: 600,
+          Hash: "1xxbgdt56",
+        },
+      ],
+    };
+    const photo2 = new Photo(values2);
+    const file = photo2.primaryFile();
+    expect(file.Name).toBe("1980/01/superCuteKitten.jpg");
+    const values3 = {
+      ID: 1,
+      UID: "ABC128",
+      Files: [
+        {
+          UID: "123fgb",
+          Name: "1980/01/NotMainKitten.jpg",
+          Primary: false,
+          FileType: "jpg",
+          Width: 500,
+          Height: 600,
+          Hash: "1xxbgdt53",
+        },
+        {
+          UID: "123fgb",
+          Name: "1980/01/MainKitten.jpg",
+          Primary: true,
+          FileType: "jpg",
+          Width: 500,
+          Height: 600,
+          Hash: "1xxbgdt54",
+        },
+      ],
+    };
+    const photo3 = new Photo(values3);
+    const file2 = photo3.primaryFile();
+    expect(file2.Name).toBe("1980/01/MainKitten.jpg");
+  });
+
+  it("should return jpeg files", () => {
+    const values = { ID: 8, UID: "ABC123", Filename: "1980/01/superCuteKitten.jpg" };
+    const photo = new Photo(values);
+    const result = photo.jpegFiles();
+    expect(result[0].Filename).toBe("1980/01/superCuteKitten.jpg");
+    const values3 = {
+      ID: 10,
+      UID: "ABC127",
+      Filename: "1980/01/superCuteKitten.mp4",
+      FileUID: "123fgb",
+      Files: [
+        {
+          UID: "123fgb",
+          Name: "1980/01/superCuteKitten.jpg",
+          Primary: false,
+          FileType: media.FormatJpeg,
+          Width: 500,
+          Height: 600,
+          Hash: "1xxbgdt55",
+        },
+        {
+          UID: "123fgz",
+          Name: "1980/01/superCuteKitten.mp4",
+          Primary: false,
+          FileType: "mp4",
+          Width: 500,
+          Height: 600,
+          Hash: "1xxbgdt66",
+        },
+      ],
+    };
+    const photo3 = new Photo(values3);
+    const file = photo3.jpegFiles();
+    expect(file[0].Name).toBe("1980/01/superCuteKitten.jpg");
+  });
+
+  it("should return file hash", () => {
+    const values = { ID: 9, UID: "ABC163" };
+    const photo = new Photo(values);
+    expect(photo.fileHash()).toBe("");
+    photo.Hash = "123693d2c2b9afdba19f97d1c92963953e1d2cfe";
+    expect(photo.fileHash()).toBe("123693d2c2b9afdba19f97d1c92963953e1d2cfe");
+    const values2 = {
+      ID: 10,
+      UID: "ABC127",
+      Type: "video",
+      Hash: "123693d2c2b9afdba19f97d1c92963953e1d2cfe",
+      Files: [
+        {
+          UID: "fsr3uh0u30trle4l",
+          Name: "1980/01/superCuteKitten.mp4",
+          Primary: false,
+          Root: "/",
+          MediaType: "video",
+          FileType: "mp4",
+          Width: 500,
+          Height: 600,
+          Hash: "617693d2c2b9afdba19f97d1c92963953e1d2cfe",
+        },
+        {
+          UID: "fsr3uh0g2us6cwg4",
+          Name: "1980/01/superCuteKitten.jpg",
+          Primary: false,
+          Root: "/",
+          MediaType: "image",
+          FileType: "jpg",
+          Width: 500,
+          Height: 600,
+          Hash: "9249cee32bc8adc6ba996a6b78dd84c03b5a0153",
+        },
+      ],
+    };
+    const photo2 = new Photo(values2);
+    expect(photo2.fileHash()).toBe("9249cee32bc8adc6ba996a6b78dd84c03b5a0153");
+    photo2.Files = [
+      {
+        UID: "fsr3uh0u30trle4l",
+        Name: "1980/01/superCuteKitten.mp4",
+        Primary: false,
+        Root: "/",
+        MediaType: "video",
+        FileType: "mp4",
+        Width: 500,
+        Height: 600,
+        Hash: "617693d2c2b9afdba19f97d1c92963953e1d2cfe",
+      },
+      {
+        UID: "fsr3uh0g2us6cwg4",
+        Name: "1980/01/superCuteKitten.jpg",
+        Primary: false,
+        Root: "/",
+        MediaType: "image",
+        FileType: "invalid",
+        Width: 500,
+        Height: 600,
+        Hash: "9249cee32bc8adc6ba996a6b78dd84c03b5a0153",
+      },
+    ];
+    expect(photo2.fileHash()).toBe("617693d2c2b9afdba19f97d1c92963953e1d2cfe");
+  });
+
+  it("should return file models", () => {
+    const values = { ID: 9, UID: "ABC163" };
+    const photo = new Photo(values);
+    expect(photo.fileModels()).toEqual([]);
+    const values2 = {
+      ID: 10,
+      UID: "ABC127",
+      Type: "video",
+      Files: [
+        {
+          UID: "fsr3uh0u30trle4l",
+          Name: "1980/01/cat.jpg",
+          Primary: false,
+          Root: "/",
+          FileType: "jpg",
+          MediaType: "image",
+          Width: 500,
+          Height: 600,
+          Hash: "35c905d21486b400814bd2d8479ed2e780440b1a",
+        },
+        {
+          UID: "fsr3uh0g2us6cwg4",
+          Name: "1999/01/dog.jpg",
+          Primary: true,
+          Root: "/",
+          FileType: "jpg",
+          MediaType: "image",
+          Width: 500,
+          Height: 600,
+          Hash: "617693d2c2b9afdba19f97d1c92963953e1d2cfe",
+        },
+        {
+          UID: "fsr3uh10nrgs63a2",
+          Name: "1999/01/dog.mov",
+          Video: true,
+          Root: "/",
+          FileType: "mov",
+          MediaType: "video",
+          Width: 500,
+          Height: 600,
+          Hash: "9249cee32bc8adc6ba996a6b78dd84c03b5a0153",
+        },
+      ],
+    };
+    const photo2 = new Photo(values2);
+    expect(photo2.fileModels()[0].Name).toBe("1999/01/dog.mov");
+    const values3 = {
+      ID: 10,
+      UID: "ABC127",
+      Files: [
+        {
+          UID: "fsr3uh0u30trle4l",
+          Name: "1980/01/cat.jpg",
+          Primary: true,
+          FileType: "jpg",
+          Width: 500,
+          Height: 600,
+          Hash: "35c905d21486b400814bd2d8479ed2e780440b1a",
+        },
+        {
+          UID: "fsr3uh0g2us6cwg4",
+          Name: "1999/01/dog.jpg",
+          Primary: false,
+          FileType: "jpg",
+          Width: 500,
+          Height: 600,
+          Hash: "617693d2c2b9afdba19f97d1c92963953e1d2cfe",
+        },
+      ],
+    };
+    const photo3 = new Photo(values3);
+    expect(photo3.fileModels()[0].Name).toBe("1980/01/cat.jpg");
+    const values4 = {
+      ID: 10,
+      UID: "ABC127",
+      Files: [
+        {
+          UID: "fsr3uh0u30trle4l",
+          Name: "1980/01/cat.jpg",
+          Primary: true,
+          Root: "/",
+          FileType: "jpg",
+          MediaType: "image",
+          Width: 500,
+          Height: 600,
+          Hash: "35c905d21486b400814bd2d8479ed2e780440b1a",
+        },
+      ],
+    };
+    const photo4 = new Photo(values4);
+    expect(photo4.fileModels()[0].Name).toBe("1980/01/cat.jpg");
+  });
+
+  it("should get country name", () => {
+    const values = { ID: 5, UID: "ABC123", Country: "zz" };
+    const photo = new Photo(values);
+    expect(photo.countryName()).toBe("Unknown");
+    const values2 = { ID: 5, UID: "ABC123", Country: "es" };
+    const photo2 = new Photo(values2);
+    expect(photo2.countryName()).toBe("Spain");
+  });
+
+  it("should get location info", () => {
+    const values = { ID: 5, UID: "ABC123", Country: "zz", PlaceID: "zz", PlaceLabel: "Nice beach" };
+    const photo = new Photo(values);
+    expect(photo.locationInfo()).toBe("Nice beach");
+    const values2 = { ID: 5, UID: "ABC123", Country: "es", PlaceID: "zz" };
+    const photo2 = new Photo(values2);
+    expect(photo2.locationInfo()).toBe("Spain");
+  });
+
+  it("should return empty placeName when the photo has no geocoding", () => {
+    const photo = new Photo({ ID: 1, UID: "ABC1" });
+    expect(photo.placeName()).toBe("");
+  });
+
+  it("should resolve placeName from Place.Label when set", () => {
+    const photo = new Photo({
+      ID: 2,
+      UID: "ABC2",
+      PlaceID: "s2:abc",
+      Country: "de",
+      Place: { ID: "s2:abc", Label: "Berlin, Germany" },
+    });
+    expect(photo.placeName()).toBe("Berlin, Germany");
+  });
+
+  it("should fall back to PlaceLabel when Place is not preloaded", () => {
+    const photo = new Photo({
+      ID: 3,
+      UID: "ABC3",
+      PlaceID: "s2:def",
+      Country: "fr",
+      PlaceLabel: "Paris, France",
+    });
+    expect(photo.placeName()).toBe("Paris, France");
+  });
+
+  it("should resolve placeName to the country name for unknown places with a known country", () => {
+    const photo = new Photo({ ID: 4, UID: "ABC4", PlaceID: "zz", Country: "es" });
+    expect(photo.placeName()).toBe("Spain");
+  });
+
+  it("should strip the UnknownPlace literal so placeName returns empty for unresolved photos", () => {
+    // Mirrors the join shape PhotoPreloadByUID returns when a photo
+    // points at UnknownPlace (`internal/entity/place.go`): every text
+    // column is the English literal "Unknown" and Country is also "zz".
+    const photo = new Photo({
+      ID: 5,
+      UID: "ABC5",
+      PlaceID: "zz",
+      Country: "zz",
+      PlaceLabel: "Unknown",
+      Place: { ID: "zz", Label: "Unknown" },
+    });
+    expect(photo.placeName()).toBe("");
+    // locationInfo() still surfaces the localized fallback for callers
+    // that want a placeholder (cards / list / edit dialog).
+    expect(photo.locationInfo()).toBe("Unknown");
+  });
+
+  it("should strip a denormalized 'Unknown' PlaceLabel even when Place is not preloaded", () => {
+    const photo = new Photo({
+      ID: 6,
+      UID: "ABC6",
+      PlaceID: "zz",
+      Country: "zz",
+      PlaceLabel: "Unknown",
+    });
+    expect(photo.placeName()).toBe("");
+  });
+
+  it("should keep a user label that merely contains the substring Unknown", () => {
+    const photo = new Photo({
+      ID: 7,
+      UID: "ABC7",
+      PlaceID: "s2:ghi",
+      Country: "us",
+      PlaceLabel: "Unknown Trail, Yosemite",
+    });
+    // The filter matches the exact DB sentinel, not substrings — a
+    // user-curated label like "Unknown Trail" stays put.
+    expect(photo.placeName()).toBe("Unknown Trail, Yosemite");
+  });
+
+  it("should return video info", () => {
+    const values = {
+      ID: 9,
+      UID: "ABC163",
+    };
+    const photo = new Photo(values);
+    expect(photo.getVideoInfo()).toBe("Video");
+    const values2 = {
+      ID: 10,
+      UID: "ABC127",
+      Files: [
+        {
+          UID: "123fgb",
+          Name: "1980/01/superCuteKitten.mp4",
+          Primary: false,
+          FileType: "mp4",
+          Hash: "1xxbgdt55",
+        },
+      ],
+    };
+    const photo2 = new Photo(values2);
+    expect(photo2.getVideoInfo()).toBe("MP4");
+    const values3 = {
+      ID: 10,
+      UID: "ABC127",
+      Files: [
+        {
+          UID: "123fgb",
+          Name: "1980/01/superCuteKitten.mp4",
+          Primary: false,
+          FileType: "mp4",
+          Width: 500,
+          Height: 600,
+          Hash: "1xxbgdt55",
+          Duration: 6000,
+          Size: 222897,
+          Codec: "avc1",
+        },
+      ],
+    };
+    const photo3 = new Photo(values3);
+    expect(photo3.getVideoInfo()).toBe("6µs, AVC, 500 × 600, 218 KB");
+    const values4 = {
+      ID: 10,
+      UID: "ABC127",
+      Files: [
+        {
+          UID: "123fgb",
+          Name: "1980/01/superCuteKitten.mp4",
+          Primary: false,
+          FileType: "mp4",
+          Hash: "1xxbgdt55",
+          Duration: 6000,
+          Size: 10240,
+          Codec: "avc1",
+        },
+        {
+          UID: "345fgb",
+          Name: "1980/01/superCuteKitten.jpg",
+          Primary: true,
+          FileType: "jpg",
+          Hash: "1xxbgjhu5",
+          Width: 300,
+          Height: 500,
+        },
+      ],
+    };
+    const photo4 = new Photo(values4);
+    expect(photo4.getVideoInfo()).toBe("6µs, AVC, 300 × 500, 10 KB");
+    expect(photo4.getDurationInfo()).toBe("6µs");
+  });
+
+  it("should return photo info", () => {
+    const values = {
+      ID: 9,
+      UID: "ABC163",
+    };
+    const photo = new Photo(values);
+    expect(photo.getCameraInfo()).toBe("Unknown");
+    const values2 = {
+      ID: 10,
+      UID: "ABC127",
+      Files: [
+        {
+          UID: "123fgb",
+          Name: "1980/01/superCuteKitten.jpg",
+          Primary: true,
+          FileType: "jpg",
+          Hash: "1xxbgdt55",
+        },
+      ],
+      Size: "300",
+      Camera: {
+        Make: "Canon",
+        Model: "abc",
+      },
+    };
+    const photo2 = new Photo(values2);
+    expect(photo2.getCameraInfo()).toBe("Canon abc");
+    const values3 = {
+      ID: 10,
+      UID: "ABC127",
+      CameraMake: "Canon",
+      CameraModel: "EOS 6D",
+      Iso: 100,
+      Files: [
+        {
+          UID: "123fgb",
+          Name: "1980/01/superCuteKitten.mp4",
+          Primary: false,
+          FileType: "mp4",
+          Width: 500,
+          Height: 600,
+          Hash: "1xxbgdt55",
+          Duration: 6000,
+          Codec: "avc1",
+        },
+      ],
+    };
+    const photo3 = new Photo(values3);
+    expect(photo3.getCameraInfo()).toBe("Canon EOS 6D, ISO 100");
+    const values4 = {
+      ID: 10,
+      UID: "ABC127",
+      CameraID: 2,
+      CameraMake: "Canon",
+      Iso: 200,
+      Files: [
+        {
+          UID: "123fgb",
+          Name: "1980/01/superCuteKitten.mp4",
+          Primary: false,
+          FileType: "mp4",
+          Width: 500,
+          Height: 600,
+          Hash: "1xxbgdt55",
+          Duration: 6000,
+          Size: 300,
+          Codec: "avc1",
+        },
+        {
+          UID: "123fgx",
+          Name: "1980/01/superCuteKitten.jpg",
+          Primary: true,
+          FileType: "jpg",
+          Width: 800,
+          Height: 600,
+          Hash: "1xxbgdt55",
+          Duration: 6000,
+          Size: 200,
+          Codec: "avc1",
+        },
+      ],
+    };
+    const photo4 = new Photo(values4);
+    expect(photo4.getCameraInfo()).toBe("Canon, ISO 200");
+  });
+
+  it("should return lens info", () => {
+    const values = {
+      ID: "674-860",
+      UID: "ps22wlskqtcmu9l3",
+      Type: "raw",
+      TypeSrc: "",
+      TakenAt: "2018-10-05T08:47:32Z",
+      TakenAtLocal: "2018-10-05T08:47:32Z",
+      TakenSrc: "meta",
+      TimeZone: "Local",
+      Path: "raw images/Canon EOS 700 D",
+      Name: "_MG_9509",
+      OriginalName: "",
+      Title: "Unknown / 2018",
+      Caption: "",
+      Year: 2018,
+      Month: 10,
+      Day: 5,
+      Country: "zz",
+      Stack: 0,
+      Favorite: false,
+      Private: false,
+      Iso: 100,
+      FocalLength: 50,
+      FNumber: 2.8,
+      Exposure: "1/1600",
+      Quality: 3,
+      Resolution: 18,
+      Color: 0,
+      Scan: false,
+      Panorama: false,
+      CameraID: 47,
+      CameraSrc: "meta",
+      CameraSerial: "338075021697",
+      CameraModel: "EOS 700D",
+      CameraMake: "Canon",
+      LensID: 47,
+      LensModel: "EF50mm f/1.8 II",
+      CellID: "zz",
+      PlaceID: "zz",
+      PlaceSrc: "",
+      PlaceLabel: "Unknown",
+      PlaceCity: "Unknown",
+      PlaceState: "Unknown",
+      PlaceCountry: "zz",
+      InstanceID: "",
+      FileUID: "fs25jsa22w9g851o",
+      FileRoot: "sidecar",
+      FileName: "raw images/Canon EOS 700 D/_MG_9509.CR2.jpg",
+      Hash: "7dc01e8cb588f3cfe31694ac2fece10167d88eec",
+      Width: 5198,
+      Height: 3462,
+      Portrait: false,
+      Files: [],
+    };
+    const photo = new Photo(values);
+    expect(photo.getLensInfo()).toBe("EF50mm ƒ/1.8 II, 50mm, ƒ/2.8");
+  });
+
+  it("should archive photo", async () => {
+    const values = { ID: 5, Title: "Crazy Cat", CountryName: "Africa", Favorite: false };
+    const photo = new Photo(values);
+    const response = await photo.archive();
+    expect(response.status).toBe(200);
+    expect(response.data).toEqual({ photos: [1, 3] });
+  });
+
+  it("should approve photo", async () => {
+    const values = {
+      ID: 5,
+      UID: "pqbemz8276mhtobh",
+      Title: "Crazy Cat",
+      CountryName: "Africa",
+      Favorite: false,
+    };
+    const photo = new Photo(values);
+    const response = await photo.approve();
+    expect(response.status).toBe(200);
+  });
+
+  it("should toggle private", () => {
+    const values = { ID: 5, Title: "Crazy Cat", CountryName: "Africa", Private: true };
+    const photo = new Photo(values);
+    expect(photo.Private).toBe(true);
+    photo.togglePrivate();
+    expect(photo.Private).toBe(false);
+    photo.togglePrivate();
+    expect(photo.Private).toBe(true);
+  });
+
+  it("should mark photo as primary", async () => {
+    const values = {
+      ID: 10,
+      UID: "pqbemz8276mhtobh",
+      Files: [
+        {
+          UID: "fqbfk181n4ca5sud",
+          Name: "1980/01/superCuteKitten.mp4",
+          Primary: false,
+          FileType: "mp4",
+          Hash: "1xxbgdt55",
+        },
+      ],
+    };
+    const photo = new Photo(values);
+    const response = await photo.setPrimaryFile("fqbfk181n4ca5sud");
+    expect(response.Files[0].Primary).toBe(true);
+  });
+
+  it("should unstack", async () => {
+    const values = {
+      ID: 10,
+      UID: "pqbemz8276mhtobh",
+      Files: [
+        {
+          UID: "fqbfk181n4ca5sud",
+          Name: "1980/01/superCuteKitten.mp4",
+          Primary: false,
+          FileType: "mp4",
+          Hash: "1xxbgdt55",
+        },
+      ],
+    };
+    const photo = new Photo(values);
+    const response = await photo.unstackFile("fqbfk181n4ca5sud");
+    expect(response.success).toBe("ok");
+  });
+
+  it("should delete file", async () => {
+    const values = {
+      ID: 10,
+      UID: "pqbemz8276mhtobh",
+      Files: [
+        {
+          UID: "fqbfk181n4ca5sud",
+          Name: "1980/01/superCuteKitten.mp4",
+          Primary: false,
+          FileType: "mp4",
+          Hash: "1xxbgdt55",
+        },
+        {
+          UID: "fqbfk181n4ca5abc",
+          Name: "1980/01/superCuteKitten.mp4",
+          Primary: true,
+          FileType: "mp4",
+          Hash: "1xxbgdt89",
+        },
+      ],
+    };
+    const photo = new Photo(values);
+    const response = await photo.deleteFile("fqbfk181n4ca5sud");
+    expect(response.success).toBe("successfully deleted");
+  });
+
+  it("should add label", async () => {
+    const values = {
+      ID: 10,
+      UID: "pqbemz8276mhtobh",
+    };
+    const photo = new Photo(values);
+    const response = await photo.addLabel("Cat");
+    expect(response.success).toBe("ok");
+  });
+
+  it("should activate label", async () => {
+    const values = {
+      ID: 10,
+      UID: "pqbemz8276mhtobh",
+    };
+    const photo = new Photo(values);
+    const response = await photo.activateLabel(12345);
+    expect(response.success).toBe("ok");
+  });
+
+  it("should rename label", async () => {
+    const values = {
+      ID: 10,
+      UID: "pqbemz8276mhtobh",
+    };
+    const photo = new Photo(values);
+    const response = await photo.renameLabel(12345, "Sommer");
+    expect(response.success).toBe("ok");
+  });
+
+  it("should remove label", async () => {
+    const values = {
+      ID: 10,
+      UID: "pqbemz8276mhtobh",
+    };
+    const photo = new Photo(values);
+    const response = await photo.removeLabel(12345);
+    expect(response.success).toBe("ok");
+  });
+
+  describe("addToAlbum", () => {
+    beforeEach(() => {
+      Photo._cache.clear();
+    });
+
+    it("posts to albums/<uid>/photos, evicts the cache, refinds, and resyncs this.Albums", async () => {
+      const photo = new Photo({ UID: "pqbemz8276mhtobh", Albums: [{ UID: "axxalbum1", Title: "Existing" }] });
+      const refreshed = new Photo({
+        UID: "pqbemz8276mhtobh",
+        Albums: [
+          { UID: "axxalbum1", Title: "Existing" },
+          { UID: "axxalbum2", Title: "New" },
+        ],
+      });
+      Photo._cache.set("pqbemz8276mhtobh", { UID: "pqbemz8276mhtobh", Title: "Cached" });
+      const findSpy = vi.spyOn(Photo.prototype, "find").mockResolvedValueOnce(refreshed);
+
+      const result = await photo.addToAlbum("axxalbum2");
+
+      expect(findSpy).toHaveBeenCalledWith("pqbemz8276mhtobh");
+      expect(Photo._cache.has("pqbemz8276mhtobh")).toBe(false);
+      expect(result).toBe(photo);
+      expect(photo.Albums.map((a) => a.UID)).toEqual(["axxalbum1", "axxalbum2"]);
+
+      findSpy.mockRestore();
+    });
+
+    it("resolves to this without a request when albumUID is falsy", async () => {
+      const photo = new Photo({ UID: "pqbemz8276mhtobh" });
+      const findSpy = vi.spyOn(Photo.prototype, "find");
+      const result = await photo.addToAlbum("");
+      expect(result).toBe(photo);
+      expect(findSpy).not.toHaveBeenCalled();
+      findSpy.mockRestore();
+    });
+
+    it("propagates the rejection without evicting or refinding when the POST fails", async () => {
+      const $api = (await import("common/api")).default;
+      const err = new Error("offline");
+      const postSpy = vi.spyOn($api, "post").mockRejectedValueOnce(err);
+      const findSpy = vi.spyOn(Photo.prototype, "find");
+      Photo._cache.set("pqbemz8276mhtobh", { UID: "pqbemz8276mhtobh", Title: "Cached" });
+      const photo = new Photo({ UID: "pqbemz8276mhtobh" });
+
+      await expect(photo.addToAlbum("axxalbum2")).rejects.toBe(err);
+
+      expect(findSpy).not.toHaveBeenCalled();
+      expect(Photo._cache.has("pqbemz8276mhtobh")).toBe(true);
+      postSpy.mockRestore();
+      findSpy.mockRestore();
+    });
+
+    // Pin the layer split: Photo.addToAlbum must NOT toggle a Removed flag
+    // (that's Thumb's contract). A future "consolidation" PR that tries to
+    // collapse the two methods into one will trip this assertion.
+    it("does not flip a Removed flag (Photo layer ≠ Thumb layer)", async () => {
+      const photo = new Photo({ UID: "pqbemz8276mhtobh" });
+      vi.spyOn(Photo.prototype, "find").mockResolvedValueOnce(new Photo({ UID: "pqbemz8276mhtobh", Albums: [] }));
+      await photo.addToAlbum("axxalbum2");
+      expect(photo.Removed).toBeUndefined();
+      Photo.prototype.find.mockRestore();
+    });
+  });
+
+  describe("removeFromAlbum", () => {
+    beforeEach(() => {
+      Photo._cache.clear();
+    });
+
+    it("deletes albums/<uid>/photos, evicts the cache, refinds, and resyncs this.Albums", async () => {
+      const photo = new Photo({
+        UID: "pqbemz8276mhtobh",
+        Albums: [
+          { UID: "axxalbum1", Title: "Existing" },
+          { UID: "axxalbum2", Title: "Other" },
+        ],
+      });
+      const refreshed = new Photo({
+        UID: "pqbemz8276mhtobh",
+        Albums: [{ UID: "axxalbum1", Title: "Existing" }],
+      });
+      Photo._cache.set("pqbemz8276mhtobh", { UID: "pqbemz8276mhtobh", Title: "Cached" });
+      const findSpy = vi.spyOn(Photo.prototype, "find").mockResolvedValueOnce(refreshed);
+
+      const result = await photo.removeFromAlbum("axxalbum2");
+
+      expect(findSpy).toHaveBeenCalledWith("pqbemz8276mhtobh");
+      expect(Photo._cache.has("pqbemz8276mhtobh")).toBe(false);
+      expect(result).toBe(photo);
+      expect(photo.Albums.map((a) => a.UID)).toEqual(["axxalbum1"]);
+
+      findSpy.mockRestore();
+    });
+
+    it("resolves to this without a request when albumUID is falsy", async () => {
+      const photo = new Photo({ UID: "pqbemz8276mhtobh" });
+      const findSpy = vi.spyOn(Photo.prototype, "find");
+      const result = await photo.removeFromAlbum(null);
+      expect(result).toBe(photo);
+      expect(findSpy).not.toHaveBeenCalled();
+      findSpy.mockRestore();
+    });
+
+    it("propagates the rejection without evicting or refinding when the DELETE fails", async () => {
+      const $api = (await import("common/api")).default;
+      const err = new Error("offline");
+      const deleteSpy = vi.spyOn($api, "delete").mockRejectedValueOnce(err);
+      const findSpy = vi.spyOn(Photo.prototype, "find");
+      Photo._cache.set("pqbemz8276mhtobh", { UID: "pqbemz8276mhtobh", Title: "Cached" });
+      const photo = new Photo({ UID: "pqbemz8276mhtobh" });
+
+      await expect(photo.removeFromAlbum("axxalbum2")).rejects.toBe(err);
+
+      expect(findSpy).not.toHaveBeenCalled();
+      expect(Photo._cache.has("pqbemz8276mhtobh")).toBe(true);
+      deleteSpy.mockRestore();
+      findSpy.mockRestore();
+    });
+
+    // Pin the layer split: Photo.removeFromAlbum must NOT toggle a Removed
+    // flag (that's Thumb.removeFromAlbum's contract — see model/thumb.js
+    // and the matching test in tests/vitest/model/thumb.test.js).
+    it("does not flip a Removed flag (Photo layer ≠ Thumb layer)", async () => {
+      const photo = new Photo({ UID: "pqbemz8276mhtobh" });
+      vi.spyOn(Photo.prototype, "find").mockResolvedValueOnce(new Photo({ UID: "pqbemz8276mhtobh", Albums: [] }));
+      await photo.removeFromAlbum("axxalbum2");
+      expect(photo.Removed).toBeUndefined();
+      Photo.prototype.find.mockRestore();
+    });
+  });
+
+  it("should test update", async () => {
+    const values = {
+      ID: 10,
+      UID: "pqbemz8276mhtobh",
+      Lat: 1.1,
+      Lng: 3.3,
+      CameraID: 123,
+      Title: "Test Titel",
+      Caption: "Super nice video",
+      Day: 10,
+      Country: "es",
+      Files: [
+        {
+          UID: "fqbfk181n4ca5sud",
+          Name: "1980/01/superCuteKitten.mp4",
+          Primary: false,
+          FileType: "mp4",
+          Hash: "1xxbgdt55",
+        },
+      ],
+      Details: [
+        {
+          Keywords: "old",
+          Notes: "old notes",
+          Subject: "old subject",
+          Artist: "Old Artist",
+          Copyright: "ABC",
+          License: "test",
+        },
+      ],
+    };
+    const photo = new Photo(values);
+    photo.Title = "New Title";
+    photo.Type = "newtype";
+    photo.Caption = "New description";
+    photo.Day = 21;
+    photo.Country = "de";
+    photo.CameraID = "newcameraid";
+    photo.Details.Keywords = "newkeyword";
+    photo.Details.Notes = "New Notes";
+    photo.Details.Subject = "New Photo Subject";
+    photo.Details.Artist = "New Artist";
+    photo.Details.Copyright = "New Copyright";
+    photo.Details.License = "New License";
+    const response = await photo.update();
+    expect(response.TitleSrc).toBe("manual");
+    expect(photo.Title).toBe("New Title");
+    expect(photo.Type).toBe("newtype");
+    expect(photo.Caption).toBe("New description");
+    expect(photo.Day).toBe(21);
+    expect(photo.Country).toBe("de");
+    expect(photo.CameraID).toBe("newcameraid");
+    expect(photo.Details.Keywords).toBe("newkeyword");
+    expect(photo.Details.Notes).toBe("New Notes");
+    expect(photo.Details.Subject).toBe("New Photo Subject");
+    expect(photo.Details.Artist).toBe("New Artist");
+    expect(photo.Details.Copyright).toBe("New Copyright");
+    expect(photo.Details.License).toBe("New License");
+  });
+
+  it("should test get Markers", () => {
+    const values = {
+      ID: 10,
+      UID: "pqbemz8276mhtobh",
+      Lat: 1.1,
+      Lng: 3.3,
+      CameraID: 123,
+      Title: "Test Titel",
+      Caption: "Super nice video",
+      Files: [
+        {
+          UID: "fqbfk181n4ca5sud",
+          Name: "1980/01/superCuteKitten.mp4",
+          Primary: false,
+          FileType: "mp4",
+          Hash: "1xxbgdt55",
+        },
+      ],
+    };
+    const photo = new Photo(values);
+    const result = photo.getMarkers(true);
+    expect(result).toEqual([]);
+    const values2 = {
+      ID: 10,
+      UID: "pqbemz8276mhtobh",
+      Lat: 1.1,
+      Lng: 3.3,
+      CameraID: 123,
+      Title: "Test Titel",
+      Caption: "Super nice video",
+      Files: [
+        {
+          UID: "fqbfk181n4ca5sud",
+          Name: "1980/01/superCuteKitten.mp4",
+          Primary: true,
+          FileType: "mp4",
+          Hash: "1xxbgdt55",
+          Markers: [
+            {
+              UID: "aaa123",
+              Invalid: false,
+            },
+            {
+              UID: "bbb123",
+              Invalid: true,
+            },
+          ],
+        },
+      ],
+    };
+    const photo2 = new Photo(values2);
+    const result2 = photo2.getMarkers(true);
+    expect(result2.length).toBe(1);
+    const result3 = photo2.getMarkers(false);
+    expect(result3.length).toBe(2);
+  });
+
+  it("should determine if photo is a stack", () => {
+    const values1 = {
+      UID: "stack1",
+      Type: "video",
+      Files: [{ FileType: media.FormatJpeg }, { FileType: media.FormatJpeg }],
+    };
+    const photo1 = new Photo(values1);
+    expect(photo1.isStack()).toBe(false);
+
+    const values2 = { UID: "stack2", Type: media.Image, Files: [] };
+    const photo2 = new Photo(values2);
+    expect(photo2.isStack()).toBe(false);
+
+    const values3 = { UID: "stack3", Type: media.Image, Files: [{ FileType: media.FormatJpeg }] };
+    const photo3 = new Photo(values3);
+    expect(photo3.isStack()).toBe(false);
+
+    const values4 = { UID: "stack4", Type: media.Image, Files: [{ FileType: media.FormatJpeg }, { FileType: "raw" }] };
+    const photo4 = new Photo(values4);
+    expect(photo4.isStack()).toBe(false);
+
+    const values5 = {
+      UID: "stack5",
+      Type: media.Image,
+      Files: [{ FileType: media.FormatJpeg }, { FileType: media.FormatJpeg }],
+    };
+    const photo5 = new Photo(values5);
+    expect(photo5.isStack()).toBe(true);
+
+    const values6 = {
+      UID: "stack6",
+      Type: media.Image,
+      Files: [{ FileType: media.FormatJpeg }, { FileType: "raw" }, { FileType: media.FormatJpeg }],
+    };
+    const photo6 = new Photo(values6);
+    expect(photo6.isStack()).toBe(true);
+  });
+
+  it("should return the original file based on type", () => {
+    const liveFiles = [
+      { UID: "live_jpg", Name: "live.jpg", FileType: media.FormatJpeg, Root: "/", Primary: true },
+      { UID: "live_mov", Name: "live.mov", FileType: "mov", MediaType: media.Video, Root: "/", Video: true },
+      { UID: "live_sidecar", Name: "live.xmp", FileType: "xmp", Root: "sidecar", Sidecar: true },
+    ];
+    const photoLive = new Photo({ UID: "livePhoto", Type: media.Live, Files: liveFiles });
+    expect(photoLive.originalFile().UID).toBe("live_mov");
+
+    const videoFiles = [
+      { UID: "video_jpg", Name: "video.jpg", FileType: media.FormatJpeg, Root: "/", Primary: true },
+      {
+        UID: "video_mp4",
+        Name: "video.mp4",
+        FileType: media.FormatMp4,
+        MediaType: media.Video,
+        Root: "/",
+        Video: true,
+      },
+    ];
+    const photoVideo = new Photo({ UID: "videoPhoto", Type: media.Video, Files: videoFiles });
+    expect(photoVideo.originalFile().UID).toBe("video_mp4");
+
+    const rawFiles = [
+      { UID: "raw_jpg", Name: "raw.jpg", FileType: media.FormatJpeg, Root: "/", Primary: true },
+      { UID: "raw_cr2", Name: "raw.cr2", FileType: "cr2", MediaType: media.Raw, Root: "/" },
+    ];
+    const photoRaw = new Photo({ UID: "rawPhoto", Type: media.Raw, Files: rawFiles });
+    expect(photoRaw.originalFile().UID).toBe("raw_cr2");
+
+    const animatedFiles = [
+      {
+        UID: "anim_gif",
+        Name: "anim.gif",
+        FileType: media.FormatGif,
+        MediaType: media.Image,
+        Root: "/",
+        Primary: true,
+      },
+      { UID: "anim_sidecar", Name: "anim.xmp", FileType: "xmp", Root: "sidecar", Sidecar: true },
+    ];
+    const photoAnimated = new Photo({ UID: "animatedPhoto", Type: media.Animated, Files: animatedFiles });
+    expect(photoAnimated.originalFile().UID).toBe("anim_gif");
+
+    const otherFiles = [
+      { UID: "other_jpg", Name: "other.jpg", FileType: media.FormatJpeg, Root: "/", Primary: true },
+      { UID: "other_png", Name: "other.png", FileType: media.FormatPng, Root: "/" },
+    ];
+    const photoOther = new Photo({ UID: "otherPhoto", Type: media.Image, Files: otherFiles });
+    expect(photoOther.originalFile().UID).toBe("other_png");
+
+    const jpegFiles = [
+      { UID: "jpeg_1", Name: "jpeg1.jpg", FileType: media.FormatJpeg, Root: "/" },
+      { UID: "jpeg_2", Name: "jpeg2.jpg", FileType: media.FormatJpeg, Root: "/", Primary: true },
+    ];
+    const photoJpeg = new Photo({ UID: "jpegPhoto", Type: media.Image, Files: jpegFiles });
+    expect(photoJpeg.originalFile().UID).toBe("jpeg_2");
+
+    const singleFile = [{ UID: "single_jpg", Name: "single.jpg", FileType: media.FormatJpeg, Root: "/", Primary: true }];
+    const photoSingle = new Photo({ UID: "singlePhoto", Type: media.Image, Files: singleFile });
+    expect(photoSingle.originalFile().UID).toBe("single_jpg");
+
+    const noFilesPhoto = new Photo({
+      UID: "noFiles",
+      Type: media.Image,
+      OriginalName: "no_files_original.jpg",
+      Name: "no_files_name.jpg",
+      FileName: "no_files_filename.jpg",
+    });
+    expect(noFilesPhoto.originalFile()).toBe(noFilesPhoto);
+  });
+
+  it("should return the correct original name", () => {
+    const files1 = [
+      { UID: "f1_orig", Name: "file1.raw", OriginalName: "original_raw_name.raw", Root: "/", MediaType: media.Raw },
+      {
+        UID: "f1_jpg",
+        Name: "file1.jpg",
+        OriginalName: "original_jpg_name.jpg",
+        Root: "/",
+        FileType: media.FormatJpeg,
+        Primary: true,
+      },
+    ];
+    const photo1 = new Photo({ UID: "origName1", Type: media.Raw, Files: files1 });
+    expect(photo1.getOriginalName()).toBe("original_raw_name.raw");
+
+    const files2 = [
+      { UID: "f2_orig", Name: "file2_actual.raw", Root: "/", MediaType: media.Raw },
+      { UID: "f2_jpg", Name: "file2_actual.jpg", Root: "/", FileType: media.FormatJpeg, Primary: true },
+    ];
+    const photo2 = new Photo({ UID: "origName2", Type: media.Raw, Files: files2 });
+    expect(photo2.getOriginalName()).toBe("file2_actual.raw");
+
+    const photo3 = new Photo({
+      UID: "origName3",
+      Type: media.Image,
+      OriginalName: "photo_original.jpg",
+      Name: "photo_name.jpg",
+      FileName: "photo_filename.jpg",
+    });
+    expect(photo3.getOriginalName()).toBe("photo_original.jpg");
+
+    const photo4 = new Photo({
+      UID: "origName4",
+      Type: media.Image,
+      Name: "photo_name.jpg",
+      FileName: "photo_filename.jpg",
+    });
+    expect(photo4.getOriginalName()).toBe("photo_name.jpg");
+
+    const photo5 = new Photo({ UID: "origName5", Type: media.Image, Name: "photo_name.jpg" });
+    expect(photo5.getOriginalName()).toBe("photo_name.jpg");
+
+    const photo6 = new Photo({ UID: "origName6", Type: media.Image });
+    expect(photo6.getOriginalName()).toBe("Unknown");
+
+    const files7 = [
+      { UID: "f7_orig", Root: "/", MediaType: media.Raw },
+      { UID: "f7_jpg", Name: "file7.jpg", Root: "/", FileType: media.FormatJpeg, Primary: true },
+    ];
+    const photo7 = new Photo({
+      UID: "origName7",
+      Type: media.Raw,
+      Files: files7,
+      OriginalName: "photo7_original.jpg",
+      FileName: "photo7_filename.jpg",
+      Name: "photo7_name.jpg",
+    });
+    expect(photo7.getOriginalName()).toBe("photo7_original.jpg");
+
+    const files8 = [
+      {
+        UID: "f8_orig",
+        Name: "some/path/file8.raw",
+        OriginalName: "another/path/original_raw_name8.raw",
+        Root: "/",
+        MediaType: media.Raw,
+      },
+      { UID: "f8_jpg", Name: "file8.jpg", Root: "/", FileType: media.FormatJpeg, Primary: true },
+    ];
+    const photo8 = new Photo({ UID: "origName8", Type: media.Raw, Files: files8 });
+    expect(photo8.getOriginalName()).toBe("original_raw_name8.raw");
+  });
+
+  it("should format EXIF info with all fields", () => {
+    const photo = new Photo({ FocalLength: 50, FNumber: 1.8, Iso: 400, Exposure: "1/125" });
+    expect(photo.getExifInfo()).toBe("50mm \u2022 \u0192/1.8 \u2022 ISO 400 \u2022 1/125");
+  });
+
+  it("should format EXIF info with partial fields", () => {
+    const photo = new Photo({ FocalLength: 35, Iso: 100 });
+    expect(photo.getExifInfo()).toBe("35mm \u2022 ISO 100");
+  });
+
+  it("should return empty EXIF info when no fields set", () => {
+    const photo = new Photo({});
+    expect(photo.getExifInfo()).toBe("");
+  });
+
+  // Photo-cache integration tests. The generic LRU semantics are covered
+  // independently in tests/vitest/model/model-cache.test.js; the cases
+  // below pin Photo's own wiring on top of ModelCache: that findCached
+  // returns Photo instances, that mutators don't touch the cache, that
+  // the photos.updated/photos.deleted subscriptions route through the
+  // shared helper, and that LRU/dedup behavior survives the extraction.
+  describe("LRU cache", () => {
+    // Helper: seed the cache via the public API used by Photo at runtime.
+    // Avoids poking ModelCache internals in every test.
+    const seedCache = (uid, values) => {
+      Photo._cache.set(uid, { UID: uid, ...values });
+    };
+
+    beforeEach(() => {
+      Photo._cache.clear();
+    });
+
+    it("should cache a photo after findCached resolves", async () => {
+      const mockPhoto = new Photo({ UID: "cache-test-1", Title: "Cached" });
+      vi.spyOn(Photo.prototype, "find").mockResolvedValueOnce(mockPhoto);
+
+      const result = await Photo.findCached("cache-test-1");
+      expect(result.Title).toBe("Cached");
+      expect(Photo._cache.has("cache-test-1")).toBe(true);
+
+      Photo.prototype.find.mockRestore();
+    });
+
+    it("should return cached photo without API call on second request", async () => {
+      seedCache("cache-test-2", { Title: "Cached" });
+
+      const findSpy = vi.spyOn(Photo.prototype, "find");
+      const result = await Photo.findCached("cache-test-2");
+
+      expect(result.Title).toBe("Cached");
+      expect(findSpy).not.toHaveBeenCalled();
+
+      findSpy.mockRestore();
+    });
+
+    it("should hand out isolated Photo instances so consumers cannot mutate the cache", async () => {
+      seedCache("cache-test-clone", { Title: "Original" });
+
+      const first = await Photo.findCached("cache-test-clone");
+      expect(first).toBeInstanceOf(Photo);
+      first.Title = "Mutated";
+
+      const second = await Photo.findCached("cache-test-clone");
+      expect(second).not.toBe(first);
+      expect(second.Title).toBe("Original");
+    });
+
+    it("should evict the oldest entry when the cache exceeds its size cap", async () => {
+      const cap = Photo._cache.max;
+      for (let i = 0; i < cap; i++) {
+        seedCache(`uid-${i}`, {});
+      }
+      expect(Photo._cache.size()).toBe(cap);
+
+      const mockPhoto = new Photo({ UID: "uid-new", Title: "New" });
+      vi.spyOn(Photo.prototype, "find").mockResolvedValueOnce(mockPhoto);
+
+      await Photo.findCached("uid-new");
+
+      expect(Photo._cache.size()).toBe(cap);
+      expect(Photo._cache.has("uid-0")).toBe(false);
+      expect(Photo._cache.has("uid-new")).toBe(true);
+
+      Photo.prototype.find.mockRestore();
+    });
+
+    it("should move an accessed entry to the most-recent LRU slot", async () => {
+      seedCache("uid-a", {});
+      seedCache("uid-b", {});
+      seedCache("uid-c", {});
+
+      await Photo.findCached("uid-a");
+
+      const keys = [...Photo._cache.items.keys()];
+      expect(keys[keys.length - 1]).toBe("uid-a");
+    });
+
+    it("should evict the cache entry for a given UID", () => {
+      seedCache("uid-evict", {});
+      expect(Photo._cache.has("uid-evict")).toBe(true);
+
+      Photo.evictCache("uid-evict");
+      expect(Photo._cache.has("uid-evict")).toBe(false);
+    });
+
+    it("should handle evictCache with a falsy uid gracefully", () => {
+      seedCache("uid-keep", {});
+      Photo.evictCache(null);
+      Photo.evictCache(undefined);
+      Photo.evictCache("");
+      expect(Photo._cache.has("uid-keep")).toBe(true);
+    });
+
+    it("should clearCache() drop every entry", () => {
+      seedCache("uid-1", {});
+      seedCache("uid-2", {});
+      Photo.clearCache();
+      expect(Photo._cache.size()).toBe(0);
+    });
+
+    it("should deduplicate concurrent requests for the same UID", async () => {
+      const mockPhoto = new Photo({ UID: "uid-dedup", Title: "Dedup" });
+      const findSpy = vi.spyOn(Photo.prototype, "find").mockResolvedValueOnce(mockPhoto);
+
+      const p1 = Photo.findCached("uid-dedup");
+      const p2 = Photo.findCached("uid-dedup");
+
+      const [r1, r2] = await Promise.all([p1, p2]);
+      expect(findSpy).toHaveBeenCalledTimes(1);
+      expect(r1).not.toBe(r2);
+      expect(r1.UID).toBe("uid-dedup");
+      expect(r2.UID).toBe("uid-dedup");
+      expect(r1.Title).toBe("Dedup");
+      expect(r2.Title).toBe("Dedup");
+
+      findSpy.mockRestore();
+    });
+
+    it("should clear the pending entry after a request completes", async () => {
+      const mockPhoto = new Photo({ UID: "uid-pending", Title: "Pending" });
+      vi.spyOn(Photo.prototype, "find").mockResolvedValueOnce(mockPhoto);
+
+      await Photo.findCached("uid-pending");
+      expect(Photo._cache.pending.has("uid-pending")).toBe(false);
+
+      Photo.prototype.find.mockRestore();
+    });
+
+    it("should clear the pending entry even if a request fails", async () => {
+      vi.spyOn(Photo.prototype, "find").mockRejectedValueOnce(new Error("Network error"));
+
+      try {
+        await Photo.findCached("uid-fail");
+      } catch {
+        // Expected
+      }
+
+      expect(Photo._cache.pending.has("uid-fail")).toBe(false);
+
+      Photo.prototype.find.mockRestore();
+    });
+
+    describe("websocket-driven invalidation", () => {
+      it("evicts a cached entry when photos.updated arrives", async () => {
+        seedCache("uid-ws-1", { Title: "Old" });
+
+        $event.publish("photos.updated", {
+          entities: [{ UID: "uid-ws-1", Title: "New" }],
+        });
+        await flushEvents();
+
+        // Eviction (not refresh): the next read goes back to find() and
+        // gets the field-complete entity from /photos/:uid.
+        expect(Photo._cache.has("uid-ws-1")).toBe(false);
+      });
+
+      it("does not seed the cache when photos.updated arrives for an entry not currently cached", async () => {
+        $event.publish("photos.updated", {
+          entities: [{ UID: "uid-ws-uncached", Title: "Should not seed" }],
+        });
+        await flushEvents();
+
+        expect(Photo._cache.has("uid-ws-uncached")).toBe(false);
+      });
+
+      // The backend sends photos.deleted with a []string of bare UIDs
+      // (event.EntitiesDeleted("photos", deleted.UIDs()) in
+      // internal/api/batch_photos.go and internal/photoprism/cleanup.go),
+      // NOT objects with .UID — pin both shapes so nobody re-introduces
+      // the silent-no-op the subscriber had before consolidating the
+      // string/object handling.
+      it("evicts cached entries when photos.deleted arrives with bare-string UIDs", async () => {
+        seedCache("uid-ws-del-string", {});
+
+        $event.publish("photos.deleted", {
+          entities: ["uid-ws-del-string"],
+        });
+        await flushEvents();
+
+        expect(Photo._cache.has("uid-ws-del-string")).toBe(false);
+      });
+
+      it("also tolerates the legacy object shape on photos.deleted", async () => {
+        seedCache("uid-ws-del-obj", {});
+
+        $event.publish("photos.deleted", {
+          entities: [{ UID: "uid-ws-del-obj" }],
+        });
+        await flushEvents();
+
+        expect(Photo._cache.has("uid-ws-del-obj")).toBe(false);
+      });
+
+      it("evicts cached entries when photos.archived arrives (bare-string payload)", async () => {
+        // event.EntitiesArchived("photos", frm.Photos) in
+        // internal/api/batch_photos.go — frm.Photos is []string.
+        seedCache("uid-ws-arc", {});
+
+        $event.publish("photos.archived", {
+          entities: ["uid-ws-arc"],
+        });
+        await flushEvents();
+
+        expect(Photo._cache.has("uid-ws-arc")).toBe(false);
+      });
+
+      it("evicts cached entries when photos.restored arrives (bare-string payload)", async () => {
+        // event.EntitiesRestored("photos", frm.Photos) — same shape.
+        seedCache("uid-ws-res", {});
+
+        $event.publish("photos.restored", {
+          entities: ["uid-ws-res"],
+        });
+        await flushEvents();
+
+        expect(Photo._cache.has("uid-ws-res")).toBe(false);
+      });
+
+      // event.EntitiesUpdated("photos", savedUIDs) in
+      // internal/api/batch_photos_edit.go — one event per batch save,
+      // payload is the full UID list (always []string, not entity
+      // objects), so the cache stays fresh after batch edits without
+      // per-UID events.
+      it("evicts every cached entry when photos.updated arrives with the batch UID list", async () => {
+        seedCache("uid-edited-1", { Title: "Stale 1" });
+        seedCache("uid-edited-2", { Title: "Stale 2" });
+        seedCache("uid-edited-keep", { Title: "Untouched" });
+
+        $event.publish("photos.updated", {
+          entities: ["uid-edited-1", "uid-edited-2"],
+        });
+        await flushEvents();
+
+        expect(Photo._cache.has("uid-edited-1")).toBe(false);
+        expect(Photo._cache.has("uid-edited-2")).toBe(false);
+        // Entries outside the payload must survive.
+        expect(Photo._cache.has("uid-edited-keep")).toBe(true);
+      });
+
+      it("ignores empty-string entries in archived/restored payloads", async () => {
+        seedCache("uid-keep-empty", {});
+
+        $event.publish("photos.archived", { entities: ["", "uid-keep-empty"] });
+        await flushEvents();
+        // The non-empty string evicts; the empty one is skipped (a
+        // malformed-payload guard, not a silent no-op for valid data).
+        expect(Photo._cache.has("uid-keep-empty")).toBe(false);
+      });
+
+      // Regression for the edit-then-navigate-back scenario where the
+      // sidebar lost its editable affordances after Photo.findCached
+      // returned a hydrated Photo without nested Details. Root cause:
+      // PublishPhotoEvent serializes search.Photos results, which carry
+      // DetailsKeywords / DetailsSubject / etc. as flat top-level fields
+      // and omit the nested Details object that GET /photos/:uid emits.
+      // refreshIfPresent silently overwrote the cached snapshot with the
+      // partial shape, so the next findCached() hydrated a Photo with
+      // Details === undefined and the sidebar's isEditable computed
+      // collapsed to false. The fix is to evict on photos.updated and
+      // let the next read repopulate from the field-complete endpoint.
+      it("must not overwrite the cached snapshot with the partial search-shape WS payload", async () => {
+        // Seed the cache with what /photos/:uid would have returned: a
+        // Photo containing the nested Details object the sidebar reads.
+        const fullEntity = new Photo({
+          UID: "uid-shape-bug",
+          Title: "Edited",
+          Details: { Subject: "Sunrise", Keywords: "kw" },
+        });
+        Photo._cache.set("uid-shape-bug", fullEntity);
+        expect(Photo._cache.has("uid-shape-bug")).toBe(true);
+
+        // Simulate the actual WS payload PublishPhotoEvent emits — flat
+        // DetailsKeywords / DetailsSubject and NO nested Details.
+        $event.publish("photos.updated", {
+          entities: [
+            {
+              UID: "uid-shape-bug",
+              Title: "Edited",
+              DetailsKeywords: "kw",
+              DetailsSubject: "Sunrise",
+            },
+          ],
+        });
+        await flushEvents();
+
+        // The cached entry must be gone — otherwise the next findCached()
+        // returns a Photo without Details and the sidebar disables editing.
+        expect(Photo._cache.has("uid-shape-bug")).toBe(false);
+      });
+
+      it("tolerates malformed payloads on every channel", async () => {
+        seedCache("uid-keep", {});
+
+        // Each subscribed channel runs the same guard, so malformed
+        // payloads on any of them must leave the cache untouched.
+        ["photos.created", "photos.updated", "photos.deleted", "photos.archived", "photos.restored"].forEach((ev) => {
+          $event.publish(ev, null);
+          $event.publish(ev, {});
+          $event.publish(ev, { entities: "not-an-array" });
+          $event.publish(ev, { entities: [null, { Title: "no uid" }, 0, false, undefined] });
+        });
+        await flushEvents();
+
+        expect(Photo._cache.has("uid-keep")).toBe(true);
+      });
+
+      // photos.created flows through the same subscribeEntityActions
+      // helper as the other mutation verbs. The cache doesn't usually
+      // hold a brand-new UID (the indexer creates it fresh), but if a
+      // call site has seeded one — e.g. an upsert flow where the UID
+      // already exists in cache — the WS event must evict it so the
+      // next read returns the post-create state instead of a stale
+      // snapshot.
+      it("evicts cached entries when photos.created arrives for a known UID", async () => {
+        seedCache("uid-created", { Title: "Pre-create" });
+
+        $event.publish("photos.created", { entities: ["uid-created"] });
+        await flushEvents();
+
+        expect(Photo._cache.has("uid-created")).toBe(false);
+      });
+
+      // Forward-compat: a hypothetical new mutation verb (e.g.
+      // "merged") would auto-evict if added to ENTITY_MUTATIONS in
+      // common/event.js. Until then it must be a no-op so unrelated
+      // future events on the photos namespace don't pull the cache
+      // out from under live consumers.
+      it("ignores photos.* events whose action is not in ENTITY_MUTATIONS", async () => {
+        seedCache("uid-merged", { Title: "Keep" });
+
+        $event.publish("photos.merged", { entities: ["uid-merged"] });
+        $event.publish("photos.viewed", { entities: ["uid-merged"] });
+        await flushEvents();
+
+        expect(Photo._cache.has("uid-merged")).toBe(true);
+      });
+    });
+
+    describe("post-logout race", () => {
+      // Concrete repro of the spec Open Question #1 race: a fetch
+      // that started under the previous role must NOT repopulate
+      // the cache after Photo.clearCache() (called from
+      // Session.reset()) has already wiped it. Without the epoch
+      // gate on ModelCache, the resolved Promise's .then chain
+      // would call set() under the original key and seed data
+      // fetched for role A into role B's session.
+      it("findCached resolving after clearCache() rejects so callers discard the stale value", async () => {
+        let resolveFind;
+        const findSpy = vi.spyOn(Photo.prototype, "find").mockImplementation(
+          () =>
+            new Promise((res) => {
+              resolveFind = res;
+            })
+        );
+
+        // Issue the fetch — equivalent to a sidebar open under role A.
+        const inFlight = Photo.findCached("uid-race");
+
+        // flush microtasks so the loader is actually invoked.
+        await Promise.resolve();
+
+        // Logout / role change happens while the request is in flight.
+        Photo.clearCache();
+        expect(Photo._cache.size()).toBe(0);
+
+        // The previous session's response finally lands.
+        resolveFind(new Photo({ UID: "uid-race", Title: "Leaked" }));
+
+        // The promise REJECTS so a caller chain like
+        //   Photo.findCached(uid).then(p => this.photo = p)
+        // never fires its .then with stale role-A data — and the
+        // cache stays empty so the next read under the new role
+        // reissues the request.
+        await expect(inFlight).rejects.toThrow(/stale fetch/i);
+        expect(Photo._cache.has("uid-race")).toBe(false);
+        expect(Photo._cache.size()).toBe(0);
+
+        findSpy.mockRestore();
+      });
+
+      it("findCached re-seeds the cache normally after clearCache() advanced the epoch", async () => {
+        let resolveStale;
+        const findSpy = vi.spyOn(Photo.prototype, "find").mockImplementationOnce(
+          () =>
+            new Promise((res) => {
+              resolveStale = res;
+            })
+        );
+
+        const stale = Photo.findCached("uid-after-clear");
+        await Promise.resolve();
+        Photo.clearCache();
+
+        // A fresh fetch under the new epoch should populate the cache
+        // even if the stale loader resolves later.
+        findSpy.mockResolvedValueOnce(new Photo({ UID: "uid-after-clear", Title: "Fresh" }));
+        const fresh = Photo.findCached("uid-after-clear");
+
+        // The stale fetch rejects (epoch mismatch); the fresh one
+        // runs under the new epoch and resolves cleanly.
+        resolveStale(new Photo({ UID: "uid-after-clear", Title: "Stale" }));
+        await expect(stale).rejects.toThrow(/stale fetch/i);
+        const result = await fresh;
+
+        expect(result.Title).toBe("Fresh");
+        expect(Photo._cache.has("uid-after-clear")).toBe(true);
+        expect(Photo._cache.size()).toBe(1);
+
+        findSpy.mockRestore();
+      });
+    });
+
+    describe("mutators no longer pre-evict the cache", () => {
+      // Verifies the websocket-driven design: the cached entry survives the
+      // local mutation request itself; the next photos.updated event is what
+      // refreshes it. The HTTP requests are fire-and-forget here — only some
+      // are mocked in fixtures.js, but the cache invariant holds regardless
+      // of whether the request resolves or rejects.
+      it.each([
+        ["toggleLike", (p) => p.toggleLike()],
+        ["togglePrivate", (p) => p.togglePrivate()],
+        ["like", (p) => p.like()],
+        ["unlike", (p) => p.unlike()],
+        ["update", (p) => p.update()],
+      ])("%s leaves the cached entry in place", (_name, run) => {
+        const photo = new Photo({ UID: "pqbemz8276mhtobh", Title: "Cached" });
+        seedCache("pqbemz8276mhtobh", photo.getValues(false));
+
+        // Swallow rejections from unmocked endpoints; the cache state is what
+        // we care about, not the API result.
+        Promise.resolve(run(photo)).catch(() => {});
+
+        expect(Photo._cache.has("pqbemz8276mhtobh")).toBe(true);
+      });
+    });
+
+    describe("prefetchAround", () => {
+      // Lightweight slide stand-ins. prefetchAround only reads UID; the
+      // actual fetch is mocked at Photo.prototype.find.
+      const slides = [{ UID: "uid-prev" }, { UID: "uid-curr" }, { UID: "uid-next-1" }, { UID: "uid-next-2" }];
+
+      it("warms the cache for slides forward of `index` by default", async () => {
+        const findSpy = vi.spyOn(Photo.prototype, "find").mockImplementation(function () {
+          return Promise.resolve(this);
+        });
+
+        await Photo.prefetchAround(slides, 1);
+
+        const calledUids = findSpy.mock.calls.map((c) => c[0]);
+        expect(calledUids).toContain("uid-next-1");
+        expect(calledUids).not.toContain("uid-curr");
+        expect(calledUids).not.toContain("uid-prev");
+        expect(calledUids).not.toContain("uid-next-2");
+
+        findSpy.mockRestore();
+      });
+
+      it("respects the {before, after} window when supplied", async () => {
+        const findSpy = vi.spyOn(Photo.prototype, "find").mockImplementation(function () {
+          return Promise.resolve(this);
+        });
+
+        await Photo.prefetchAround(slides, 1, { before: 1, after: 2 });
+
+        const calledUids = findSpy.mock.calls.map((c) => c[0]);
+        expect(calledUids).toContain("uid-prev");
+        expect(calledUids).toContain("uid-next-1");
+        expect(calledUids).toContain("uid-next-2");
+        expect(calledUids).not.toContain("uid-curr");
+
+        findSpy.mockRestore();
+      });
+
+      it("does nothing when models is empty or index is invalid", async () => {
+        const findSpy = vi.spyOn(Photo.prototype, "find");
+
+        await Photo.prefetchAround([], 0);
+        await Photo.prefetchAround(null, 0);
+        await Photo.prefetchAround(slides, -1);
+        await Photo.prefetchAround(slides, "not-a-number");
+
+        expect(findSpy).not.toHaveBeenCalled();
+
+        findSpy.mockRestore();
+      });
+
+      it("absorbs rejected prefetch loaders without throwing", async () => {
+        vi.spyOn(Photo.prototype, "find").mockRejectedValue(new Error("offline"));
+
+        await expect(Photo.prefetchAround(slides, 1)).resolves.toBeDefined();
+
+        Photo.prototype.find.mockRestore();
+      });
+    });
+  });
+});

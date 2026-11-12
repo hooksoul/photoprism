@@ -1,10 +1,18 @@
 package form
 
 import (
+	"net/http"
+	"net/http/httptest"
+	"net/url"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
+
+	"github.com/gin-gonic/gin"
+	"github.com/gin-gonic/gin/binding"
+
+	"github.com/photoprism/photoprism/pkg/txt"
 )
 
 func TestSearchPhotosForm(t *testing.T) {
@@ -14,7 +22,7 @@ func TestSearchPhotosForm(t *testing.T) {
 }
 
 func TestParseQueryString(t *testing.T) {
-	t.Run("subjects", func(t *testing.T) {
+	t.Run("Subjects", func(t *testing.T) {
 		form := &SearchPhotos{Query: "subjects:\"Jens & Mander\""}
 
 		err := form.ParseQueryString()
@@ -25,7 +33,19 @@ func TestParseQueryString(t *testing.T) {
 
 		assert.Equal(t, "Jens & Mander", form.Subjects)
 	})
-	t.Run("aliases", func(t *testing.T) {
+	t.Run("Subject", func(t *testing.T) {
+		form := &SearchPhotos{Query: "subject:\"Jens\""}
+
+		err := form.ParseQueryString()
+
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		assert.Equal(t, "Jens", form.Subject)
+		assert.Equal(t, "", form.Person)
+	})
+	t.Run("Aliases", func(t *testing.T) {
 		form := &SearchPhotos{Query: "people:\"Jens & Mander\" folder:Foo person:Bar"}
 
 		err := form.ParseQueryString()
@@ -40,7 +60,7 @@ func TestParseQueryString(t *testing.T) {
 		assert.Equal(t, "Bar", form.Subject)
 		assert.Equal(t, "Jens & Mander", form.Subjects)
 	})
-	t.Run("keywords", func(t *testing.T) {
+	t.Run("Keywords", func(t *testing.T) {
 		form := &SearchPhotos{Query: "keywords:\"Foo Bar\""}
 
 		err := form.ParseQueryString()
@@ -51,7 +71,7 @@ func TestParseQueryString(t *testing.T) {
 
 		assert.Equal(t, "Foo Bar", form.Keywords)
 	})
-	t.Run("and query", func(t *testing.T) {
+	t.Run("AndQuery", func(t *testing.T) {
 		form := &SearchPhotos{Query: "\"Jens & Mander\" title:\"Tübingen\""}
 
 		err := form.ParseQueryString()
@@ -64,7 +84,7 @@ func TestParseQueryString(t *testing.T) {
 		assert.Equal(t, "jens & mander", form.GetQuery())
 		assert.Equal(t, "Tübingen", form.Title)
 	})
-	t.Run("path", func(t *testing.T) {
+	t.Run("Path", func(t *testing.T) {
 		form := &SearchPhotos{Query: "path:123abc/,EFG"}
 
 		err := form.ParseQueryString()
@@ -77,8 +97,7 @@ func TestParseQueryString(t *testing.T) {
 
 		assert.Equal(t, "123abc/,EFG", form.Path)
 	})
-
-	t.Run("folder", func(t *testing.T) {
+	t.Run("Folder", func(t *testing.T) {
 		form := &SearchPhotos{Query: "folder:123abc/,EFG"}
 
 		err := form.ParseQueryString()
@@ -91,7 +110,7 @@ func TestParseQueryString(t *testing.T) {
 
 		assert.Equal(t, "123abc/,EFG", form.Path)
 	})
-	t.Run("valid query", func(t *testing.T) {
+	t.Run("ValidQuery", func(t *testing.T) {
 		form := &SearchPhotos{Query: "label:cat q:\"fooBar baz\" before:2019-01-15 camera:23 favorite:false dist:25000 lat:33.45343166666667"}
 
 		err := form.ParseQueryString()
@@ -106,11 +125,11 @@ func TestParseQueryString(t *testing.T) {
 		assert.Equal(t, "fooBar baz", form.Query)
 		assert.Equal(t, "23", form.Camera)
 		assert.Equal(t, time.Date(2019, 01, 15, 0, 0, 0, 0, time.UTC), form.Before)
-		assert.Equal(t, false, form.Favorite)
-		assert.Equal(t, uint(0x61a8), form.Dist)
-		assert.Equal(t, float32(33.45343), form.Lat)
+		assert.Equal(t, "false", form.Favorite)
+		assert.Equal(t, float64(25000), form.Dist)
+		assert.Equal(t, 33.45343166666667, form.Lat)
 	})
-	t.Run("valid query 2", func(t *testing.T) {
+	t.Run("ValidQueryTwo", func(t *testing.T) {
 		form := &SearchPhotos{Query: "chroma:200 title:\"te:st\" after:2018-01-15 favorite:true lng:33.45343166666667"}
 
 		err := form.ParseQueryString()
@@ -124,9 +143,9 @@ func TestParseQueryString(t *testing.T) {
 		assert.Equal(t, int16(200), form.Chroma)
 		assert.Equal(t, "te:st", form.Title)
 		assert.Equal(t, time.Date(2018, 01, 15, 0, 0, 0, 0, time.UTC), form.After)
-		assert.Equal(t, float32(33.45343), form.Lng)
+		assert.Equal(t, 33.45343166666667, form.Lng)
 	})
-	t.Run("valid query with filter", func(t *testing.T) {
+	t.Run("ValidQueryWithFilter", func(t *testing.T) {
 		form := &SearchPhotos{Query: "label:cat title:\"fooBar baz\"", Filter: "label:dog"}
 
 		err := form.ParseQueryString()
@@ -141,7 +160,7 @@ func TestParseQueryString(t *testing.T) {
 		assert.Equal(t, "label:dog", form.Filter)
 		assert.Equal(t, "fooBar baz", form.Title)
 	})
-	t.Run("valid query with umlauts", func(t *testing.T) {
+	t.Run("ValidQueryWithUmlauts", func(t *testing.T) {
 		form := &SearchPhotos{Query: "title:\"tübingen\""}
 
 		err := form.ParseQueryString()
@@ -154,7 +173,7 @@ func TestParseQueryString(t *testing.T) {
 
 		assert.Equal(t, "tübingen", form.Title)
 	})
-	t.Run("query for invalid filter", func(t *testing.T) {
+	t.Run("QueryForInvalidFilter", func(t *testing.T) {
 		form := &SearchPhotos{Query: "xxx:false"}
 
 		err := form.ParseQueryString()
@@ -167,7 +186,7 @@ func TestParseQueryString(t *testing.T) {
 
 		assert.Equal(t, "unknown filter: xxx", err.Error())
 	})
-	t.Run("query for favorites with uncommon bool value", func(t *testing.T) {
+	t.Run("QueryForFavoritesWithUncommonBoolValue", func(t *testing.T) {
 		form := &SearchPhotos{Query: "favorite:cat"}
 
 		err := form.ParseQueryString()
@@ -176,9 +195,9 @@ func TestParseQueryString(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		assert.True(t, form.Favorite)
+		assert.Equal(t, "cat", form.Favorite)
 	})
-	t.Run("query for primary with uncommon bool value", func(t *testing.T) {
+	t.Run("QueryForPrimaryWithUncommonBoolValue", func(t *testing.T) {
 		form := &SearchPhotos{Query: "primary:&cat"}
 
 		err := form.ParseQueryString()
@@ -189,7 +208,7 @@ func TestParseQueryString(t *testing.T) {
 
 		assert.True(t, form.Primary)
 	})
-	t.Run("query for stack with uncommon bool value", func(t *testing.T) {
+	t.Run("QueryForStackWithUncommonBoolValue", func(t *testing.T) {
 		form := &SearchPhotos{Query: "stack:*cat"}
 
 		err := form.ParseQueryString()
@@ -200,7 +219,7 @@ func TestParseQueryString(t *testing.T) {
 
 		assert.True(t, form.Stack)
 	})
-	t.Run("query for unstacked with uncommon bool value", func(t *testing.T) {
+	t.Run("QueryForUnstackedWithUncommonBoolValue", func(t *testing.T) {
 		form := &SearchPhotos{Query: "unstacked:'cat"}
 
 		err := form.ParseQueryString()
@@ -211,7 +230,7 @@ func TestParseQueryString(t *testing.T) {
 
 		assert.True(t, form.Unstacked)
 	})
-	t.Run("query for stackable with uncommon bool value", func(t *testing.T) {
+	t.Run("QueryForStackableWithUncommonBoolValue", func(t *testing.T) {
 		form := &SearchPhotos{Query: "stackable:mother's day"}
 
 		err := form.ParseQueryString()
@@ -222,7 +241,7 @@ func TestParseQueryString(t *testing.T) {
 
 		assert.True(t, form.Stackable)
 	})
-	t.Run("query for video with uncommon bool value", func(t *testing.T) {
+	t.Run("QueryForVideoWithUncommonBoolValue", func(t *testing.T) {
 		form := &SearchPhotos{Query: "video:|cat"}
 
 		err := form.ParseQueryString()
@@ -255,7 +274,7 @@ func TestParseQueryString(t *testing.T) {
 		assert.False(t, form.Animated)
 		assert.True(t, form.Vector)
 	})
-	t.Run("query for photo with uncommon bool value", func(t *testing.T) {
+	t.Run("QueryForPhotoWithUncommonBoolValue", func(t *testing.T) {
 		form := &SearchPhotos{Query: "photo:cat>"}
 
 		err := form.ParseQueryString()
@@ -266,7 +285,7 @@ func TestParseQueryString(t *testing.T) {
 
 		assert.True(t, form.Photo)
 	})
-	t.Run("query for raw with uncommon bool value", func(t *testing.T) {
+	t.Run("QueryForRawWithUncommonBoolValue", func(t *testing.T) {
 		form := &SearchPhotos{Query: "raw:ca+(t"}
 
 		err := form.ParseQueryString()
@@ -277,7 +296,7 @@ func TestParseQueryString(t *testing.T) {
 
 		assert.True(t, form.Raw)
 	})
-	t.Run("query for live with uncommon bool value", func(t *testing.T) {
+	t.Run("QueryForLiveWithUncommonBoolValue", func(t *testing.T) {
 		form := &SearchPhotos{Query: "live:cat"}
 
 		err := form.ParseQueryString()
@@ -288,7 +307,7 @@ func TestParseQueryString(t *testing.T) {
 
 		assert.True(t, form.Live)
 	})
-	t.Run("query for scan with uncommon bool value", func(t *testing.T) {
+	t.Run("QueryForScanWithUncommonBoolValue", func(t *testing.T) {
 		form := &SearchPhotos{Query: "scan:;cat"}
 
 		err := form.ParseQueryString()
@@ -297,9 +316,9 @@ func TestParseQueryString(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		assert.True(t, form.Scan)
+		assert.Equal(t, ";cat", form.Scan)
 	})
-	t.Run("query for panorama with uncommon bool value", func(t *testing.T) {
+	t.Run("QueryForPanoramaWithUncommonBoolValue", func(t *testing.T) {
 		form := &SearchPhotos{Query: "panorama:*cat"}
 
 		err := form.ParseQueryString()
@@ -310,7 +329,7 @@ func TestParseQueryString(t *testing.T) {
 
 		assert.True(t, form.Panorama)
 	})
-	t.Run("query for error with uncommon bool value", func(t *testing.T) {
+	t.Run("QueryForErrorWithUncommonBoolValue", func(t *testing.T) {
 		form := &SearchPhotos{Query: "error:^cat$#"}
 
 		err := form.ParseQueryString()
@@ -321,7 +340,7 @@ func TestParseQueryString(t *testing.T) {
 
 		assert.True(t, form.Error)
 	})
-	t.Run("query for hidden with uncommon bool value", func(t *testing.T) {
+	t.Run("QueryForHiddenWithUncommonBoolValue", func(t *testing.T) {
 		form := &SearchPhotos{Query: "hidden:*cat"}
 
 		err := form.ParseQueryString()
@@ -332,7 +351,7 @@ func TestParseQueryString(t *testing.T) {
 
 		assert.True(t, form.Hidden)
 	})
-	t.Run("query for archived with uncommon bool value", func(t *testing.T) {
+	t.Run("QueryForArchivedWithUncommonBoolValue", func(t *testing.T) {
 		form := &SearchPhotos{Query: "archived:`cat"}
 
 		err := form.ParseQueryString()
@@ -343,7 +362,7 @@ func TestParseQueryString(t *testing.T) {
 
 		assert.True(t, form.Archived)
 	})
-	t.Run("query for public with uncommon bool value", func(t *testing.T) {
+	t.Run("QueryForPublicWithUncommonBoolValue", func(t *testing.T) {
 		form := &SearchPhotos{Query: "public:*cat"}
 
 		err := form.ParseQueryString()
@@ -354,7 +373,7 @@ func TestParseQueryString(t *testing.T) {
 
 		assert.True(t, form.Public)
 	})
-	t.Run("query for private with uncommon bool value", func(t *testing.T) {
+	t.Run("QueryForPrivateWithUncommonBoolValue", func(t *testing.T) {
 		form := &SearchPhotos{Query: "private:*c@t"}
 
 		err := form.ParseQueryString()
@@ -365,7 +384,7 @@ func TestParseQueryString(t *testing.T) {
 
 		assert.True(t, form.Private)
 	})
-	t.Run("query for unsorted with uncommon bool value", func(t *testing.T) {
+	t.Run("QueryForUnsortedWithUncommonBoolValue", func(t *testing.T) {
 		form := &SearchPhotos{Query: "unsorted:*cat"}
 
 		err := form.ParseQueryString()
@@ -376,7 +395,7 @@ func TestParseQueryString(t *testing.T) {
 
 		assert.True(t, form.Unsorted)
 	})
-	t.Run("query for mono with uncommon bool value", func(t *testing.T) {
+	t.Run("QueryForMonoWithUncommonBoolValue", func(t *testing.T) {
 		form := &SearchPhotos{Query: "mono:*cat"}
 
 		err := form.ParseQueryString()
@@ -387,7 +406,7 @@ func TestParseQueryString(t *testing.T) {
 
 		assert.True(t, form.Mono)
 	})
-	t.Run("query for portrait with uncommon bool value", func(t *testing.T) {
+	t.Run("QueryForPortraitWithUncommonBoolValue", func(t *testing.T) {
 		form := &SearchPhotos{Query: "portrait:*cat"}
 
 		err := form.ParseQueryString()
@@ -417,7 +436,7 @@ func TestParseQueryString(t *testing.T) {
 		assert.True(t, form.Square)
 		assert.False(t, form.Panorama)
 	})
-	t.Run("query for geo with uncommon bool value", func(t *testing.T) {
+	t.Run("QueryForGeoWithUncommonBoolValue", func(t *testing.T) {
 		form := &SearchPhotos{Query: "geo:*cat"}
 
 		err := form.ParseQueryString()
@@ -426,9 +445,10 @@ func TestParseQueryString(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		assert.True(t, form.Geo)
+		assert.Equal(t, "*cat", form.Geo)
+		assert.False(t, txt.No(form.Geo))
 	})
-	t.Run("query for review with uncommon bool value", func(t *testing.T) {
+	t.Run("QueryForReviewWithUncommonBoolValue", func(t *testing.T) {
 		form := &SearchPhotos{Query: "review:*cat"}
 
 		err := form.ParseQueryString()
@@ -439,14 +459,14 @@ func TestParseQueryString(t *testing.T) {
 
 		assert.True(t, form.Review)
 	})
-	t.Run("query for merged with uncommon bool value", func(t *testing.T) {
+	t.Run("QueryForMergedWithUncommonBoolValue", func(t *testing.T) {
 		form := &SearchPhotos{Query: "merged:*cat"}
 
 		err := form.ParseQueryString()
 
 		assert.Error(t, err)
 	})
-	t.Run("query for landscape with uncommon bool value", func(t *testing.T) {
+	t.Run("QueryForLandscapeWithUncommonBoolValue", func(t *testing.T) {
 		form := &SearchPhotos{Query: "landscape:test$5123"}
 
 		err := form.ParseQueryString()
@@ -457,7 +477,7 @@ func TestParseQueryString(t *testing.T) {
 
 		assert.True(t, form.Landscape)
 	})
-	t.Run("query for square with uncommon bool value", func(t *testing.T) {
+	t.Run("QueryForSquareWithUncommonBoolValue", func(t *testing.T) {
 		form := &SearchPhotos{Query: "square:%abc"}
 
 		err := form.ParseQueryString()
@@ -468,7 +488,7 @@ func TestParseQueryString(t *testing.T) {
 
 		assert.True(t, form.Square)
 	})
-	t.Run("query for animated with uncommon bool value", func(t *testing.T) {
+	t.Run("QueryForAnimatedWithUncommonBoolValue", func(t *testing.T) {
 		form := &SearchPhotos{Query: "animated:%abc"}
 
 		err := form.ParseQueryString()
@@ -479,7 +499,7 @@ func TestParseQueryString(t *testing.T) {
 
 		assert.True(t, form.Animated)
 	})
-	t.Run("query for vector with uncommon bool value", func(t *testing.T) {
+	t.Run("QueryForVectorWithUncommonBoolValue", func(t *testing.T) {
 		form := &SearchPhotos{Query: "vector:%abc"}
 
 		err := form.ParseQueryString()
@@ -490,7 +510,7 @@ func TestParseQueryString(t *testing.T) {
 
 		assert.True(t, form.Vector)
 	})
-	t.Run("query for lat with invalid type", func(t *testing.T) {
+	t.Run("QueryForLatWithInvalidType", func(t *testing.T) {
 		form := &SearchPhotos{Query: "lat:&cat"}
 
 		err := form.ParseQueryString()
@@ -503,7 +523,7 @@ func TestParseQueryString(t *testing.T) {
 
 		assert.Contains(t, err.Error(), "invalid syntax")
 	})
-	t.Run("query for lng with invalid type", func(t *testing.T) {
+	t.Run("QueryForLngWithInvalidType", func(t *testing.T) {
 		form := &SearchPhotos{Query: "lng:^>cat"}
 
 		err := form.ParseQueryString()
@@ -516,7 +536,7 @@ func TestParseQueryString(t *testing.T) {
 
 		assert.Contains(t, err.Error(), "invalid syntax")
 	})
-	t.Run("query for dist with invalid type", func(t *testing.T) {
+	t.Run("QueryForDistWithInvalidType", func(t *testing.T) {
 		form := &SearchPhotos{Query: "dist:c@t"}
 
 		err := form.ParseQueryString()
@@ -529,33 +549,26 @@ func TestParseQueryString(t *testing.T) {
 
 		assert.Contains(t, err.Error(), "invalid syntax")
 	})
-	t.Run("query for fmin with invalid type", func(t *testing.T) {
-		form := &SearchPhotos{Query: "fmin:=}cat{"}
+	t.Run("QueryForFWithInvalidType", func(t *testing.T) {
+		form := &SearchPhotos{Query: "f:=}cat{"}
 
 		err := form.ParseQueryString()
 
-		if err == nil {
+		if err != nil {
 			t.Fatal(err)
 		}
 
-		// log.Debugf("%+v\n", form)
-
-		assert.Contains(t, err.Error(), "invalid syntax")
 	})
-	t.Run("query for fmax with invalid type", func(t *testing.T) {
-		form := &SearchPhotos{Query: "fmax:ca#$t"}
+	t.Run("QueryForFWithInvalidType", func(t *testing.T) {
+		form := &SearchPhotos{Query: "f:ca#$t"}
 
 		err := form.ParseQueryString()
 
-		if err == nil {
+		if err != nil {
 			t.Fatal(err)
 		}
-
-		// log.Debugf("%+v\n", form)
-
-		assert.Contains(t, err.Error(), "invalid syntax")
 	})
-	t.Run("query for chroma with invalid type", func(t *testing.T) {
+	t.Run("QueryForChromaWithInvalidType", func(t *testing.T) {
 		form := &SearchPhotos{Query: "chroma:&|cat"}
 
 		err := form.ParseQueryString()
@@ -568,7 +581,7 @@ func TestParseQueryString(t *testing.T) {
 
 		assert.Contains(t, err.Error(), "invalid syntax")
 	})
-	t.Run("query for diff with invalid type", func(t *testing.T) {
+	t.Run("QueryForDiffWithInvalidType", func(t *testing.T) {
 		form := &SearchPhotos{Query: "diff:&cat;%"}
 
 		err := form.ParseQueryString()
@@ -581,7 +594,7 @@ func TestParseQueryString(t *testing.T) {
 
 		assert.Contains(t, err.Error(), "invalid syntax")
 	})
-	t.Run("query for quality with invalid type", func(t *testing.T) {
+	t.Run("QueryForQualityWithInvalidType", func(t *testing.T) {
 		form := &SearchPhotos{Query: "quality:`cat"}
 
 		err := form.ParseQueryString()
@@ -594,14 +607,14 @@ func TestParseQueryString(t *testing.T) {
 
 		assert.Contains(t, err.Error(), "invalid syntax")
 	})
-	t.Run("query for count with invalid type", func(t *testing.T) {
+	t.Run("QueryForCountWithInvalidType", func(t *testing.T) {
 		form := &SearchPhotos{Query: "dist:ca(%t"}
 
 		err := form.ParseQueryString()
 
 		assert.Error(t, err)
 	})
-	t.Run("query for offset with invalid type", func(t *testing.T) {
+	t.Run("QueryForOffsetWithInvalidType", func(t *testing.T) {
 		form := &SearchPhotos{Query: "lat:&cat"}
 
 		err := form.ParseQueryString()
@@ -636,20 +649,42 @@ func TestParseQueryString(t *testing.T) {
 
 		assert.Equal(t, "cat", form.Lens)
 	})
-	t.Run("query for before with invalid type", func(t *testing.T) {
+	t.Run("Altitude", func(t *testing.T) {
+		form := &SearchPhotos{Query: "alt:200-500"}
+
+		err := form.ParseQueryString()
+
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		assert.Equal(t, "200-500", form.Alt)
+	})
+	t.Run("BeforeTime", func(t *testing.T) {
+		form := &SearchPhotos{Query: "before:time"}
+
+		err := form.ParseQueryString()
+
+		t.Logf("%s", form.Before)
+
+		if err != nil {
+			assert.Equal(t, "invalid before date", err.Error())
+		} else {
+			t.Fatal("'invalid before date' error expected")
+		}
+	})
+	t.Run("BeforeCat", func(t *testing.T) {
 		form := &SearchPhotos{Query: "before:cat"}
 
 		err := form.ParseQueryString()
 
-		if err == nil {
-			t.Fatal(err)
+		if err != nil {
+			assert.Equal(t, "invalid before date", err.Error())
+		} else {
+			t.Fatal("'invalid before date' error expected")
 		}
-
-		// log.Debugf("%+v\n", form)
-
-		assert.Equal(t, "Could not find format for \"cat\"", err.Error())
 	})
-	t.Run("query for after with invalid type", func(t *testing.T) {
+	t.Run("AfterCat", func(t *testing.T) {
 		form := &SearchPhotos{Query: "after:cat"}
 
 		err := form.ParseQueryString()
@@ -660,9 +695,9 @@ func TestParseQueryString(t *testing.T) {
 
 		// log.Debugf("%+v\n", form)
 
-		assert.Equal(t, "Could not find format for \"cat\"", err.Error())
+		assert.Equal(t, "invalid after date", err.Error())
 	})
-	t.Run("id", func(t *testing.T) {
+	t.Run("Id", func(t *testing.T) {
 		form := &SearchPhotos{Query: "id:\"ii3e4567-e89b-hdgtr\""}
 
 		err := form.ParseQueryString()
@@ -672,6 +707,68 @@ func TestParseQueryString(t *testing.T) {
 		}
 
 		assert.Equal(t, "ii3e4567-e89b-hdgtr", form.ID)
+	})
+	t.Run("Added", func(t *testing.T) {
+		form := &SearchPhotos{Query: "added:\"2022-01-02T13:04:05+01:00\""}
+
+		err := form.ParseQueryString()
+
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		assert.Equal(t, "2022-01-02 13:04:05 +0100 UTC+01:00", form.Added.String())
+		assert.Equal(t, "2022-01-02 12:04:05 +0000 UTC", form.Added.UTC().String())
+		assert.Equal(t, "2022-01-02T13:04:05+01:00", form.Added.Format(time.RFC3339))
+		assert.Equal(t, "2022-01-02T12:04:05Z", form.Added.UTC().Format(time.RFC3339))
+	})
+	t.Run("Updated", func(t *testing.T) {
+		form := &SearchPhotos{Query: "updated:\"2001-01-02 17:04:05\""}
+
+		err := form.ParseQueryString()
+
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		assert.Equal(t, "2001-01-02 17:04:05 +0000 UTC", form.Updated.String())
+		assert.Equal(t, "2001-01-02 17:04:05 +0000 UTC", form.Updated.UTC().String())
+		assert.Equal(t, "2001-01-02T17:04:05Z", form.Updated.Format(time.RFC3339))
+		assert.Equal(t, "2001-01-02T17:04:05Z", form.Updated.UTC().Format(time.RFC3339))
+	})
+	t.Run("MustBindWith", func(t *testing.T) {
+		form := &SearchPhotos{}
+
+		w := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(w)
+		u, err := url.Parse("https://www.photoprism.app/api/v1/photos?count=100&offset=0&order=added&added=2022-01-02T13:04:05-01:00&updated=2001-01-02T17:04:05Z&q=")
+
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		c.Request = &http.Request{
+			Header: make(http.Header),
+			URL:    u,
+		}
+
+		// Abort if request params are invalid.
+		if err = c.MustBindWith(form, binding.Form); err != nil {
+			t.Fatal(err)
+		}
+
+		err = form.ParseQueryString()
+
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		assert.Equal(t, "added", form.Order)
+		assert.Equal(t, "2022-01-02T13:04:05-01:00", form.Added.Format(time.RFC3339))
+		assert.Equal(t, "2022-01-02T14:04:05Z", form.Added.UTC().Format(time.RFC3339))
+		assert.Equal(t, "2001-01-02T17:04:05Z", form.Updated.Format(time.RFC3339))
+		assert.Equal(t, 100, form.Count)
+		assert.Equal(t, 0, form.Offset)
 	})
 }
 
@@ -784,5 +881,18 @@ func TestSearchPhotos_Unserialize(t *testing.T) {
 		assert.Equal(t, "foo.jpg", f.Name)
 		assert.Equal(t, "priqwb43p5dh7777", f.UID)
 		assert.Equal(t, "ariqwb43p5dh5555", f.Album)
+	})
+}
+
+func TestSearchPhotos_FindUidOnly(t *testing.T) {
+	t.Run("True", func(t *testing.T) {
+		f := &SearchPhotos{UID: "priqwb43p5dh7777"}
+
+		assert.True(t, f.FindUidOnly())
+	})
+	t.Run("False", func(t *testing.T) {
+		f := &SearchPhotos{Query: "label:cat", UID: "priqwb43p5dh7777"}
+
+		assert.False(t, f.FindUidOnly())
 	})
 }

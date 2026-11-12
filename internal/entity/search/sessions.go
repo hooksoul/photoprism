@@ -1,0 +1,100 @@
+package search
+
+import (
+	"fmt"
+	"strings"
+
+	"github.com/photoprism/photoprism/internal/entity"
+	"github.com/photoprism/photoprism/internal/entity/sortby"
+	"github.com/photoprism/photoprism/internal/form"
+	"github.com/photoprism/photoprism/pkg/clean"
+)
+
+// Sessions finds user sessions.
+func Sessions(frm form.SearchSessions) (result entity.Sessions, err error) {
+	result = entity.Sessions{}
+	stmt := Db()
+
+	// A filter value whose removed NUL bytes and invalid UTF-8 leave nothing usable matches nothing.
+	userUid, uidOk := clean.SearchFilter(frm.UID)
+	search, queryOk := clean.SearchFilter(frm.Query)
+	_, providerOk := clean.SearchFilter(frm.Provider)
+	_, methodOk := clean.SearchFilter(frm.Method)
+
+	if !uidOk || !queryOk || !providerOk || !methodOk {
+		return result, nil
+	}
+
+	userUid, search = strings.TrimSpace(userUid), strings.TrimSpace(search)
+
+	order := frm.Order
+	limit := frm.Count
+	offset := frm.Offset
+
+	// Limit maximum number of results.
+	if limit > MaxResults {
+		limit = MaxResults
+	}
+
+	// Set default sort order or use normalized order value.
+	if order == "" {
+		order = sortby.LastActive
+	} else {
+		order = clean.TypeLowerUnderscore(order)
+	}
+
+	// Filter by user UID?
+	if userUid != "" {
+		stmt = stmt.Where("user_uid = ?", userUid)
+	}
+
+	// Filter by username and/or auth provider name?
+	if search != "" && search != "all" {
+		like := clean.SqlLike(search) + "%"
+		stmt = stmt.Where(clean.SqlLikeAny(entity.DbDialect(), false, "user_name", "client_name"), like, like)
+	}
+
+	// Filter by authentication providers?
+	if frm.Provider != "" {
+		stmt = stmt.Where("auth_provider IN (?)", frm.AuthProviders())
+	}
+
+	// Filter by authentication methods?
+	if frm.Method != "" {
+		stmt = stmt.Where("auth_method IN (?)", frm.AuthMethods())
+	}
+
+	// Sort results?
+	switch order {
+	case sortby.LastActive:
+		stmt = stmt.Order(OrderExprNulls("last_active DESC, user_name, client_name, id", frm.Reverse))
+	case sortby.SessExpires:
+		stmt = stmt.Order(OrderExprNulls("sess_expires DESC, user_name, client_name, id", frm.Reverse))
+	case sortby.ClientName:
+		stmt = stmt.
+			Where("client_name <> '' AND client_name IS NOT NULL").
+			Order(OrderExpr("client_name, created_at, id", frm.Reverse))
+	case sortby.Login, sortby.LoginAt:
+		stmt = stmt.Order(OrderExprNulls("login_at DESC, user_name, client_name, id", frm.Reverse))
+	case sortby.Created, sortby.CreatedAt:
+		stmt = stmt.Order(OrderExprNulls("created_at ASC, user_name, client_name, id", frm.Reverse))
+	case sortby.Updated, sortby.UpdatedAt:
+		stmt = stmt.Order(OrderExprNulls("updated_at DESC, user_name, client_name, id", frm.Reverse))
+	default:
+		return result, fmt.Errorf("invalid sort order %s", order)
+	}
+
+	// Apply limit and offset.
+	if limit > 0 {
+		stmt = stmt.Limit(limit)
+
+		if offset > 0 {
+			stmt = stmt.Offset(offset)
+		}
+	}
+
+	// Perform query.
+	err = stmt.Find(&result).Error
+
+	return result, err
+}

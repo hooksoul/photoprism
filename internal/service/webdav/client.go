@@ -1,0 +1,784 @@
+package webdav
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"net/url"
+	"os"
+	"path"
+	"path/filepath"
+	"runtime/debug"
+	"strings"
+	"time"
+
+	"github.com/emersion/go-webdav"
+
+	"github.com/photoprism/photoprism/internal/service"
+	"github.com/photoprism/photoprism/pkg/clean"
+	"github.com/photoprism/photoprism/pkg/fs"
+	"github.com/photoprism/photoprism/pkg/http/safe"
+	"github.com/photoprism/photoprism/pkg/rnd"
+)
+
+// ErrSkipPath identifies a path excluded by the transfer policy without a remote failure.
+var ErrSkipPath = errors.New("webdav: transfer path skipped")
+
+// ErrForbidden identifies a transfer the remote server refused with 403 Forbidden.
+var ErrForbidden = errors.New("forbidden")
+
+// ErrUnavailable identifies an upload that failed because of the remote server rather than the file: a failed
+// connection, a redirect, a server error, or a response such as 401, 407, 408 or 429.
+var ErrUnavailable = errors.New("unavailable")
+
+// ErrStalled identifies a transfer that ended because too little data moved.
+var ErrStalled = errors.New("stalled")
+
+// ErrUnsafePath identifies a path with a parent-directory segment. It is reported as a failure
+// rather than a skip, so a queued transfer is not recorded as benignly ignored.
+var ErrUnsafePath = errors.New("webdav: transfer path contains a parent directory")
+
+// checkTransferPath returns ErrSkipPath for an excluded path and ErrUnsafePath for one with a
+// parent-directory segment. The exclusion is checked first, so a reserved name that also contains
+// one keeps reporting a skip.
+func checkTransferPath(name string) error {
+	if SkipSyncPath(name) {
+		return ErrSkipPath
+	} else if isUnsafePath(name) {
+		return ErrUnsafePath
+	}
+
+	return nil
+}
+
+// Client represents a webdav client.
+type Client struct {
+	client        *webdav.Client
+	http          *http.Client
+	ctx           context.Context
+	endpoint      *url.URL
+	timeout       time.Duration
+	mkdir         map[string]bool
+	cidrs         []*net.IPNet
+	downloadLimit int64
+}
+
+// SetDownloadLimit bounds the size of a single downloaded file in bytes; a value
+// of zero or less leaves downloads unbounded. The remote endpoint is a separate
+// trust domain, so this caps how much one response can write to local storage —
+// files above the configured originals limit are rejected by the indexer anyway.
+func (c *Client) SetDownloadLimit(maxBytes int64) {
+	if c == nil {
+		return
+	}
+
+	c.downloadLimit = maxBytes
+}
+
+// CheckDownloadSize returns an error if size exceeds the download limit, where a size of zero or less is unknown.
+func (c *Client) CheckDownloadSize(dest string, size int64) error {
+	if c == nil || c.downloadLimit <= 0 || size <= c.downloadLimit {
+		return nil
+	}
+
+	// The name is bounded so the reason after it survives clipping.
+	return fmt.Errorf("webdav: %s exceeds the maximum size of %d bytes", clean.LogBytes(path.Base(dest), clean.LogNamesBytes), c.downloadLimit)
+}
+
+// clientUrl returns the validated server url including username and password, if specified.
+func clientUrl(serverUrl, user, pass string) (*url.URL, error) {
+	result, err := safe.URL(serverUrl)
+
+	if err != nil {
+		return nil, err
+	}
+
+	// Set user and password if provided.
+	if user != "" {
+		result.User = url.UserPassword(user, pass)
+	}
+
+	return result, nil
+}
+
+// newTransferHTTPClient returns an HTTP client with connection-level safeguards but no total transfer deadline.
+func newTransferHTTPClient(cidrs []*net.IPNet) *http.Client {
+	client := service.NewHTTPClient(0, cidrs)
+	transport, ok := client.Transport.(*http.Transport)
+
+	if !ok || transport == nil {
+		return client
+	}
+
+	transport = transport.Clone()
+
+	if baseDial := transport.DialContext; baseDial != nil {
+		transport.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+			if transferConnectTimeout > 0 {
+				var cancel context.CancelFunc
+				ctx, cancel = context.WithTimeout(ctx, transferConnectTimeout)
+				defer cancel()
+			}
+
+			return baseDial(ctx, network, addr)
+		}
+	}
+
+	transport.TLSHandshakeTimeout = transferTLSHandshakeTimeout
+	transport.IdleConnTimeout = transferIdleConnTimeout
+	transport.ExpectContinueTimeout = transferExpectContinueTimeout
+	client.Transport = transport
+
+	return client
+}
+
+// NewClient creates a new WebDAV client for the specified endpoint.
+func NewClient(serverUrl, user, pass string, timeout Timeout, servicesCIDR string) (*Client, error) {
+	endpoint, err := clientUrl(serverUrl, user, pass)
+
+	if err != nil {
+		return nil, err
+	}
+
+	allowedCIDRs, err := service.ParseCIDRs(servicesCIDR)
+
+	if err != nil {
+		return nil, err
+	}
+
+	if validateErr := service.ValidateURLHost(endpoint, allowedCIDRs, 5*time.Second); validateErr != nil {
+		return nil, validateErr
+	}
+
+	serverUrl = endpoint.String()
+
+	// The endpoint carries the configured account credentials, which the transport needs and a log
+	// line does not.
+	log.Debugf("webdav: connecting to %s", clean.Log(clean.UriRedacted(serverUrl)))
+
+	transfer := newTransferHTTPClient(allowedCIDRs)
+	client, err := webdav.NewClient(transfer, serverUrl)
+
+	if err != nil {
+		return nil, err
+	}
+
+	// Create a new webdav.Client wrapper.
+	result := &Client{
+		client:   client,
+		http:     transfer,
+		ctx:      context.Background(),
+		endpoint: endpoint,
+		timeout:  Durations[timeout],
+		mkdir:    make(map[string]bool, 128),
+		cidrs:    allowedCIDRs,
+	}
+
+	return result, nil
+}
+
+// withTimeout returns a *webdav.Client with specified total request time.
+func (c *Client) withTimeout(timeout time.Duration) *webdav.Client {
+	if timeout < 0 {
+		return c.client
+	} else if timeout == 0 {
+		timeout = c.timeout
+	}
+
+	// Create webdav client with the specified total request time.
+	client, err := webdav.NewClient(service.NewHTTPClient(timeout, c.cidrs), c.endpoint.String())
+
+	if err != nil {
+		return c.client
+	}
+
+	return client
+}
+
+// effectiveTimeout returns the effective request timeout used by WebDAV calls.
+func (c *Client) effectiveTimeout(timeout time.Duration) time.Duration {
+	if timeout < 0 {
+		return -1
+	} else if timeout == 0 {
+		return c.timeout
+	}
+
+	return timeout
+}
+
+// timeoutContext returns a request context bounded by the configured timeout when applicable, and by
+// MaxRequestDuration when the configured timeout is none.
+func (c *Client) timeoutContext(timeout time.Duration) (context.Context, context.CancelFunc) {
+	switch timeout = c.effectiveTimeout(timeout); {
+	case timeout > 0:
+		return context.WithTimeout(c.ctx, timeout)
+	case timeout == 0:
+		return context.WithTimeout(c.ctx, MaxRequestDuration)
+	}
+
+	return c.ctx, func() {}
+}
+
+// timeoutRequest returns a timeout-aware client and context for outbound WebDAV calls.
+func (c *Client) timeoutRequest(timeout time.Duration) (*webdav.Client, context.Context, context.CancelFunc) {
+	ctx, cancel := c.timeoutContext(timeout)
+	return c.withTimeout(timeout), ctx, cancel
+}
+
+// readDirPath returns an absolute WebDAV collection path rooted at the configured endpoint.
+func (c *Client) readDirPath(dir string) string {
+	basePath := c.endpoint.Path
+
+	if basePath == "" {
+		basePath = "/"
+	} else if !strings.HasSuffix(basePath, "/") {
+		basePath += "/"
+	}
+
+	if dir = trimPath(dir); dir != "" {
+		return strings.TrimRight(basePath, "/") + "/" + dir + "/"
+	}
+
+	return basePath
+}
+
+// readDirContext returns the contents of the specified directory using the provided request context.
+func (c *Client) readDirContext(ctx context.Context, dir string, recursive bool, timeout time.Duration) ([]webdav.FileInfo, error) {
+	dir = c.readDirPath(dir)
+	return c.withTimeout(timeout).ReadDir(ctx, dir, recursive)
+}
+
+// appendUniqueEntries adds new WebDAV entries only once while preserving response order.
+func appendUniqueEntries(result []webdav.FileInfo, found []webdav.FileInfo, seen map[string]bool) []webdav.FileInfo {
+	for _, entry := range found {
+		entryPath := trimPath(entry.Path)
+
+		if seen[entryPath] {
+			continue
+		}
+
+		seen[entryPath] = true
+		result = append(result, entry)
+	}
+
+	return result
+}
+
+// appendTraversalDirs adds unseen child directories from a non-recursive PROPFIND response to the queue, with
+// paths relative to the endpoint path, which the server includes in the paths it returns.
+func appendTraversalDirs(queue []string, current, endpoint string, found []webdav.FileInfo, seen map[string]bool) []string {
+	current = trimPath(current)
+
+	for _, entry := range found {
+		if !entry.IsDir {
+			continue
+		}
+
+		entryPath := trimPath(fs.RelName(trimPath(entry.Path), trimPath(endpoint)))
+
+		if entryPath == "" || entryPath == current || isHiddenPath(entryPath) || isUnsafePath(entry.Path) || seen[entryPath] {
+			continue
+		}
+
+		seen[entryPath] = true
+		queue = append(queue, entryPath)
+	}
+
+	return queue
+}
+
+// readDirFallback traverses directories with repeated non-recursive PROPFIND requests.
+func (c *Client) readDirFallback(ctx context.Context, dir string, timeout time.Duration) (result []webdav.FileInfo, requests int, err error) {
+	queue := []string{trimPath(dir)}
+	traversed := map[string]bool{trimPath(dir): true}
+	seenEntries := map[string]bool{}
+
+	for len(queue) > 0 {
+		current := queue[0]
+		queue = queue[1:]
+		requests++
+
+		found, readErr := c.readDirContext(ctx, current, false, timeout)
+
+		if readErr != nil {
+			return result, requests, readErr
+		}
+
+		result = appendUniqueEntries(result, found, seenEntries)
+		queue = appendTraversalDirs(queue, current, c.endpoint.Path, found, traversed)
+	}
+
+	return result, requests, nil
+}
+
+// Files returns information about files in a directory, optionally recursively.
+func (c *Client) Files(dir string, recursive bool) (result fs.FileInfos, err error) {
+	if SkipSyncPath(dir) {
+		return nil, nil
+	} else if isUnsafePath(dir) {
+		return nil, ErrUnsafePath
+	}
+
+	defer func() {
+		if r := recover(); r != nil {
+			log.Errorf("webdav: %s (panic while listing files in %s)", clean.Log(fmt.Sprint(r)), clean.Log(dir))
+			log.Debugf("webdav: stack of the panic while listing files in %s: %s", clean.Log(dir), debug.Stack())
+			err = fmt.Errorf("webdav: failed to list files in %s (unexpected error)", clean.LogBytes(dir, clean.LogNamesBytes))
+		}
+	}()
+
+	dir = trimPath(dir)
+	ctx, cancel := c.timeoutContext(0)
+	defer cancel()
+
+	found, err := c.readDirContext(ctx, dir, recursive, 0)
+
+	if err != nil {
+		return result, err
+	}
+
+	result = make(fs.FileInfos, 0, len(found))
+
+	for _, f := range found {
+		if f.IsDir || f.Path == "" || isUnsafePath(f.Path) {
+			continue
+		}
+
+		info := fs.WebFileInfo(f, c.endpoint.Path)
+		if SkipSyncPath(info.Abs) {
+			continue
+		}
+
+		result = append(result, info)
+	}
+
+	return result, nil
+}
+
+// Directories returns all subdirectories in a path and falls back to iterative Depth: 1 traversal when needed.
+func (c *Client) Directories(dir string, recursive bool, timeout time.Duration) (result fs.FileInfos, err error) {
+	if SkipSyncPath(dir) {
+		return nil, nil
+	} else if isUnsafePath(dir) {
+		return nil, ErrUnsafePath
+	}
+
+	dir = trimPath(dir)
+	ctx, cancel := c.timeoutContext(timeout)
+	defer cancel()
+
+	found, err := c.readDirContext(ctx, dir, recursive, timeout)
+
+	if err != nil && recursive {
+		started := time.Now()
+
+		if fallback, requests, fallbackErr := c.readDirFallback(ctx, dir, timeout); fallbackErr == nil {
+			log.Infof("webdav: recursive PROPFIND failed for %s, using iterative Depth: 1 fallback after %d requests [%s] (%s)", clean.Log(path.Join("/", dir)), requests, time.Since(started).Round(time.Millisecond), clean.Error(err))
+			found = fallback
+			err = nil
+		} else {
+			log.Warnf("webdav: recursive PROPFIND failed for %s (%s)", clean.Log(path.Join("/", dir)), clean.Error(err))
+			log.Debugf("webdav: Depth: 1 fallback failed for %s after %d requests [%s] (%s)", clean.Log(path.Join("/", dir)), requests, time.Since(started).Round(time.Millisecond), clean.Error(fallbackErr))
+		}
+	}
+
+	if err != nil {
+		return result, err
+	}
+
+	result = make(fs.FileInfos, 0, len(found))
+
+	for _, f := range found {
+		if !f.IsDir || f.Path == "" || isUnsafePath(f.Path) {
+			continue
+		}
+
+		info := fs.WebFileInfo(f, c.endpoint.Path)
+
+		if SkipSyncPath(info.Abs) {
+			continue
+		}
+
+		result = append(result, info)
+	}
+
+	return result, err
+}
+
+// MkdirAll recursively creates remote directories.
+func (c *Client) MkdirAll(dir string) (err error) {
+	if err = checkTransferPath(dir); err != nil {
+		return err
+	}
+
+	folders := splitPath(dir)
+
+	if len(folders) == 0 {
+		return nil
+	}
+
+	dir = ""
+
+	for _, folder := range folders {
+		dir = path.Join(dir, folder)
+		err = c.Mkdir(dir)
+	}
+
+	return err
+}
+
+// Mkdir creates a single remote directory.
+func (c *Client) Mkdir(dir string) error {
+	if err := checkTransferPath(dir); err != nil {
+		return err
+	}
+
+	dir = trimPath(dir)
+
+	if dir == "" || dir == "." || dir == ".." {
+		// Ignore.
+		return nil
+	} else if c.mkdir[dir] {
+		// Dir was already created.
+		return nil
+	}
+
+	c.mkdir[dir] = true
+	client, ctx, cancel := c.timeoutRequest(0)
+	defer cancel()
+
+	err := client.Mkdir(ctx, dir)
+
+	if err == nil {
+		return nil
+	} else if strings.Contains(err.Error(), "already exists") {
+		return nil
+	}
+
+	return err
+}
+
+// Upload uploads a single file to the remote server.
+func (c *Client) Upload(src, dest string) (err error) {
+	if err = checkTransferPath(dest); err != nil {
+		return err
+	}
+
+	defer func() {
+		if r := recover(); r != nil {
+			log.Errorf("webdav: %s (panic while uploading %s)", clean.Log(fmt.Sprint(r)), clean.Log(dest))
+			log.Debugf("webdav: stack of the panic while uploading %s: %s", clean.Log(dest), debug.Stack())
+			err = fmt.Errorf("webdav: failed to upload %s (unexpected error)", clean.LogBytes(dest, clean.LogNamesBytes))
+		}
+	}()
+
+	dest = trimPath(dest)
+
+	if !fs.FileExists(src) {
+		return fmt.Errorf("file %s not found", clean.LogBytes(path.Base(src), clean.LogNamesBytes))
+	}
+
+	f, err := os.OpenFile(src, os.O_RDONLY, 0) //nolint:gosec // path provided by caller; read-only
+
+	if err != nil {
+		log.Errorf("webdav: %s", clean.Error(err))
+		return fmt.Errorf("webdav: failed to read %s", clean.Log(path.Base(src)))
+	}
+
+	defer func() {
+		if closeErr := f.Close(); closeErr != nil {
+			log.Debugf("webdav: %s (close source file)", clean.Error(closeErr))
+		}
+	}()
+
+	// The request ends when too little data moves, and the wait for the response grows with the file size.
+	var size int64
+
+	if info, statErr := f.Stat(); statErr == nil {
+		size = info.Size()
+	}
+
+	watch := newStallWatch(c.ctx, transferStallTimeout)
+	defer watch.Stop()
+
+	// The deferred Close owns the file, as the client would otherwise close the request body.
+	body := watch.Reader(f, func() time.Duration { return responseWait(size) })
+	req, err := http.NewRequestWithContext(watch.Context(), http.MethodPut, c.resolveHref(dest).String(), io.NopCloser(body))
+
+	if err != nil {
+		log.Errorf("webdav: %s", clean.Error(err))
+		return fmt.Errorf("webdav: failed to write %s", clean.Log(dest))
+	}
+
+	if size > 0 {
+		req.ContentLength = size
+	}
+
+	resp, err := c.http.Do(req)
+
+	if err != nil && watch.Stalled() {
+		return fmt.Errorf("webdav: failed to upload %s (%w)", clean.LogBytes(dest, clean.LogNamesBytes), ErrStalled)
+	} else if err != nil {
+		log.Errorf("webdav: %s", clean.Error(err))
+		return fmt.Errorf("webdav: failed to upload %s (%w)", clean.Log(dest), ErrUnavailable)
+	}
+
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
+	_ = resp.Body.Close()
+
+	switch {
+	case resp.Request != nil && resp.Request.Method != http.MethodPut:
+		// The client follows 301, 302, and 303 with a GET, whose status does not report the upload.
+		return fmt.Errorf("webdav: failed to upload %s (redirected, %w)", clean.LogBytes(dest, clean.LogNamesBytes), ErrUnavailable)
+	case resp.StatusCode == http.StatusForbidden:
+		return fmt.Errorf("webdav: failed to upload %s (%w)", clean.LogBytes(dest, clean.LogNamesBytes), ErrForbidden)
+	case resp.StatusCode/100 != 2 && uploadUnavailable(resp.StatusCode):
+		return fmt.Errorf("webdav: failed to upload %s (%d %s, %w)", clean.LogBytes(dest, clean.LogNamesBytes),
+			resp.StatusCode, http.StatusText(resp.StatusCode), ErrUnavailable)
+	case resp.StatusCode/100 != 2:
+		return fmt.Errorf("webdav: failed to upload %s (%d %s)", clean.LogBytes(dest, clean.LogNamesBytes), resp.StatusCode, http.StatusText(resp.StatusCode))
+	}
+
+	return nil
+}
+
+// uploadUnavailable reports whether an upload response status says the remote server cannot take uploads at all,
+// rather than that it refused the file.
+func uploadUnavailable(status int) bool {
+	switch status {
+	case http.StatusUnauthorized, http.StatusProxyAuthRequired, http.StatusRequestTimeout, http.StatusTooManyRequests:
+		return true
+	default:
+		return status/100 == 3 || status >= 500
+	}
+}
+
+// resolveHref returns the absolute URL of a path relative to the endpoint, including its credentials.
+func (c *Client) resolveHref(name string) *url.URL {
+	base := c.endpoint.Path
+
+	if base == "" {
+		base = "/"
+	}
+
+	return &url.URL{Scheme: c.endpoint.Scheme, User: c.endpoint.User, Host: c.endpoint.Host, Path: path.Join(base, name)}
+}
+
+// Download downloads a single file to the given location.
+func (c *Client) Download(src, dest string, force bool) (err error) {
+	if err = checkTransferPath(src); err != nil {
+		return err
+	}
+
+	defer func() {
+		if r := recover(); r != nil {
+			log.Errorf("webdav: %s (panic while downloading %s)", clean.Log(fmt.Sprint(r)), clean.Log(src))
+			log.Debugf("webdav: stack of the panic while downloading %s: %s", clean.Log(src), debug.Stack())
+			err = fmt.Errorf("webdav: unexpected error while downloading %s", clean.Log(src))
+		}
+	}()
+
+	src = trimPath(src)
+
+	// Skip if file already exists.
+	if fs.Exists(dest) && !force {
+		return fmt.Errorf("webdav: download skipped, %s already exists: %w", clean.Log(dest), os.ErrExist)
+	}
+
+	dir := path.Dir(dest)
+	dirInfo, err := fs.Stat(dir)
+
+	if err != nil {
+		// Create local storage path.
+		if err = fs.MkdirAll(dir); err != nil {
+			return fmt.Errorf("webdav: cannot create folder %s (%s)", clean.LogBytes(dir, clean.LogNamesBytes), clean.Error(err))
+		}
+	} else if !dirInfo.IsDir() {
+		return fmt.Errorf("webdav: %s is not a folder", clean.LogBytes(dir, clean.LogNamesBytes))
+	}
+
+	// The download ends when too little data moves, including the wait for the response.
+	watch := newStallWatch(c.ctx, transferStallTimeout)
+	defer watch.Stop()
+
+	var reader io.ReadCloser
+	// Start download.
+	reader, err = c.client.Open(watch.Context(), src)
+
+	// Error?
+	if err != nil && watch.Stalled() {
+		return fmt.Errorf("webdav: failed to download %s (%w)", clean.LogBytes(src, clean.LogNamesBytes), ErrStalled)
+	} else if err != nil {
+		log.Errorf("webdav: %s", clean.Error(err))
+		return fmt.Errorf("webdav: failed to download %s", clean.Log(src))
+	}
+
+	defer func() {
+		if closeErr := reader.Close(); closeErr != nil {
+			log.Debugf("webdav: %s (close source stream)", clean.Error(closeErr))
+		}
+	}()
+
+	// The bytes go to a temporary sibling this call creates exclusively, and only the publish step
+	// below touches the destination.
+	sink := tempSink(dest)
+
+	f, err := os.OpenFile(sink, os.O_WRONLY|os.O_CREATE|os.O_EXCL, fs.ModeFile) //nolint:gosec // dest provided by caller
+
+	if err != nil {
+		log.Errorf("webdav: %s", clean.Error(err))
+		return fmt.Errorf("webdav: failed to create %s", clean.Log(path.Base(dest)))
+	}
+
+	// Remove the file this call created unless it completes, so every way out - including a panic -
+	// leaves the destination as it was found.
+	committed := false
+
+	defer func() {
+		if committed {
+			return
+		}
+
+		_ = f.Close()
+		_ = os.Remove(sink)
+	}()
+
+	// Keep the mode a replaced destination already had, so it is not widened by the staging file.
+	if info, statErr := os.Stat(dest); statErr == nil {
+		_ = f.Chmod(info.Mode().Perm())
+	}
+
+	if c.downloadLimit > 0 {
+		// Read one byte past the limit so an exact-size overflow is detected
+		// instead of being silently truncated into a corrupt local file.
+		if n, copyErr := io.Copy(f, io.LimitReader(watch.Reader(reader, nil), c.downloadLimit+1)); copyErr != nil {
+			err = copyErr
+		} else if sizeErr := c.CheckDownloadSize(dest, n); sizeErr != nil {
+			return sizeErr
+		}
+	} else {
+		_, err = f.ReadFrom(watch.Reader(reader, nil))
+	}
+
+	if err != nil && watch.Stalled() {
+		return fmt.Errorf("webdav: failed to download %s (%w)", clean.LogBytes(src, clean.LogNamesBytes), ErrStalled)
+	} else if err != nil {
+		log.Errorf("webdav: %s", clean.Error(err))
+		return fmt.Errorf("webdav: failed writing to %s", clean.Log(path.Base(dest)))
+	}
+
+	if closeErr := f.Close(); closeErr != nil {
+		log.Errorf("webdav: %s", clean.Error(closeErr))
+		return fmt.Errorf("webdav: failed to finalize %s", clean.Log(path.Base(dest)))
+	}
+
+	if err = publishSink(sink, dest, force); err != nil {
+		log.Errorf("webdav: %s", clean.Error(err))
+
+		if errors.Is(err, os.ErrExist) {
+			return fmt.Errorf("webdav: %s already exists: %w", clean.Log(path.Base(dest)), os.ErrExist)
+		}
+
+		return fmt.Errorf("webdav: failed to finalize %s", clean.Log(path.Base(dest)))
+	}
+
+	committed = true
+
+	return nil
+}
+
+// linkFile creates a hard link. A test replaces it to take the path of a filesystem that has none.
+var linkFile = os.Link
+
+// publishSink moves a staged download to its destination, and reports os.ErrExist when the name is
+// already taken and force is false.
+func publishSink(sink, dest string, force bool) error {
+	if force {
+		return os.Rename(sink, dest)
+	}
+
+	// The hard link is the check itself: it fails when the name is taken.
+	if err := linkFile(sink, dest); err == nil {
+		if rmErr := os.Remove(sink); rmErr != nil {
+			log.Debugf("webdav: %s (remove staging file)", clean.Error(rmErr))
+		}
+
+		return nil
+	} else if errors.Is(err, os.ErrExist) {
+		return err
+	}
+
+	// A filesystem that has no hard links is checked with a stat instead.
+	if _, err := os.Lstat(dest); err == nil {
+		return os.ErrExist
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+
+	return os.Rename(sink, dest)
+}
+
+// DownloadDir downloads all files from a remote to a local directory.
+func (c *Client) DownloadDir(src, dest string, recursive, force bool) (errs []error) {
+	src = trimPath(src)
+
+	files, err := c.Files(src, recursive)
+
+	if err != nil {
+		return append(errs, err)
+	}
+
+	for _, file := range files {
+		// Resolve the local destination safely so a crafted remote path cannot
+		// escape the download directory.
+		fileName, joinErr := fs.SafeJoin(dest, strings.TrimPrefix(file.Abs, "/"))
+
+		if joinErr != nil {
+			log.Warnf("webdav: skipped %s because its remote path is invalid", clean.Log(file.Abs))
+			errs = append(errs, joinErr)
+			continue
+		}
+
+		// Check if file already exists.
+		if fs.Exists(fileName) {
+			msg := fmt.Errorf("webdav: %s already exists", clean.Log(fileName))
+			log.Warn(msg)
+			errs = append(errs, msg)
+			continue
+		}
+
+		// Download file from remote server.
+		if err = c.Download(file.Abs, fileName, force); err != nil {
+			errs = append(errs, err)
+			continue
+		}
+	}
+
+	return errs
+}
+
+// Delete deletes a single file or directory on a remote server.
+func (c *Client) Delete(dir string) error {
+	if err := checkTransferPath(dir); err != nil {
+		return err
+	}
+
+	dir = trimPath(dir)
+	client, ctx, cancel := c.timeoutRequest(0)
+
+	defer cancel()
+
+	return client.RemoveAll(ctx, dir)
+}
+
+// tempSink returns a unique sibling path for staging a replacement, shortened when the added suffix
+// would push the name past the length a file name may have.
+func tempSink(dest string) string {
+	dir, base := filepath.Split(dest)
+	suffix := "." + rnd.Base36(8) + ".tmp"
+
+	return dir + fs.ClipName(base, fs.NameMaxLen-len(suffix)) + suffix
+}

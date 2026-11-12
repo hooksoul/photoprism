@@ -1,37 +1,20 @@
-/*
-
-Copyright (c) 2018 - 2023 PhotoPrism UG. All rights reserved.
-
-    This program is free software: you can redistribute it and/or modify
-    it under Version 3 of the GNU Affero General Public License (the "AGPL"):
-    <https://docs.photoprism.app/license/agpl>
-
-    This program is distributed in the hope that it will be useful,
-    but WITHOUT ANY WARRANTY; without even the implied warranty of
-    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-    GNU Affero General Public License for more details.
-
-    The AGPL is supplemented by our Trademark and Brand Guidelines,
-    which describe how our Brand Assets may be used:
-    <https://www.photoprism.app/trademark>
-
-Feel free to send an email to hello@photoprism.app if you have questions,
-want to support our work, or just want to say hello.
-
-Additional information can be found in our Developer Guide:
-<https://docs.photoprism.app/developer-guide/>
-
-*/
-
-import RestModel from "model/rest";
-import Api from "common/api";
+import $api from "common/api";
 import { DateTime } from "luxon";
-import { config } from "app/session";
-import { $gettext } from "common/vm";
+import { $config } from "app/session";
+import { $gettext } from "common/gettext";
+import Collection from "model/collection";
 
-export let BatchSize = 24;
+export let BatchSize = 180;
 
-export class Label extends RestModel {
+// MaxLength mirrors the backend setter clips in internal/entity/label.go.
+export const MaxLength = Object.freeze({
+  Name: 160,
+  Description: 2048,
+  Notes: 1024,
+});
+
+// Label models user-defined keywords and AI-generated tags.
+export class Label extends Collection {
   getDefaults() {
     return {
       ID: 0,
@@ -44,6 +27,8 @@ export class Label extends RestModel {
       Description: "",
       Notes: "",
       PhotoCount: 0,
+      Thumb: "",
+      ThumbSrc: "",
       CreatedAt: "",
       UpdatedAt: "",
       DeletedAt: "",
@@ -57,8 +42,12 @@ export class Label extends RestModel {
   classes(selected) {
     let classes = ["is-label", "uid-" + this.UID];
 
-    if (this.Favorite) classes.push("is-favorite");
-    if (selected) classes.push("is-selected");
+    if (this.Favorite) {
+      classes.push("is-favorite");
+    }
+    if (selected) {
+      classes.push("is-selected");
+    }
 
     return classes;
   }
@@ -67,17 +56,26 @@ export class Label extends RestModel {
     return this.Slug;
   }
 
+  // trimInputs strips whitespace from MaxLength string fields before save.
+  trimInputs() {
+    for (const key of Object.keys(MaxLength)) {
+      if (typeof this[key] === "string") {
+        this[key] = this[key].trim();
+      }
+    }
+  }
+
   getTitle() {
     return this.Name;
   }
 
   thumbnailUrl(size) {
     if (this.Thumb) {
-      return `${config.contentUri}/t/${this.Thumb}/${config.previewToken}/${size}`;
+      return `${$config.contentUri}/t/${this.Thumb}/${$config.previewToken}/${size}`;
     } else if (this.UID) {
-      return `${config.contentUri}/labels/${this.UID}/t/${config.previewToken}/${size}`;
+      return `${$config.contentUri}/labels/${this.UID}/t/${$config.previewToken}/${size}`;
     } else {
-      return `${config.contentUri}/svg/label`;
+      return `${$config.contentUri}/svg/label`;
     }
   }
 
@@ -89,20 +87,20 @@ export class Label extends RestModel {
     this.Favorite = !this.Favorite;
 
     if (this.Favorite) {
-      return Api.post(this.getEntityResource() + "/like");
+      return $api.post(this.getEntityResource() + "/like");
     } else {
-      return Api.delete(this.getEntityResource() + "/like");
+      return $api.delete(this.getEntityResource() + "/like");
     }
   }
 
   like() {
     this.Favorite = true;
-    return Api.post(this.getEntityResource() + "/like");
+    return $api.post(this.getEntityResource() + "/like");
   }
 
   unlike() {
     this.Favorite = false;
-    return Api.delete(this.getEntityResource() + "/like");
+    return $api.delete(this.getEntityResource() + "/like");
   }
 
   static batchSize() {

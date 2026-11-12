@@ -1,6 +1,6 @@
 /*
 
-Copyright (c) 2018 - 2023 PhotoPrism UG. All rights reserved.
+Copyright (c) 2018 - 2026 PhotoPrism UG. All rights reserved.
 
     This program is free software: you can redistribute it and/or modify
     it under Version 3 of the GNU Affero General Public License (the "AGPL"):
@@ -13,7 +13,7 @@ Copyright (c) 2018 - 2023 PhotoPrism UG. All rights reserved.
 
     The AGPL is supplemented by our Trademark and Brand Guidelines,
     which describe how our Brand Assets may be used:
-    <https://www.photoprism.app/trademark>
+    <https://www.photoprism.app/trademark/>
 
 Feel free to send an email to hello@photoprism.app if you have questions,
 want to support our work, or just want to say hello.
@@ -23,15 +23,34 @@ Additional information can be found in our Developer Guide:
 
 */
 
-import Api from "api.js";
-import Event from "pubsub-js";
+import $api from "common/api";
+import $event from "common/event";
 import * as themes from "options/themes";
-import translations from "locales/translations.json";
-import { Languages } from "options/options";
+import * as options from "options/options";
 import { Photo } from "model/photo";
 import { onInit, onSetTheme } from "common/hooks";
+import { ref, reactive } from "vue";
+import memoizeOne from "memoize-one";
+import { Info } from "luxon";
 
 onInit();
+
+// normalizeFrontendUri returns a normalized frontend base URI with a leading slash.
+const normalizeFrontendUri = (baseUri, frontendUri) => {
+  const fallbackUri = `${baseUri || ""}/library`;
+  const rawUri = typeof frontendUri === "string" && frontendUri.trim() !== "" ? frontendUri : fallbackUri;
+  const prefixedUri = rawUri.startsWith("/") ? rawUri : `/${rawUri}`;
+
+  return prefixedUri.replace(/\/+$/, "");
+};
+
+// frontendLoginUri returns the default login URI below the frontend base URI.
+const frontendLoginUri = (frontendUri) => {
+  return `${frontendUri.replace(/\/+$/, "")}/login`;
+};
+
+// schemeUriRegExp matches a leading URI scheme ("https:", "data:") so absolute references are left untouched.
+const schemeUriRegExp = /^[a-z][a-z0-9+.-]*:/i;
 
 export default class Config {
   /**
@@ -39,15 +58,15 @@ export default class Config {
    * @param {object} values
    */
   constructor(storage, values) {
-    this.disconnected = false;
+    this.disconnected = ref(false);
     this.storage = storage;
-    this.storage_key = "config";
+    this.storageKey = "config";
     this.previewToken = "";
     this.downloadToken = "";
     this.updating = false;
 
     this.$vuetify = null;
-    this.translations = translations;
+    this.translations = {};
 
     if (!values || !values.siteTitle) {
       // Omit warning in unit tests.
@@ -55,13 +74,19 @@ export default class Config {
         console.warn("config: values missing");
       }
 
+      const now = new Date();
+
       this.debug = true;
+      this.trace = false;
       this.test = true;
       this.demo = false;
+      this.version = `${now.getUTCFullYear().toString().substr(-2)}${now.getMonth() + 1}${now.getDate()}-TEST`;
+      this.theme = themes.Get("default");
       this.themeName = "";
       this.baseUri = "";
+      this.frontendUri = "/library";
       this.staticUri = "/static";
-      this.loginUri = "/library/login";
+      this.loginUri = frontendLoginUri(this.frontendUri);
       this.apiUri = "/api/v1";
       this.contentUri = this.apiUri;
       this.videoUri = this.apiUri;
@@ -76,8 +101,9 @@ export default class Config {
       return;
     } else {
       this.baseUri = values.baseUri ? values.baseUri : "";
+      this.frontendUri = normalizeFrontendUri(this.baseUri, values.frontendUri);
       this.staticUri = values.staticUri ? values.staticUri : this.baseUri + "/static";
-      this.loginUri = values.loginUri ? values.loginUri : this.baseUri + "/library/login";
+      this.loginUri = values.loginUri ? values.loginUri : frontendLoginUri(this.frontendUri);
       this.apiUri = values.apiUri ? values.apiUri : this.baseUri + "/api/v1";
       this.contentUri = values.contentUri ? values.contentUri : this.apiUri;
       this.videoUri = values.videoUri ? values.videoUri : this.apiUri;
@@ -101,28 +127,31 @@ export default class Config {
       }
     }
 
-    this.page = {
+    this.page = reactive({
       title: values.siteTitle,
       caption: values.siteCaption,
-    };
+    });
 
-    this.values = values;
+    this.values = reactive(values);
     this.debug = !!values.debug;
+    this.trace = !!values.trace;
     this.test = !!values.test;
     this.demo = !!values.demo;
+    this.version = values.version;
 
     this.updateTokens();
 
-    Event.subscribe("config.updated", (ev, data) => this.setValues(data.config));
-    Event.subscribe("config.tokens", (ev, data) => this.setTokens(data));
-    Event.subscribe("count", (ev, data) => this.onCount(ev, data));
-    Event.subscribe("people", (ev, data) => this.onPeople(ev, data));
+    $event.subscribe("config.updated", (ev, data) => this.setValues(data.config));
+    $event.subscribe("config.tokens", (ev, data) => this.setTokens(data));
+    $event.subscribe("count", (ev, data) => this.onCount(ev, data));
 
     if (this.has("settings")) {
       this.setTheme(this.get("settings").ui.theme);
     } else {
       this.setTheme("default");
     }
+
+    this.setReduceMotion(this.getSettings()?.ui.reduceMotion);
   }
 
   loading() {
@@ -142,7 +171,8 @@ export default class Config {
       return this.updating;
     }
 
-    this.updating = Api.get("config")
+    this.updating = $api
+      .get("config")
       .then(
         (resp) => {
           return this.setValues(resp.data);
@@ -157,15 +187,17 @@ export default class Config {
     return this.updating;
   }
 
-  setValues(values) {
-    if (!values) return;
-
-    if (this.debug) {
-      console.log("config: updated", values);
+  async setValues(values) {
+    if (!values || typeof values !== "object") {
+      return;
     }
 
-    if (values.jsUri && this.values.jsUri !== values.jsUri) {
-      Event.publish("dialog.reload", { values });
+    if (values.jsUri && values.mode === "user" && this.values.jsUri && this.values.jsUri !== values.jsUri) {
+      $event.publish("dialog.update", { values });
+    }
+
+    if (values.defaultLocale && options.DefaultLocale !== values.defaultLocale) {
+      options.SetDefaultLocale(values.defaultLocale);
     }
 
     for (let key in values) {
@@ -178,8 +210,9 @@ export default class Config {
 
     if (values.settings) {
       this.setBatchSize(values.settings);
-      this.setLanguage(values.settings.ui.language);
+      await this.setLanguage(this.getLanguageLocale(), true);
       this.setTheme(values.settings.ui.theme);
+      this.setReduceMotion(values.settings.ui.reduceMotion);
     }
 
     // Adjust album counts by access level.
@@ -199,80 +232,13 @@ export default class Config {
       return;
     }
 
-    if (settings.search.batchSize) {
+    if (settings?.search?.batchSize > 0) {
       Photo.setBatchSize(settings.search.batchSize);
     }
   }
 
-  onPeople(ev, data) {
-    const type = ev.split(".")[1];
-
-    if (this.debug) {
-      console.log(ev, data);
-    }
-
-    if (!this.values.people) {
-      this.values.people = [];
-    }
-
-    if (!data || !data.entities || !Array.isArray(data.entities)) {
-      return;
-    }
-
-    switch (type) {
-      case "created":
-        this.values.people.unshift(...data.entities);
-        break;
-      case "updated":
-        for (let i = 0; i < data.entities.length; i++) {
-          const values = data.entities[i];
-
-          this.values.people
-            .filter((m) => m.UID === values.UID)
-            .forEach((m) => {
-              for (let key in values) {
-                if (
-                  key !== "UID" &&
-                  values.hasOwnProperty(key) &&
-                  values[key] != null &&
-                  typeof values[key] !== "object"
-                ) {
-                  m[key] = values[key];
-                }
-              }
-            });
-        }
-        break;
-      case "deleted":
-        for (let i = 0; i < data.entities.length; i++) {
-          const index = this.values.people.findIndex((m) => m.UID === data.entities[i]);
-
-          if (index >= 0) {
-            this.values.people.splice(index, 1);
-          }
-        }
-        break;
-    }
-  }
-
-  getPerson(name) {
-    name = name.toLowerCase();
-
-    const result = this.values.people.filter((m) => m.Name.toLowerCase() === name);
-    const l = result ? result.length : 0;
-
-    if (l === 0) {
-      return null;
-    } else if (l === 1) {
-      return result[0];
-    } else {
-      if (this.debug) {
-        console.warn("more than one person having the same name", result);
-      }
-      return result[0];
-    }
-  }
-
+  // onCount updates the media type, location, people and other
+  // counters used e.g. in the expanded sidebar navigation.
   onCount(ev, data) {
     const type = ev.split(".")[1];
 
@@ -281,13 +247,29 @@ export default class Config {
         this.values.count.all += data.count;
         this.values.count.photos += data.count;
         break;
-      case "live":
+      case "animated":
         this.values.count.all += data.count;
-        this.values.count.live += data.count;
+        this.values.count.media += data.count;
+        this.values.count.animated += data.count;
         break;
       case "videos":
         this.values.count.all += data.count;
+        this.values.count.media += data.count;
         this.values.count.videos += data.count;
+        break;
+      case "live":
+        this.values.count.all += data.count;
+        this.values.count.media += data.count;
+        this.values.count.live += data.count;
+        break;
+      case "audio":
+        this.values.count.all += data.count;
+        this.values.count.media += data.count;
+        this.values.count.audio += data.count;
+        break;
+      case "documents":
+        this.values.count.all += data.count;
+        this.values.count.documents += data.count;
         break;
       case "cameras":
         this.values.count.cameras += data.count;
@@ -327,6 +309,12 @@ export default class Config {
       case "files":
         this.values.count.files += data.count;
         break;
+      case "hidden":
+        this.values.count.hidden += data.count;
+        break;
+      case "archived":
+        this.values.count.archived += data.count;
+        break;
       case "favorites":
         this.values.count.favorites += data.count;
         break;
@@ -345,39 +333,9 @@ export default class Config {
     this.values.count;
   }
 
+  // setVuetify sets a reference to the current Vuetify instance.
   setVuetify(instance) {
     this.$vuetify = instance;
-  }
-
-  setBodyTheme(name) {
-    if (!document || !document.body) {
-      return;
-    }
-    document.body.classList.forEach((c) => {
-      if (c.startsWith("theme-")) {
-        document.body.classList.remove(c);
-      }
-    });
-
-    document.body.classList.add("theme-" + name);
-  }
-
-  setColorMode(value) {
-    if (!document || !document.body) {
-      return;
-    }
-
-    const tags = document.getElementsByTagName("html");
-
-    if (tags && tags.length > 0) {
-      tags[0].setAttribute("data-color-mode", value);
-    }
-
-    if (value === "dark") {
-      document.body.classList.add("dark-theme");
-    } else {
-      document.body.classList.remove("dark-theme");
-    }
   }
 
   aclClasses(resource) {
@@ -385,7 +343,9 @@ export default class Config {
     const perms = ["update", "search", "manage", "share", "delete"];
 
     perms.forEach((perm) => {
-      if (this.deny(resource, perm)) result.push(`disable-${perm}`);
+      if (this.deny(resource, perm)) {
+        result.push(`disable-${perm}`);
+      }
     });
 
     return result;
@@ -430,72 +390,155 @@ export default class Config {
     return !this.allowAny(resource, perm);
   }
 
-  settings() {
-    return this.values.settings;
-  }
-
-  setSettings(settings) {
-    if (!settings) return;
-
-    if (this.debug) {
-      console.log("config: new settings", settings);
-    }
-
-    this.values.settings = settings;
-
-    this.setBatchSize(settings);
-    this.setLanguage(settings.ui.language);
-    this.setTheme(settings.ui.theme);
-
-    return this;
-  }
-
-  setLanguage(locale) {
-    if (!locale || this.loading()) {
+  // loadTranslation asynchronously loads the specified locale file.
+  async loadTranslation(locale) {
+    if (!locale || (this.translations && this.translations[locale])) {
       return;
     }
 
+    try {
+      // Dynamically import the translation JSON file, which the build emits as its own chunk.
+      await import(`../locales/json/${locale}.json`).then((module) => {
+        Object.assign(this.translations, module.default);
+      });
+    } catch (error) {
+      console.error(`failed to load translations for locale ${locale}:`, error);
+    }
+  }
+
+  // setLanguage sets the ISO/IEC 15897 locale,
+  // e.g. "en" or "zh_TW" (minimum 2 letters).
+  async setLanguage(locale, apply) {
+    // Skip setting language if no locale is specified.
+    if (!locale) {
+      return this;
+    }
+
+    // Apply locale to browser window?
+    if (apply) {
+      await this.loadTranslation(locale);
+
+      // Update the Accept-Language header for XHR requests.
+      if ($api) {
+        $api.defaults.headers.common["Accept-Language"] = locale;
+      }
+
+      // Update the language-specific attributes of the <html> and <body> elements.
+      if (document && document.body) {
+        const isRtl = this.isRtl(locale);
+
+        // Update <html> lang attribute and dir attribute to match the current locale.
+        document.documentElement.setAttribute("lang", locale);
+        document.documentElement.setAttribute("dir", this.dir(isRtl));
+
+        // Set body.is-rtl or .is-ltr, depending on the writing direction of the current locale.
+        if (isRtl) {
+          document.body.classList.add("is-rtl");
+          document.body.classList.remove("is-ltr");
+        } else {
+          document.body.classList.remove("is-rtl");
+          document.body.classList.add("is-ltr");
+        }
+      }
+    }
+
+    // Don't update the configuration settings if they haven't been loaded yet.
+    if (this.loading()) {
+      return this;
+    }
+
+    // Update the configuration settings and save them to namespaced storage.
     if (this.values.settings && this.values.settings.ui) {
       this.values.settings.ui.language = locale;
-      this.storage.setItem(this.storage_key + ".locale", locale);
-      Api.defaults.headers.common["Accept-Language"] = locale;
+      this.storage.setItem(this.storageKey + ".locale", locale);
     }
 
     return this;
   }
 
-  getLanguage() {
-    let locale = "en";
+  // getLanguageLocale returns the ISO/IEC 15897 locale, e.g. "en" or "zh_TW" (minimum 2 letters).
+  // While loading or with a ?locale= override, it is copied to settings.ui.language, which the language picker binds to.
+  getLanguageLocale() {
+    const loading = this.loading();
+    let locale = navigator?.language;
+    let mirror = loading;
 
-    if (this.loading()) {
-      const stored = this.storage.getItem(this.storage_key + ".locale");
-      if (stored) {
-        locale = stored;
+    // Override language locale with query parameter?
+    if (window.location?.search) {
+      const queryLocale = new URLSearchParams(window.location.search).get("locale");
+      if (queryLocale && queryLocale.length > 1 && queryLocale.length < 6) {
+        locale = options.FindLocale(queryLocale);
+        mirror = true;
+        this.storage.setItem(this.storageKey + ".locale", locale);
       }
-    } else if (
-      this.values.settings &&
-      this.values.settings.ui &&
-      this.values.settings.ui.language
-    ) {
+    }
+
+    // Get user locale from storage if settings have not yet been loaded from backend.
+    if (loading) {
+      locale = this.storage.getItem(this.storageKey + ".locale") || locale;
+    } else if (!mirror && this.values?.settings?.ui?.language) {
       locale = this.values.settings.ui.language;
+    }
+
+    // Find the best matching language locale that exists.
+    locale = options.FindLocale(locale);
+
+    if (mirror && this.values?.settings?.ui) {
+      this.values.settings.ui.language = locale;
     }
 
     return locale;
   }
 
+  // getLanguageCode returns the ISO 639-1 language code (2 letters),
+  // see https://www.loc.gov/standards/iso639-2/php/code_list.php.
+  getLanguageCode() {
+    return this.getLanguageLocale().substring(0, 2);
+  }
+
+  // getTimeZone returns the user time zone, or "Local" if none is set or the browser cannot resolve it.
+  getTimeZone() {
+    const zone = this.values?.settings?.ui?.timeZone;
+
+    if (typeof zone === "string" && zone !== "" && Info.normalizeZone(zone)?.isValid) {
+      return zone;
+    }
+
+    return "Local";
+  }
+
+  // isRtl returns true if a right-to-left language is currently used.
+  isRtl(locale) {
+    if (!locale) {
+      locale = this.getLanguageLocale();
+    }
+
+    return options.Languages().some((l) => l.value === locale && l.rtl);
+  }
+
+  // dir returns the user interface direction (for the current locale if no argument is given).
+  dir(isRtl) {
+    if (typeof isRtl === "undefined") {
+      isRtl = this.isRtl();
+    }
+
+    return isRtl ? "rtl" : "ltr";
+  }
+
+  // setTheme set the current UI theme based on the specified name.
   setTheme(name) {
     let theme = onSetTheme(name, this);
 
     if (!theme) {
       theme = themes.Get(name);
-      this.themeName = theme.name;
+      this.themeName = theme?.name;
     }
 
     if (this.values.settings && this.values.settings.ui) {
       this.values.settings.ui.theme = this.themeName;
     }
 
-    Event.publish("view.refresh", this);
+    $event.publish("view.refresh", this);
 
     this.theme = theme;
 
@@ -507,74 +550,253 @@ export default class Config {
       this.setColorMode("light");
     }
 
-    if (this.$vuetify) {
-      this.$vuetify.theme = this.theme.colors;
+    if (this.themeName && this.$vuetify) {
+      this.$vuetify.theme.name = this.themeName;
     }
 
     return this;
   }
 
+  // setBodyTheme updates the classes of the <body> element based on the specified theme name.
+  setBodyTheme(name) {
+    if (!document || !document.body) {
+      return;
+    }
+
+    document.body.classList.forEach((c) => {
+      if (c.startsWith("theme-")) {
+        document.body.classList.remove(c);
+      }
+    });
+
+    document.body.classList.add("theme-" + name);
+  }
+
+  // setColorMode updates the dark/light mode attributes of the <html> and <body> elements.
+  setColorMode(value) {
+    if (!document || !document.body) {
+      return;
+    }
+
+    if (document.documentElement) {
+      document.documentElement.setAttribute("data-color-mode", value);
+    }
+
+    if (value === "dark") {
+      document.body.classList.add("dark-theme");
+    } else {
+      document.body.classList.remove("dark-theme");
+    }
+  }
+
+  // setReduceMotion toggles the "reduce-motion" class on the <html> element so CSS can
+  // suppress interface animations and transitions when the accessibility setting is enabled.
+  setReduceMotion(enabled) {
+    if (document && document.documentElement) {
+      document.documentElement.classList.toggle("reduce-motion", !!enabled);
+    }
+
+    return this;
+  }
+
+  // getSettings returns the current user's configuration settings.
+  getSettings() {
+    return this.values.settings;
+  }
+
+  // setSettings updates the current user's configuration settings
+  // and then changes the UI language and theme as needed.
+  setSettings(settings) {
+    if (!settings) {
+      return;
+    }
+
+    if (this.debug) {
+      console.log("config: new settings", settings);
+    }
+
+    this.values.settings = settings;
+
+    this.setBatchSize(settings);
+    this.setLanguage(settings.ui.language, false);
+    this.setTheme(settings.ui.theme);
+    this.setReduceMotion(settings.ui.reduceMotion);
+
+    return this;
+  }
+
+  // getDefaultRoute returns the default route to use after login or in case of routing errors.
+  getDefaultRoute() {
+    if (this.isPortal()) {
+      return "cluster";
+    }
+
+    const albumsRoute = "albums";
+    const browseRoute = "browse";
+    const settingsRoute = "settings";
+
+    let defaultRoute;
+
+    if (this.deny("photos", "access_library") || !this.feature("search")) {
+      if (this.deny("albums", "view") || !this.feature("albums")) {
+        defaultRoute = settingsRoute;
+      } else {
+        defaultRoute = albumsRoute;
+      }
+    } else {
+      defaultRoute = browseRoute;
+    }
+
+    if (defaultRoute !== settingsRoute && this.allow("settings", "update")) {
+      const features = this.getSettings()?.features;
+      const startPage = this.getSettings()?.ui?.startPage;
+
+      if (features && typeof features === "object" && startPage && typeof startPage === "string") {
+        switch (startPage) {
+          case "browse":
+            return defaultRoute;
+          case "albums":
+            return features.albums ? startPage : defaultRoute;
+          case "photos":
+            return features.albums ? startPage : defaultRoute;
+          case "videos":
+            return features.library ? startPage : defaultRoute;
+          case "people":
+            return features.people && features.edit ? startPage : defaultRoute;
+          case "favorites":
+            return features.favorites ? startPage : defaultRoute;
+          case "places":
+            return features.places ? startPage : defaultRoute;
+          case "calendar":
+            return features.calendar ? startPage : defaultRoute;
+          case "moments":
+            return features.moments ? startPage : defaultRoute;
+          case "labels":
+            return features.labels ? startPage : defaultRoute;
+          case "folders":
+            return features.folders ? startPage : defaultRoute;
+          case "settings":
+            return features.settings ? startPage : defaultRoute;
+          default:
+            return defaultRoute;
+        }
+      }
+    }
+
+    return defaultRoute;
+  }
+
+  // getValues returns all client configuration values as exposed by the backend.
   getValues() {
     return this.values;
   }
 
+  // storeValues saves the current configuration values in storage.
   storeValues() {
-    this.storage.setItem(this.storage_key, JSON.stringify(this.getValues()));
+    this.storage.setItem(this.storageKey, JSON.stringify(this.getValues()));
     return this;
   }
 
+  // restoreValues restores the configuration values from storage.
   restoreValues() {
-    const json = this.storage.getItem(this.storage_key);
+    const json = this.storage.getItem(this.storageKey);
     if (json !== "undefined") {
       this.setValues(JSON.parse(json));
     }
     return this;
   }
 
+  // set updates a top-level config value.
   set(key, value) {
     this.values[key] = value;
     return this;
   }
 
+  // has checks if the specified top-level config value exists.
   has(key) {
     return !!this.values[key];
   }
 
+  // get returns a top-level config value.
   get(key) {
     return this.values[key];
   }
 
+  // featDevelop checks if features under development should be enabled.
+  featDevelop() {
+    return this.values?.develop === true;
+  }
+
+  // featExperimental checks if new features that may be incomplete or unstable should be enabled.
+  featExperimental() {
+    return this.values?.experimental === true;
+  }
+
+  // featPreview checks if features available for preview should be enabled.
+  featPreview() {
+    return this.featDevelop() || this.featExperimental();
+  }
+
+  // feature checks a single feature flag by name and returns true if it is set.
   feature(name) {
     return this.values.settings.features[name] === true;
   }
 
-  rtl() {
-    if (!this.values || !this.values.settings || !this.values.settings.ui.language) {
-      return false;
-    }
-
-    return Languages().some((lang) => lang.value === this.values.settings.ui.language && lang.rtl);
+  // featOAuthApps checks if users can connect apps with OAuth sign-in and consent.
+  featOAuthApps() {
+    return this.values?.oauthApps === true;
   }
 
+  // featAppPasswords checks if app passwords (app-specific passwords) are enabled.
+  featAppPasswords() {
+    return this.feature("appPasswords");
+  }
+
+  // filesQuotaReached returns true if the filesystem quota is reached or exceeded.
+  filesQuotaReached() {
+    return Boolean(this.values?.usage?.filesUsedPct >= 100);
+  }
+
+  // storageLow returns true if the storage folder is almost full.
+  storageLow() {
+    return Boolean(this.values?.usage?.storageLow);
+  }
+
+  // insufficientStorage returns true if the filesystem quota is reached or the storage folder is almost full.
+  insufficientStorage() {
+    return this.storageLow() || this.filesQuotaReached();
+  }
+
+  // setTokens sets the security tokens required to load thumbnails and download files from the server.
   setTokens(tokens) {
-    if (!tokens || !tokens.previewToken || !tokens.downloadToken) {
+    if (!tokens || typeof tokens !== "object") {
       return;
     }
-    this.previewToken = tokens.previewToken;
-    this.values.previewToken = tokens.previewToken;
-    this.downloadToken = tokens.downloadToken;
-    this.values.downloadToken = tokens.downloadToken;
+
+    if (tokens.previewToken && this.values?.previewToken !== tokens.previewToken) {
+      this.values.previewToken = tokens.previewToken;
+    }
+
+    if (tokens.downloadToken && this.values?.downloadToken !== tokens.downloadToken) {
+      this.values.downloadToken = tokens.downloadToken;
+    }
+
+    this.updateTokens();
   }
 
+  // updateTokens updates the security tokens required to load thumbnails and download files from the server.
   updateTokens() {
-    if (this.values["previewToken"]) {
+    if (this.values?.previewToken && this.previewToken !== this.values.previewToken) {
       this.previewToken = this.values.previewToken;
     }
-    if (this.values["downloadToken"]) {
+
+    if (this.values?.downloadToken && this.downloadToken !== this.values.downloadToken) {
       this.downloadToken = this.values.downloadToken;
     }
   }
 
+  // albumCategories returns an array containing the categories
+  // assigned to albums, or an empty array if there are none.
   albumCategories() {
     if (this.values["albumCategories"]) {
       return this.values["albumCategories"];
@@ -583,12 +805,54 @@ export default class Config {
     return [];
   }
 
+  // isPublic returns true if the instance is running in public mode, i.e. without authentication.
   isPublic() {
-    return this.values && this.values.public;
+    return !!this.values?.public;
   }
 
+  // isDemo returns true if the instance is running in demo mode for public or private testing.
   isDemo() {
-    return this.values && this.values.demo;
+    return !!this.values?.demo;
+  }
+
+  // isPortal returns true if this is a cluster portal server.
+  isPortal() {
+    return !!this.values?.portal;
+  }
+
+  // isClusterOidc returns true when the OIDC provider is the cluster Portal (not an external IdP).
+  isClusterOidc() {
+    return !!this.values?.ext?.oidc?.cluster;
+  }
+
+  // oidcEnabled returns true when OIDC single sign-on is configured.
+  oidcEnabled() {
+    return !!this.values?.ext?.oidc?.enabled;
+  }
+
+  // ldapEnabled returns true when LDAP/AD directory authentication is configured.
+  ldapEnabled() {
+    return !!this.values?.ext?.ldap?.enabled;
+  }
+
+  // oidcLoginUri returns the OIDC login endpoint that starts the provider roundtrip, or "" when off.
+  oidcLoginUri() {
+    return this.values?.ext?.oidc?.loginUri || "";
+  }
+
+  // oidcLogout returns true when sign-out should perform RP-initiated logout against the provider.
+  oidcLogout() {
+    return !!this.values?.ext?.oidc?.logout;
+  }
+
+  // portalLoginUri returns the cluster Portal's browser-facing login page, or "" when unknown.
+  portalLoginUri() {
+    return this.values?.ext?.oidc?.portalLoginUri || "";
+  }
+
+  // isPro returns true if this is team version.
+  isPro() {
+    return !!this.values?.ext["pro"];
   }
 
   isSponsor() {
@@ -665,19 +929,55 @@ export default class Config {
     return s;
   }
 
-  getIcon() {
-    switch (this.get("appIcon")) {
-      case "crisp":
-      case "mint":
-      case "bold":
-        return `${this.staticUri}/icons/${this.get("appIcon")}.svg`;
-      default:
-        return `${this.staticUri}/icons/logo.svg`;
+  // themeAssetUri resolves a theme asset reference against the base URI (e.g.
+  // "logo.svg" → "{baseUri}/_theme/logo.svg"); memoized since the base URI is
+  // fixed once the config is loaded.
+  themeAssetUri = memoizeOne((uri) => {
+    if (typeof uri !== "string" || uri === "") {
+      return uri;
+    } else if (schemeUriRegExp.test(uri) || uri.startsWith("//")) {
+      return uri; // absolute, data:/blob:, or protocol-relative
+    } else if (!uri.startsWith("/")) {
+      return `${this.baseUri || ""}/_theme/${uri}`; // bare name → theme dir
+    } else if (this.baseUri && uri.startsWith(`${this.baseUri}/`)) {
+      return uri; // already prefixed
     }
+
+    return `${this.baseUri || ""}${uri}`; // other root path → add prefix
+  });
+
+  getIcon() {
+    if (this.theme?.variables?.icon) {
+      return this.themeAssetUri(this.theme.variables.icon);
+    }
+
+    // The backend validates built-in icon names against the files in
+    // assets/static/icons before sending them, so any bare name is safe to
+    // use directly; the regex guards against path traversal from custom values.
+    const appIcon = this.get("appIcon");
+
+    if (appIcon && appIcon !== "logo" && /^[a-z0-9-]+$/.test(appIcon)) {
+      return `${this.staticUri}/icons/${appIcon}.svg`;
+    }
+
+    return `${this.staticUri}/icons/logo.svg`;
+  }
+
+  getLoginIcon() {
+    const loginTheme = themes.Get("login", false);
+    if (loginTheme?.variables?.icon) {
+      return this.themeAssetUri(loginTheme?.variables?.icon);
+    }
+
+    return this.getIcon();
   }
 
   getVersion() {
-    return this.get("version");
+    return this.version;
+  }
+
+  getServerVersion() {
+    return this.values?.version;
   }
 
   getSiteDescription() {

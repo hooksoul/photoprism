@@ -2,29 +2,28 @@ package commands
 
 import (
 	"context"
-	"errors"
 	"path/filepath"
 	"strings"
 	"time"
 
-	"github.com/urfave/cli"
+	"github.com/urfave/cli/v2"
 
 	"github.com/photoprism/photoprism/internal/config"
-	"github.com/photoprism/photoprism/internal/get"
 	"github.com/photoprism/photoprism/internal/photoprism"
-	"github.com/photoprism/photoprism/pkg/clean"
+	"github.com/photoprism/photoprism/internal/photoprism/get"
 )
 
 // CopyCommand configures the command name, flags, and action.
-var CopyCommand = cli.Command{
+var CopyCommand = &cli.Command{
 	Name:      "cp",
 	Aliases:   []string{"copy"},
 	Usage:     "Copies media files to originals",
 	ArgsUsage: "[source]",
 	Flags: []cli.Flag{
-		cli.BoolFlag{
-			Name:  "dest, d",
-			Usage: "relative originals `PATH` to which the files should be imported",
+		&cli.StringFlag{
+			Name:    "dest",
+			Aliases: []string{"d"},
+			Usage:   "relative originals `PATH` in which new files should be imported",
 		},
 	},
 	Action: copyAction,
@@ -66,13 +65,18 @@ func copyAction(ctx *cli.Context) error {
 		sourcePath = abs
 	}
 
-	if sourcePath == conf.OriginalsPath() {
-		return errors.New("import path is identical with originals")
+	if err := get.Import().CheckPath(sourcePath); err != nil {
+		return cli.Exit(err, 2)
 	}
 
 	var destFolder string
+
 	if ctx.IsSet("dest") {
-		destFolder = clean.UserPath(ctx.String("dest"))
+		destFolder, err = sanitizeDestinationArg(ctx.String("dest"))
+
+		if err != nil {
+			return err
+		}
 	} else {
 		destFolder = conf.ImportDest()
 	}

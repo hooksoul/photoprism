@@ -28,22 +28,24 @@ func AppendName(s, n string) string {
 	s = strings.TrimSpace(s)
 	n = strings.TrimSpace(n)
 
-	if s == "" {
+	switch s {
+	case "":
 		return n
-	} else if s == n {
+	case n:
 		return s
+	default:
+		return fmt.Sprintf("%s %s", s, n)
 	}
-
-	return fmt.Sprintf("%s %s", s, n)
 }
 
 // JoinNames joins a list of names to be used in titles and descriptions.
 func JoinNames(names []string, shorten bool) (result string) {
 	l := len(names)
 
-	if l == 0 {
+	switch l {
+	case 0:
 		return ""
-	} else if l == 1 {
+	case 1:
 		return names[0]
 	}
 
@@ -54,7 +56,7 @@ func JoinNames(names []string, shorten bool) (result string) {
 		familyName = names[0][i:]
 
 		for i := 1; i < l; i++ {
-			if !strings.HasSuffix(names[i], familyName) {
+			if !strings.HasSuffix(names[i], familyName) { //nolint:gosec // indices bounded by l
 				familyName = ""
 				break
 			}
@@ -63,15 +65,23 @@ func JoinNames(names []string, shorten bool) (result string) {
 
 	// Shorten names?
 	if shorten {
-		shortNames := make([]string, l)
+		shortNames := make([]string, 0, l)
+		var lastShort string
+		var lastFull string
 
-		for i := 0; i < l; i++ {
-			shortNames[i] = strings.SplitN(names[i], Space, 2)[0]
+		for _, full := range names {
+			parts := strings.SplitN(full, Space, 2)
+			currShort := parts[0]
 
-			if i > 0 && shortNames[i] == strings.SplitN(names[i-1], Space, 2)[0] {
-				shortNames[i] = names[i]
-				shortNames[i-1] = names[i-1]
+			if len(shortNames) > 0 && currShort == lastShort {
+				shortNames[len(shortNames)-1] = lastFull
+				shortNames = append(shortNames, full)
+			} else {
+				shortNames = append(shortNames, currShort)
 			}
+
+			lastShort = currShort
+			lastFull = full
 		}
 
 		names = shortNames
@@ -86,7 +96,7 @@ func JoinNames(names []string, shorten bool) (result string) {
 	// Keep family name at the end.
 	if familyName != "" {
 		if shorten {
-			result = result + familyName
+			result += familyName
 		} else {
 			result = strings.Replace(result, familyName, "", l-1)
 		}

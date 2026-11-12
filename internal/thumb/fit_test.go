@@ -3,28 +3,34 @@ package thumb
 import (
 	"testing"
 
-	"github.com/disintegration/imaging"
-
 	"github.com/stretchr/testify/assert"
+
+	"github.com/photoprism/photoprism/pkg/fs"
 )
 
 func TestFit(t *testing.T) {
 	assert.Equal(t, Sizes[Fit720], Fit(54, 453))
 	assert.Equal(t, Sizes[Fit1280], Fit(1000, 1000))
 	assert.Equal(t, Sizes[Fit1280], Fit(1250, 1000))
-	assert.Equal(t, Sizes[Fit2048], Fit(1300, 1300))
-	assert.Equal(t, Sizes[Fit2048], Fit(1600, 1600))
+	assert.Equal(t, Sizes[Fit1920], Fit(1300, 1200))
+	assert.Equal(t, Sizes[Fit2560], Fit(1300, 1300))
+	assert.Equal(t, Sizes[Fit2560], Fit(1600, 1600))
 	assert.Equal(t, Sizes[Fit4096], Fit(1000, 3000))
-	assert.Equal(t, Sizes[Fit3840], Fit(2300, 2000))
+	assert.Equal(t, Sizes[Fit4096], Fit(2300, 2000))
+	assert.Equal(t, Sizes[Fit5120], Fit(5000, 2000))
+	assert.Equal(t, Sizes[Fit7680], Fit(6020, 2000))
+	assert.Equal(t, Sizes[Fit15360], Fit(8000, 8000))
+	assert.Equal(t, Sizes[Fit15360], Fit(15520, 7760))
+	assert.Equal(t, Sizes[Fit15360], Fit(20000, 20000))
 }
 
 func TestFitBounds(t *testing.T) {
-	t.Run("example.jpg", func(t *testing.T) {
+	t.Run("ExampleJpg", func(t *testing.T) {
 		src := "testdata/example.jpg"
 
 		assert.FileExists(t, src)
 
-		img, err := imaging.Open(src, imaging.AutoOrientation(true))
+		img, _, err := fs.DecodeImageFile(src)
 
 		if err != nil {
 			t.Fatal(err)
@@ -39,12 +45,12 @@ func TestFitBounds(t *testing.T) {
 
 		assert.Equal(t, "fit_1280", size.Name.String())
 	})
-	t.Run("example.bmp", func(t *testing.T) {
+	t.Run("ExampleBmp", func(t *testing.T) {
 		src := "testdata/example.bmp"
 
 		assert.FileExists(t, src)
 
-		img, err := imaging.Open(src, imaging.AutoOrientation(true))
+		img, _, err := fs.DecodeImageFile(src)
 
 		if err != nil {
 			t.Fatal(err)
@@ -59,12 +65,12 @@ func TestFitBounds(t *testing.T) {
 
 		assert.Equal(t, "fit_720", size.Name.String())
 	})
-	t.Run("animated-earth.jpg", func(t *testing.T) {
+	t.Run("AnimatedEarthJpg", func(t *testing.T) {
 		src := "testdata/animated-earth.jpg"
 
 		assert.FileExists(t, src)
 
-		img, err := imaging.Open(src, imaging.AutoOrientation(true))
+		img, _, err := fs.DecodeImageFile(src)
 
 		if err != nil {
 			t.Fatal(err)

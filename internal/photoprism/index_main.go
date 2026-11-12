@@ -1,75 +1,127 @@
 package photoprism
 
 import (
+	"errors"
 	"fmt"
-	"path/filepath"
 
-	"github.com/photoprism/photoprism/internal/query"
+	"github.com/photoprism/photoprism/internal/entity/query"
 	"github.com/photoprism/photoprism/pkg/clean"
+	"github.com/photoprism/photoprism/pkg/log/status"
 )
 
 // IndexMain indexes the main file from a group of related files and returns the result.
 func IndexMain(related *RelatedFiles, ind *Index, o IndexOptions) (result IndexResult) {
 	// Skip if main file is nil.
 	if related.Main == nil {
-		result.Err = fmt.Errorf("index: no main file for %s", clean.Log(related.String()))
+		result.Err = fmt.Errorf("index: no main media file for %s", clean.Log(related.String()))
 		result.Status = IndexFailed
 		return result
 	}
 
 	f := related.Main
 
-	// Enforce file size and resolution limits.
-	if limitErr, _ := f.ExceedsBytes(o.ByteLimit); limitErr != nil {
+	// Check mime type, file size, and resolution.
+	if typeErr := f.CheckType(); typeErr != nil {
+		// Skip files if the filename extension does not match their mime type,
+		// see https://github.com/photoprism/photoprism/issues/3518 for details.
+		result.Err = fmt.Errorf("index: skipped %s because it %w", clean.Log(f.RootRelName()), typeErr)
+		result.Status = IndexFailed
+		return result
+	} else if _, limitErr := f.ExceedsBytes(o.ByteLimit); limitErr != nil {
 		result.Err = fmt.Errorf("index: %s", limitErr)
 		result.Status = IndexFailed
 		return result
-	} else if limitErr, _ = f.ExceedsResolution(o.ResolutionLimit); limitErr != nil {
+	} else if _, limitErr = f.ExceedsResolution(o.ResolutionLimit); limitErr != nil {
 		result.Err = fmt.Errorf("index: %s", limitErr)
 		result.Status = IndexFailed
 		return result
 	}
 
-	// Extract metadata to a JSON file with Exiftool.
-	if f.NeedsExifToolJson() {
-		if jsonName, err := ind.convert.ToJson(f, false); err != nil {
-			log.Tracef("exiftool: %s", clean.Log(err.Error()))
-			log.Debugf("exiftool: failed parsing %s", clean.Log(f.RootRelName()))
-		} else {
-			log.Debugf("index: created %s", filepath.Base(jsonName))
-		}
+	warnInsta360LensNotVideo("index", f)
+
+	// Create JSON sidecar file, if needed.
+	if jsonErr := f.CreateExifToolJson(ind.convert); jsonErr != nil {
+		log.Warnf("index: %s", clean.Error(jsonErr))
 	}
 
-	// Create JPEG sidecar for media files in other formats so that thumbnails can be created.
-	if o.Convert && f.IsMedia() && !f.HasPreviewImage() {
-		if jpg, err := ind.convert.ToImage(f, false); err != nil {
-			result.Err = fmt.Errorf("index: failed creating preview for %s (%s)", clean.Log(f.RootRelName()), err.Error())
-			result.Status = IndexFailed
-			return result
-		} else if limitErr, _ := jpg.ExceedsResolution(o.ResolutionLimit); limitErr != nil {
-			result.Err = fmt.Errorf("index: %s", limitErr)
-			result.Status = IndexFailed
-			return result
-		} else {
-			log.Debugf("index: created %s", clean.Log(jpg.BaseName()))
-
-			if err := jpg.CreateThumbnails(ind.thumbPath(), false); err != nil {
-				result.Err = fmt.Errorf("index: failed creating thumbnails for %s (%s)", clean.Log(f.RootRelName()), err.Error())
+	// Create JPEG sidecar for media files in other formats so that thumbnails can be created. The left
+	// lens preview of a capture completed in this run is replaced only if FFmpeg can create the new one.
+	forcePreview := forceDewarpPreview(f, o.Rescan) ||
+		ind.conf.FFmpegEnabled() && ind.convert.FFmpegAllowed(f) && insta360StalePreview(f, related.Files)
+	if o.Convert && f.IsMedia() && (!f.HasPreviewImage() || forcePreview) {
+		if img, imgErr := ind.convert.ToImage(f, forcePreview); imgErr != nil {
+			// Stop the run instead of masking a full disk as a generic preview error.
+			if errors.Is(imgErr, status.ErrInsufficientStorage) {
+				ind.abortInsufficientStorage()
+				result.Err = imgErr
 				result.Status = IndexFailed
 				return result
 			}
 
-			related.Files = append(related.Files, jpg)
+			result.Err = fmt.Errorf("index: could not create preview image for %s", clean.Log(f.RootRelName()))
+			log.Error(result.Err)
+			result.Status = IndexFailed
+			return result
+		} else if img == nil {
+			log.Debugf("index: skipped creating preview image for %s", clean.Log(f.RootRelName()))
+		} else if _, limitErr := img.ExceedsResolution(o.ResolutionLimit); limitErr != nil {
+			result.Err = fmt.Errorf("index: %s", limitErr)
+			result.Status = IndexFailed
+			return result
+		} else {
+			log.Debugf("index: created %s", clean.Log(img.BaseName()))
+
+			// Report 360° originals whose new preview shows the raw lens frames.
+			if img.InSidecar() && insta360ExpectsDewarp(f) && img.visualProjection.Unknown() {
+				log.Warnf("index: %s could not be dewarped to an equirectangular preview", clean.Log(f.RootRelName()))
+			}
+
+			if imgErr = img.GenerateThumbnails(ind.thumbPath(), false); imgErr != nil {
+				// Stop the run instead of masking a full disk as a generic thumbnail error.
+				if errors.Is(imgErr, status.ErrInsufficientStorage) {
+					ind.abortInsufficientStorage()
+					result.Err = imgErr
+					result.Status = IndexFailed
+					return result
+				}
+
+				result.Err = fmt.Errorf("index: failed to generate thumbnails for %s (%s)", clean.Log(f.RootRelName()), imgErr.Error())
+				result.Status = IndexFailed
+				return result
+			}
+
+			if forcePreview {
+				ind.forgetReplacedPreview(img)
+			}
+
+			img.SetRelatedMain(f)
+			related.Files = append(related.Files, img)
+		}
+	}
+
+	// Generate the playable equirectangular AVC while the index worker is already running in the
+	// background. This prevents the HTTP video endpoint from doing an expensive v360 conversion.
+	if o.Convert && f.DewarpableInsv() {
+		if avc, avcErr := ind.convert.ToAvc(f, ind.conf.FFmpegEncoder(), false, o.Rescan); errors.Is(avcErr, status.ErrInsufficientStorage) {
+			ind.abortInsufficientStorage()
+			result.Err = avcErr
+			result.Status = IndexFailed
+			return result
+		} else if avcErr != nil {
+			log.Warnf("index: could not create equirectangular video for %s (%s)", clean.Log(f.RootRelName()), clean.Error(avcErr))
+		} else if avc != nil {
+			related.Files = append(related.Files, avc)
 		}
 	}
 
 	// Index main MediaFile.
 	exists := ind.files.Exists(f.RootRelName(), f.Root())
+	f.SetRelatedMain(f)
 	result = ind.MediaFile(f, o, "", "")
 
 	// Save file error.
 	if fileUid, err := result.FileError(); err != nil {
-		query.SetFileError(fileUid, err.Error())
+		query.SetFileError(fileUid, clean.Error(err))
 	}
 
 	// Log index result.
@@ -77,13 +129,18 @@ func IndexMain(related *RelatedFiles, ind *Index, o IndexOptions) (result IndexR
 		log.Error(result.Err)
 
 		if exists {
-			log.Errorf("index: %s updating main %s file %s", result, f.FileType(), clean.Log(f.RootRelName()))
+			log.Errorf("index: %s to update main %s file %s", result, f.FileType(), clean.Log(f.RootRelName()))
 		} else {
-			log.Errorf("index: %s adding main %s file %s", result, f.FileType(), clean.Log(f.RootRelName()))
+			log.Errorf("index: %s to add main %s file %s", result, f.FileType(), clean.Log(f.RootRelName()))
 		}
 	} else {
 		log.Infof("index: %s main %s file %s", result, f.FileType(), clean.Log(f.RootRelName()))
 	}
 
 	return result
+}
+
+// forceDewarpPreview reports whether forced indexing should replace a recognized 360° preview.
+func forceDewarpPreview(f *MediaFile, rescan bool) bool {
+	return rescan && f != nil && (f.DewarpableInsv() || f.IsInsp() && f.DualFisheyeLayout() || f.FisheyeDng())
 }

@@ -9,11 +9,11 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/gin-gonic/gin/binding"
 
-	"github.com/photoprism/photoprism/internal/acl"
+	"github.com/photoprism/photoprism/internal/auth/acl"
 	"github.com/photoprism/photoprism/internal/entity"
+	"github.com/photoprism/photoprism/internal/entity/query"
 	"github.com/photoprism/photoprism/internal/form"
-	"github.com/photoprism/photoprism/internal/get"
-	"github.com/photoprism/photoprism/internal/query"
+	"github.com/photoprism/photoprism/internal/photoprism/get"
 	"github.com/photoprism/photoprism/pkg/clean"
 )
 
@@ -28,7 +28,13 @@ type FoldersResponse struct {
 
 // SearchFoldersOriginals returns folders in originals as JSON.
 //
-// GET /api/v1/folders/originals
+//	@Summary	list folders in originals
+//	@Id			SearchFoldersOriginals
+//	@Tags		Folders
+//	@Produce	json
+//	@Success	200		{object}	api.FoldersResponse
+//	@Failure	401,403	{object}	i18n.Response
+//	@Router		/api/v1/folders/originals [get]
 func SearchFoldersOriginals(router *gin.RouterGroup) {
 	conf := get.Config()
 	SearchFolders(router, "originals", entity.RootOriginals, conf.OriginalsPath())
@@ -36,7 +42,18 @@ func SearchFoldersOriginals(router *gin.RouterGroup) {
 
 // SearchFoldersImport returns import folders as JSON.
 //
-// GET /api/v1/folders/import
+//	@Summary	list folders in import
+//	@Id			SearchFoldersImport
+//	@Tags		Folders
+//	@Produce	json
+//	@Success	200		{object}	api.FoldersResponse
+//	@Header		200		{number}	X-Folders	"The actual number of folders returned.  Do not use for determining if all the results have been returned."
+//	@Header		200		{number}	X-Files		"The actual number of files returned.  Use this for comparing to X-Limit to determine if all the results have been returned."
+//	@Header		200		{number}	X-Count		"The actual number of files and folders returned.  Do not use for determining if all the results have been returned."
+//	@Header		200		{number}	X-Limit		"The limit of the number of files to be returned"
+//	@Header		200		{number}	X-Offset	"The offset that was used"
+//	@Failure	401,403	{object}	i18n.Response
+//	@Router		/api/v1/folders/import [get]
 func SearchFoldersImport(router *gin.RouterGroup) {
 	conf := get.Config()
 	SearchFolders(router, "import", entity.RootImport, conf.ImportPath())
@@ -45,47 +62,48 @@ func SearchFoldersImport(router *gin.RouterGroup) {
 // SearchFolders is a reusable request handler for directory listings (GET /api/v1/folders/*).
 func SearchFolders(router *gin.RouterGroup, urlPath, rootName, rootPath string) {
 	handler := func(c *gin.Context) {
-		s := Auth(c, acl.ResourceFiles, acl.AccessLibrary)
+		// A directory listing names every file in the library, private pictures included, so it
+		// asks for whole-library access rather than library reach alone - no less than the File
+		// Browser, Index and Import pages require before they render it.
+		s := AuthAccess(c, acl.ResourceFiles, acl.ActionSearch, acl.Permissions{acl.AccessAll})
 
-		// Abort if permission was not granted.
+		// Abort if permission is not granted.
 		if s.Abort(c) {
 			return
 		}
 
-		var f form.SearchFolders
+		var frm form.SearchFolders
 
 		start := time.Now()
-		err := c.MustBindWith(&f, binding.Form)
+		err := c.MustBindWith(&frm, binding.Form)
 
 		if err != nil {
-			AbortBadRequest(c)
+			AbortBadRequest(c, err)
 			return
 		}
 
-		user := s.User()
-		aclRole := user.AclRole()
-
-		// Exclude private content?
+		// Exclude private content? Evaluated on the session's effective role: for a client session,
+		// the intersection of the client and user roles.
 		if !get.Config().Settings().Features.Private {
-			f.Public = false
-		} else if acl.Resources.Deny(acl.ResourcePhotos, aclRole, acl.AccessPrivate) {
-			f.Public = true
+			frm.Public = false
+		} else if s.Denies(acl.ResourcePhotos, acl.AccessPrivate) {
+			frm.Public = true
 		}
 
 		cache := get.FolderCache()
-		recursive := f.Recursive
-		listFiles := f.Files
-		uncached := listFiles || f.Uncached
+		recursive := frm.Recursive
+		listFiles := frm.Files
+		uncached := listFiles || frm.Uncached
 		resp := FoldersResponse{Root: rootName, Recursive: recursive, Cached: !uncached}
 		path := clean.UserPath(c.Param("path"))
 
-		cacheKey := fmt.Sprintf("folder:%s:%t:%t:%t", filepath.Join(rootName, path), recursive, listFiles, f.Public)
+		cacheKey := fmt.Sprintf("folder:%s:%t:%t:%t", filepath.Join(rootName, path), recursive, listFiles, frm.Public)
 
 		if !uncached {
 			if cacheData, ok := cache.Get(cacheKey); ok {
 				cached := cacheData.(FoldersResponse)
 
-				log.Tracef("api-v1: cache hit for %s [%s]", cacheKey, time.Since(start))
+				log.Tracef("api: cache hit for %s [%s]", clean.Log(cacheKey), time.Since(start))
 
 				c.JSON(http.StatusOK, cached)
 				return
@@ -93,7 +111,7 @@ func SearchFolders(router *gin.RouterGroup, urlPath, rootName, rootPath string) 
 		}
 
 		if folders, err := query.FoldersByPath(rootName, rootPath, path, recursive); err != nil {
-			log.Errorf("folder: %s", err)
+			log.Errorf("folder: %s", clean.Error(err))
 			c.JSON(http.StatusOK, resp)
 			return
 		} else {
@@ -101,8 +119,8 @@ func SearchFolders(router *gin.RouterGroup, urlPath, rootName, rootPath string) 
 		}
 
 		if listFiles {
-			if files, err := query.FilesByPath(f.Count, f.Offset, rootName, path, f.Public); err != nil {
-				log.Errorf("folder: %s", err)
+			if files, err := query.FilesByPath(frm.Count, frm.Offset, rootName, path, frm.Public); err != nil {
+				log.Errorf("folder: %s", clean.Error(err))
 			} else {
 				resp.Files = files
 			}
@@ -110,13 +128,13 @@ func SearchFolders(router *gin.RouterGroup, urlPath, rootName, rootPath string) 
 
 		if !uncached {
 			cache.SetDefault(cacheKey, resp)
-			log.Debugf("cached %s [%s]", cacheKey, time.Since(start))
+			log.Debugf("cached %s [%s]", clean.Log(cacheKey), time.Since(start))
 		}
 
 		AddFileCountHeaders(c, len(resp.Files), len(resp.Folders))
 		AddCountHeader(c, len(resp.Files)+len(resp.Folders))
-		AddLimitHeader(c, f.Count)
-		AddOffsetHeader(c, f.Offset)
+		AddLimitHeader(c, frm.Count)
+		AddOffsetHeader(c, frm.Offset)
 		AddTokenHeaders(c, s)
 
 		c.JSON(http.StatusOK, resp)

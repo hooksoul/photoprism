@@ -14,15 +14,15 @@ func TestConfig_DefaultTheme(t *testing.T) {
 	c.options.Sponsor = false
 	c.options.Test = false
 	c.options.DefaultTheme = "grayscale"
-	assert.Equal(t, "default", c.DefaultTheme())
+	assert.Equal(t, "grayscale", c.DefaultTheme())
 	c.options.Sponsor = true
 	assert.Equal(t, "grayscale", c.DefaultTheme())
 	c.options.Sponsor = false
 	c.options.Test = true
-	assert.Equal(t, "default", c.DefaultTheme())
+	assert.Equal(t, "grayscale", c.DefaultTheme())
 	c.options.Sponsor = false
 	c.options.Test = false
-	assert.Equal(t, "default", c.DefaultTheme())
+	assert.Equal(t, "grayscale", c.DefaultTheme())
 	c.options.Sponsor = true
 	c.options.DefaultTheme = ""
 	assert.Equal(t, "default", c.DefaultTheme())
@@ -40,13 +40,39 @@ func TestConfig_DefaultLocale(t *testing.T) {
 	assert.Equal(t, "en", c.DefaultLocale())
 }
 
+func TestConfig_DefaultTimezone(t *testing.T) {
+	c := NewConfig(CliTestContext())
+
+	assert.Equal(t, "Local", c.DefaultTimezone().String())
+	c.options.DefaultTimezone = "Europe/Berlin"
+	assert.Equal(t, "Europe/Berlin", c.DefaultTimezone().String())
+	c.options.DefaultTimezone = ""
+	assert.Equal(t, "Local", c.DefaultTimezone().String())
+}
+
+func TestConfig_ThemeUrl(t *testing.T) {
+	c := NewConfig(CliTestContext())
+
+	assert.Equal(t, "", c.ThemeUrl())
+	assert.Equal(t, "", c.SetThemeUrl("").ThemeUrl())
+	assert.Equal(t, "", c.SetThemeUrl("ftp://cdn.photoprism.app/theme.zip").ThemeUrl())
+	assert.Equal(t, "", c.SetThemeUrl("https://cdn.photoprism.app/theme.tar").ThemeUrl())
+	assert.Equal(t, "https://user:pass@cdn.photoprism.app/theme.zip", c.SetThemeUrl("https://user:pass@cdn.photoprism.app/theme.zip").ThemeUrl())
+	assert.Equal(t, "https://user:***@cdn.photoprism.app/theme.zip", c.ThemeUrlRedacted())
+	assert.Equal(t, "https://cdn.photoprism.app/theme.zip", c.SetThemeUrl(" https://cdn.photoprism.app/theme.zip ").ThemeUrl())
+	assert.Equal(t, "https://cdn.photoprism.app/theme.zip", c.ThemeUrlRedacted())
+
+	c.options.ThemeUrl = "https://cdn.photoprism.app/theme.ZIP"
+	assert.Equal(t, "https://cdn.photoprism.app/theme.ZIP", c.ThemeUrl())
+}
+
 func TestConfig_WallpaperUri(t *testing.T) {
 	c := NewConfig(CliTestContext())
 
 	assert.Equal(t, "", c.WallpaperUri())
 	assert.Equal(t, "", c.Options().WallpaperUri)
-	c.SetWallpaperUri("kashmir")
-	assert.Equal(t, "/static/img/wallpaper/kashmir.jpg", c.WallpaperUri())
+	c.SetWallpaperUri("default")
+	assert.Equal(t, "/static/img/wallpaper/default.jpg", c.WallpaperUri())
 	c.SetWallpaperUri("https://cdn.photoprism.app/wallpaper/welcome.jpg")
 	assert.Equal(t, "https://cdn.photoprism.app/wallpaper/welcome.jpg", c.WallpaperUri())
 	c.options.Test = false
@@ -57,15 +83,15 @@ func TestConfig_WallpaperUri(t *testing.T) {
 	assert.Equal(t, "https://cdn.photoprism.app/wallpaper/welcome.jpg", c.WallpaperUri())
 	c.options.Sponsor = true
 	assert.Equal(t, "https://cdn.photoprism.app/wallpaper/welcome.jpg", c.WallpaperUri())
-	c.SetWallpaperUri("kashmir")
-	assert.Equal(t, "/static/img/wallpaper/kashmir.jpg", c.WallpaperUri())
-	c.SetWallpaperUri("kashmir")
+	c.SetWallpaperUri("default")
+	assert.Equal(t, "/static/img/wallpaper/default.jpg", c.WallpaperUri())
+	c.SetWallpaperUri("default")
 	c.options.CdnUrl = "https://bunny.net/cdn/"
-	assert.Equal(t, "https://bunny.net/cdn/static/img/wallpaper/kashmir.jpg", c.WallpaperUri())
-	assert.Equal(t, "kashmir", c.Options().WallpaperUri)
-	c.SetWallpaperUri("kashmir")
+	assert.Equal(t, "https://bunny.net/cdn/static/img/wallpaper/default.jpg", c.WallpaperUri())
+	assert.Equal(t, "default", c.Options().WallpaperUri)
+	c.SetWallpaperUri("default")
 	c.options.CdnUrl = ""
-	assert.Equal(t, "/static/img/wallpaper/kashmir.jpg", c.WallpaperUri())
+	assert.Equal(t, "/static/img/wallpaper/default.jpg", c.WallpaperUri())
 	c.SetWallpaperUri("")
 	assert.Equal(t, "", c.WallpaperUri())
 	assert.Equal(t, "", c.Options().WallpaperUri)

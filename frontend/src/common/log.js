@@ -1,6 +1,6 @@
 /*
 
-Copyright (c) 2018 - 2023 PhotoPrism UG. All rights reserved.
+Copyright (c) 2018 - 2026 PhotoPrism UG. All rights reserved.
 
     This program is free software: you can redistribute it and/or modify
     it under Version 3 of the GNU Affero General Public License (the "AGPL"):
@@ -13,7 +13,7 @@ Copyright (c) 2018 - 2023 PhotoPrism UG. All rights reserved.
 
     The AGPL is supplemented by our Trademark and Brand Guidelines,
     which describe how our Brand Assets may be used:
-    <https://www.photoprism.app/trademark>
+    <https://www.photoprism.app/trademark/>
 
 Feel free to send an email to hello@photoprism.app if you have questions,
 want to support our work, or just want to say hello.
@@ -23,14 +23,15 @@ Additional information can be found in our Developer Guide:
 
 */
 
-import Event from "pubsub-js";
-import { config } from "app/session";
+import $event from "common/event";
+import { $config } from "app/session";
+import { reactive } from "vue";
 
 class Log {
   constructor() {
     this.cap = 150;
     this.created = new Date();
-    this.logs = [
+    this.logs = reactive([
       /* EXAMPLE LOG MESSAGE
             {
                 "message": "waiting for events",
@@ -38,15 +39,15 @@ class Log {
                 "time": this.created.toISOString(),
             },
             */
-    ];
+    ]);
 
     this.logId = 0;
 
-    Event.subscribe("log", this.onLog.bind(this));
+    $event.subscribe("log", this.onLog.bind(this));
   }
 
   debug(msg, data) {
-    if (config.debug && msg) {
+    if ($config.debug && msg) {
       if (data) {
         if (Array.isArray(data)) {
           data.forEach((val) => {
@@ -81,6 +82,6 @@ class Log {
   }
 }
 
-const log = new Log();
+const $log = reactive(new Log());
 
-export default log;
+export default $log;

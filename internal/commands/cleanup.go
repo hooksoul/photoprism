@@ -5,14 +5,14 @@ import (
 	"time"
 
 	"github.com/dustin/go-humanize/english"
-	"github.com/urfave/cli"
+	"github.com/urfave/cli/v2"
 
-	"github.com/photoprism/photoprism/internal/get"
 	"github.com/photoprism/photoprism/internal/photoprism"
+	"github.com/photoprism/photoprism/internal/photoprism/get"
 )
 
 // CleanUpCommand configures the command name, flags, and action.
-var CleanUpCommand = cli.Command{
+var CleanUpCommand = &cli.Command{
 	Name:   "cleanup",
 	Usage:  "Removes orphaned index entries, sidecar and thumbnail files",
 	Flags:  cleanUpFlags,
@@ -20,10 +20,7 @@ var CleanUpCommand = cli.Command{
 }
 
 var cleanUpFlags = []cli.Flag{
-	cli.BoolFlag{
-		Name:  "dry",
-		Usage: "dry run, don't actually remove anything",
-	},
+	DryRunFlag("performs a dry run that doesn't actually remove anything"),
 }
 
 // cleanUpAction removes orphaned index entries, sidecar and thumbnail files.
@@ -49,7 +46,7 @@ func cleanUpAction(ctx *cli.Context) error {
 	w := get.CleanUp()
 
 	opt := photoprism.CleanUpOptions{
-		Dry: ctx.Bool("dry"),
+		Dry: ctx.Bool("dry-run"),
 	}
 
 	// Start cleanup worker.

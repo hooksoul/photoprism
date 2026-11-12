@@ -1,8 +1,9 @@
 package clean
 
 import (
-	"regexp"
 	"strings"
+	"unicode"
+	"unicode/utf8"
 )
 
 // spaced returns the string padded with a space left and right.
@@ -11,13 +12,102 @@ func spaced(s string) string {
 }
 
 // replace performs a case-insensitive string replacement.
-func replace(subject string, search string, replace string) string {
-	return regexp.MustCompile("(?i)"+search).ReplaceAllString(subject, replace)
+// replaceFoldASCII replaces all case-insensitive ASCII matches of needle
+// in s with repl. It avoids regex compilation and extra allocations.
+func replaceFoldASCII(s, needle, repl string) string {
+	if s == "" || needle == "" {
+		return s
+	}
+
+	// Quick check to see if there's any possible match using a lowercased scan.
+	// We implement a simple ASCII case-insensitive search.
+	toLower := func(b byte) byte {
+		if b >= 'A' && b <= 'Z' {
+			return b + 32
+		}
+		return b
+	}
+
+	nl := len(needle)
+	// Precompute lower-case needle bytes.
+	nb := make([]byte, nl)
+	for i := range nl {
+		nb[i] = toLower(needle[i])
+	}
+
+	// First pass: find if any match exists; if not, return s unchanged.
+	// Second pass: build result with replacements.
+	// Implement both in one pass by building only when the first match is seen.
+	var out []byte
+	i := 0
+	last := 0
+	for i <= len(s)-nl {
+		// Compare at position i.
+		j := 0
+		for ; j < nl; j++ {
+			if toLower(s[i+j]) != nb[j] {
+				break
+			}
+		}
+		if j == nl {
+			// Match found.
+			if out == nil {
+				// Allocate with an estimate: original len.
+				out = make([]byte, 0, len(s))
+			}
+			out = append(out, s[last:i]...)
+			out = append(out, repl...)
+			i += nl
+			last = i
+			continue
+		}
+		i++
+	}
+	if out == nil {
+		return s
+	}
+	// Append the tail.
+	out = append(out, s[last:]...)
+	return string(out)
+}
+
+// SearchBindable removes NUL bytes and invalid UTF-8 from a search value.
+func SearchBindable(s string) string {
+	if strings.IndexByte(s, 0) >= 0 {
+		s = strings.ReplaceAll(s, "\x00", "")
+	}
+
+	if !utf8.ValidString(s) {
+		s = strings.ToValidUTF8(s, "")
+	}
+
+	return s
+}
+
+// SearchFilter removes NUL bytes and invalid UTF-8 from a search filter value, and reports false if bytes were
+// removed and nothing usable is left, since such a filter can match nothing.
+func SearchFilter(s string) (string, bool) {
+	if b := SearchBindable(s); b != s {
+		return b, SearchUsable(b)
+	}
+
+	return s, true
+}
+
+// searchSyntax lists the characters that only form search syntax, such as wildcards and operators.
+const searchSyntax = "|&*%<>${}\\:\"'+!/"
+
+// SearchUsable reports whether a search value has a character other than whitespace, control characters,
+// and the characters that only form search syntax.
+func SearchUsable(s string) bool {
+	return strings.ContainsFunc(s, func(r rune) bool {
+		return !unicode.IsSpace(r) && !unicode.IsControl(r) && !strings.ContainsRune(searchSyntax, r)
+	})
 }
 
 // SearchString replaces search operator with default symbols.
 func SearchString(s string) string {
-	if s == "" || reject(s, MaxLength) {
+	if s = SearchBindable(s); s == "" || reject(s, LengthLimit) {
 		return Empty
 	}
 
@@ -26,23 +116,46 @@ func SearchString(s string) string {
 	s = strings.ReplaceAll(s, "%", "*")
 	s = strings.ReplaceAll(s, "**", "*")
 
-	// Trim.
-	return strings.Trim(s, "|\\<>\n\r\t")
+	// Trim — keep '\' so downstream filters can honor escape sequences.
+	return strings.Trim(s, "|<>\n\r\t")
+}
+
+// SearchTerms bounds a search value to LengthLimit, the limit SearchString applies to a value
+// parsed from a query expression, and removes NUL bytes and invalid UTF-8. Each term expands into
+// its own condition, so this input sizes the statement.
+func SearchTerms(s string) string {
+	if s = SearchBindable(s); len(s) <= LengthLimit {
+		return s
+	}
+
+	s = s[:LengthLimit]
+
+	// Drop a trailing partial rune, as a term must stay valid UTF-8 to bind.
+	for len(s) > 0 {
+		if r, size := utf8.DecodeLastRuneInString(s); r == utf8.RuneError && size <= 1 {
+			s = s[:len(s)-1]
+			continue
+		}
+
+		break
+	}
+
+	return s
 }
 
 // SearchQuery replaces search operator with default symbols.
 func SearchQuery(s string) string {
-	if s == "" || reject(s, MaxLength) {
+	if s = SearchBindable(s); s == "" || reject(s, LengthLimit) {
 		return Empty
 	}
 
 	// Normalize.
-	s = replace(s, spaced(EnOr), Or)
-	s = replace(s, spaced(EnOr), Or)
-	s = replace(s, spaced(EnAnd), And)
-	s = replace(s, spaced(EnWith), And)
-	s = replace(s, spaced(EnIn), And)
-	s = replace(s, spaced(EnAt), And)
+	s = replaceFoldASCII(s, spaced(EnOr), Or)
+	s = replaceFoldASCII(s, spaced(EnOr), Or)
+	s = replaceFoldASCII(s, spaced(EnAnd), And)
+	s = replaceFoldASCII(s, spaced(EnWith), And)
+	s = replaceFoldASCII(s, spaced(EnIn), And)
+	s = replaceFoldASCII(s, spaced(EnAt), And)
 	s = strings.ReplaceAll(s, SpacedPlus, And)
 	s = strings.ReplaceAll(s, "%%", "%")
 	s = strings.ReplaceAll(s, "%", "*")

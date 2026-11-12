@@ -1,0 +1,379 @@
+import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import "../fixtures";
+import * as options from "options/options";
+import {
+  AccountTypes,
+  AlbumSortOrder,
+  Colors,
+  DownloadName,
+  Expires,
+  FallbackLocale,
+  FeedbackCategories,
+  FindLanguage,
+  FindLocale,
+  Gender,
+  Intervals,
+  ItemsPerPage,
+  MapsAnimate,
+  MapsStyle,
+  Orientations,
+  PhotoTypes,
+  RetryLimits,
+  SetDefaultLocale,
+  SortOrderOptions,
+  StartPages,
+  ThumbSizes,
+  Timeouts,
+} from "options/options";
+
+describe("options/options", () => {
+  let originalDefaultLocale;
+
+  beforeEach(() => {
+    originalDefaultLocale = options.DefaultLocale;
+  });
+
+  afterEach(() => {
+    SetDefaultLocale(originalDefaultLocale);
+  });
+  it("should get timezones", () => {
+    const timezones = options.TimeZones();
+    expect(timezones[0].ID).toBe("Local");
+    expect(timezones[0].Name).toBe("Local");
+    expect(timezones[1].ID).toBe("UTC");
+    expect(timezones[1].Name).toBe("UTC");
+  });
+
+  it("should label UTC offsets with their own sign", () => {
+    const offsets = options.GmtOffsets.filter((o) => o.ID !== "GMT");
+    expect(offsets).toHaveLength(24);
+
+    for (const o of offsets) {
+      const [, sign, hours] = o.ID.match(/^UTC([+-])(\d+)$/);
+      expect(o.Name).toBe(`UTC${sign}${hours.padStart(2, "0")}:00`);
+    }
+
+    expect(options.TimeZones().slice(-24)).toEqual(offsets);
+  });
+
+  it("should get days", () => {
+    const Days = options.Days();
+    expect(Days[0].text).toBe("01");
+    expect(Days[30].text).toBe("31");
+  });
+
+  it("should get years", () => {
+    const Years = options.Years();
+    const currentYear = new Date().getUTCFullYear();
+    expect(Years[0].text).toBe(currentYear.toString());
+  });
+
+  it("should get indexed years", () => {
+    const IndexedYears = options.IndexedYears();
+    expect(IndexedYears[0].text).toBe("2021");
+  });
+
+  it("should get months", () => {
+    const Months = options.Months();
+    expect(Months[5].text).toBe("June");
+  });
+
+  it("should get short months", () => {
+    const MonthsShort = options.MonthsShort();
+    expect(MonthsShort[5].text).toBe("06");
+  });
+
+  it("should get languages", () => {
+    const Languages = options.Languages();
+    expect(Languages[0].value).toBe("en");
+  });
+
+  it("should get countries without mixed by default", () => {
+    const list = options.Countries();
+    expect(list.some((c) => c.Code === options.Mixed.ID)).toBe(false);
+  });
+
+  it("should use Batch helper to inject mixed entries", () => {
+    const base = [{ Code: "de", Name: "Germany" }];
+    const withMixed = options.Batch(base, true);
+
+    expect(withMixed).toHaveLength(base.length + 1);
+    expect(withMixed.at(-1)).toEqual({ Code: options.Mixed.ID, Name: options.Mixed.Placeholder() });
+    expect(withMixed[0]).toEqual(base[0]);
+
+    // ensure original array is untouched
+    expect(base).toEqual([{ Code: "de", Name: "Germany" }]);
+
+    const noMixed = options.Batch(base, false);
+    expect(noMixed).toBe(base);
+  });
+
+  it("should add mixed placeholder for numeric value lists", () => {
+    const values = [{ value: 1, text: "January" }];
+    const mixedValues = options.Batch(values, true);
+    expect(mixedValues.at(-1)).toEqual({ value: options.Mixed.ID, text: options.Mixed.Placeholder() });
+    expect(mixedValues[0]).toEqual(values[0]);
+  });
+
+  it("should set default locale", () => {
+    SetDefaultLocale("en");
+    expect(options.DefaultLocale).toBe("en");
+    SetDefaultLocale("de");
+    expect(options.DefaultLocale).toBe("de");
+  });
+
+  it("should return default when no locale is provided", () => {
+    expect(FindLanguage("").value).toBe("en");
+  });
+
+  it("should return default if locale is smaller than 2", () => {
+    expect(FindLanguage("d").value).toBe("en");
+  });
+
+  it("should return default for unknown locale", () => {
+    expect(FindLanguage("xx").value).toBe("en");
+  });
+
+  it("should return correct locale", () => {
+    expect(FindLanguage("de").value).toBe("de");
+    expect(FindLanguage("de").text).toBe("Deutsch");
+    expect(FindLanguage("de_AT").value).toBe("de");
+    expect(FindLanguage("de_AT").text).toBe("Deutsch");
+    expect(FindLanguage("zh-tw").value).toBe("zh_TW");
+    expect(FindLanguage("zh-tw").text).toBe("繁體中文");
+    expect(FindLanguage("zh+tw").value).toBe("zh_TW");
+    expect(FindLanguage("zh+tw").text).toBe("繁體中文");
+    expect(FindLanguage("zh_AT").value).toBe("zh");
+    expect(FindLanguage("zh_AT").text).toBe("简体中文");
+    expect(FindLanguage("ZH_TW").value).toBe("zh_TW");
+    expect(FindLanguage("ZH_TW").text).toBe("繁體中文");
+    expect(FindLanguage("zH-tW").value).toBe("zh_TW");
+    expect(FindLanguage("zH-tW").text).toBe("繁體中文");
+  });
+
+  it("should follow the default locale for unknown locales", () => {
+    expect(FindLanguage("xx").value).toBe("en");
+    SetDefaultLocale("de");
+    expect(FindLanguage("xx").value).toBe("de");
+    expect(FindLocale("xx")).toBe("de");
+    expect(FindLanguage("fr-FR").value).toBe("fr");
+  });
+
+  describe("with theme locales", () => {
+    const originalLocales = window.__LOCALES__;
+    const english = { text: "English", value: "en" };
+    const arabic = { text: "العربية", value: "ar", rtl: true };
+    const french = { text: "Français", value: "fr" };
+
+    afterEach(() => {
+      window.__LOCALES__ = originalLocales;
+      SetDefaultLocale(originalDefaultLocale);
+    });
+
+    it("should return the default locale if offered", () => {
+      window.__LOCALES__ = [english, arabic];
+      SetDefaultLocale("ar");
+      expect(FindLanguage("de-DE").value).toBe("ar");
+      expect(FindLocale("de_DE")).toBe("ar");
+      expect(FindLanguage("en-US").value).toBe("en");
+    });
+    it("should return the first offered locale if the default is not offered", () => {
+      window.__LOCALES__ = [arabic, french];
+      expect(options.DefaultLocale).toBe("en");
+      expect(FindLanguage("de").value).toBe("ar");
+      expect(FindLocale("de")).toBe("ar");
+      expect(FindLanguage("").value).toBe("ar");
+      expect(FindLanguage("fr-FR").value).toBe("fr");
+    });
+    it("should set the first offered locale as default if the default is not offered", () => {
+      window.__LOCALES__ = [arabic, english];
+      SetDefaultLocale("de");
+      expect(options.DefaultLocale).toBe("ar");
+      expect(FindLanguage("de-DE").value).toBe("ar");
+      expect(FindLanguage("en-US").value).toBe("en");
+    });
+  });
+
+  it("should return default locale", () => {
+    expect(FindLocale("xx")).toBe("en");
+    expect(FindLocale("")).toBe("en");
+  });
+
+  it("should return fallback locale", () => {
+    expect(FallbackLocale()).toBe("en");
+  });
+
+  it("should return items per page", () => {
+    expect(ItemsPerPage()[0].value).toBe(10);
+  });
+
+  it("should return start page options", () => {
+    let features = {
+      account: true,
+      albums: true,
+      archive: true,
+      delete: true,
+      download: true,
+      edit: true,
+      estimates: true,
+      favorites: true,
+      files: true,
+      folders: true,
+      import: true,
+      labels: true,
+      library: true,
+      logs: true,
+      calendar: true,
+      moments: true,
+      people: true,
+      places: true,
+      private: true,
+      ratings: true,
+      reactions: true,
+      review: true,
+      search: true,
+      services: true,
+      settings: true,
+      share: true,
+      upload: true,
+      videos: true,
+    };
+    let pages = StartPages(features);
+    expect(pages.length).toBe(13);
+    expect(pages[5].value).toBe("people");
+    expect(pages[5].props.disabled).toBe(false);
+    expect(pages[pages.length - 1].value).toBe("settings");
+    expect(pages[pages.length - 1].props.disabled).toBe(false);
+    features = {
+      ...features, // copy previous settings
+      calendar: false,
+      people: false,
+      settings: false,
+    };
+    pages = StartPages(features);
+    expect(pages.length).toBe(13);
+    expect(pages[5].value).toBe("people");
+    expect(pages[5].props.disabled).toBe(true);
+    expect(pages[pages.length - 1].value).toBe("settings");
+    expect(pages[pages.length - 1].props.disabled).toBe(true);
+  });
+
+  it("should return animation options", () => {
+    expect(MapsAnimate()[1].value).toBe(2500);
+  });
+
+  it("should return photo types", () => {
+    expect(PhotoTypes()[0].value).toBe("image");
+    expect(PhotoTypes()[1].value).toBe("raw");
+  });
+
+  it("should return map styles", () => {
+    let styles = MapsStyle(true);
+    expect(styles[styles.length - 1].value).toContain("low-resolution");
+    styles = MapsStyle(false);
+    expect(styles[styles.length - 1].value).not.toContain("low-resolution");
+  });
+
+  it("should omit styles that require a map key", () => {
+    const withKey = MapsStyle(false, true);
+    const withoutKey = MapsStyle(false, false);
+    expect(withKey.some((s) => s.sponsor)).toBe(true);
+    expect(withoutKey.some((s) => s.sponsor)).toBe(false);
+    expect(withoutKey.length).toBeLessThan(withKey.length);
+    expect(withoutKey.map((s) => s.value)).toContain("default");
+  });
+
+  it("should list all map styles by default", () => {
+    expect(MapsStyle(false)).toEqual(MapsStyle(false, true));
+    expect(MapsStyle(true)).toEqual(MapsStyle(true, true));
+  });
+
+  it("should keep the experimental style when no map key is available", () => {
+    const styles = MapsStyle(true, false);
+    expect(styles.map((s) => s.value)).toContain("low-resolution");
+    expect(styles.some((s) => s.sponsor)).toBe(false);
+  });
+
+  it("should return timeouts", () => {
+    expect(Timeouts()[1].value).toBe("high");
+  });
+
+  it("should return retry limits", () => {
+    expect(RetryLimits()[1].value).toBe(1);
+  });
+
+  it("should return intervals", () => {
+    expect(Intervals()[0].text).toBe("Never");
+    expect(Intervals()[1].text).toBe("1 hour");
+  });
+
+  it("should return expiry options", () => {
+    expect(Expires()[0].text).toBe("Never");
+    expect(Expires()[1].text).toBe("After 1 day");
+  });
+
+  it("should return colors", () => {
+    expect(Colors()[0].Slug).toBe("purple");
+  });
+
+  it("should return feedback categories", () => {
+    expect(FeedbackCategories()[0].value).toBe("feedback");
+  });
+
+  it("should return thumb sizes", () => {
+    expect(ThumbSizes()[1].value).toBe("fit_720");
+  });
+
+  it("should return gender", () => {
+    expect(Gender()[2].value).toBe("other");
+  });
+
+  it("should return orientations", () => {
+    expect(Orientations()[1].text).toBe("90°");
+  });
+
+  it("should return service account type options", () => {
+    expect(AccountTypes()[0].value).toBe("webdav");
+    expect(AccountTypes().length).toBe(1);
+  });
+
+  it("should return download name options", () => {
+    const downloadNames = DownloadName();
+    expect(downloadNames).toHaveLength(3);
+    expect(downloadNames[0].value).toBe("file");
+    expect(downloadNames[0].text).toBe("Current Name");
+    expect(downloadNames[1].value).toBe("original");
+    expect(downloadNames[1].text).toBe("Original Name");
+    expect(downloadNames[2].value).toBe("share");
+    expect(downloadNames[2].text).toBe("Share Friendly");
+  });
+
+  it("should return album sort order options", () => {
+    const sortOrders = AlbumSortOrder();
+    expect(sortOrders).toHaveLength(8);
+    expect(sortOrders[0].value).toBe("newest");
+    expect(sortOrders[0].text).toBe("Newest First");
+    expect(sortOrders[1].value).toBe("oldest");
+    expect(sortOrders[1].text).toBe("Oldest First");
+    expect(sortOrders[2].value).toBe("added");
+    expect(sortOrders[3].value).toBe("title");
+    expect(sortOrders[4].value).toBe("name");
+    expect(sortOrders[5].value).toBe("size");
+    expect(sortOrders[6].value).toBe("duration");
+    expect(sortOrders[7].value).toBe("relevance");
+  });
+
+  it("should build sort order options for the requested keys, in order", () => {
+    const opts = SortOrderOptions(["relevance", "newest", "archived"]);
+    expect(opts).toHaveLength(3);
+    expect(opts[0]).toEqual({ value: "relevance", text: "Most Relevant" });
+    expect(opts[1]).toEqual({ value: "newest", text: "Newest First" });
+    expect(opts[2]).toEqual({ value: "archived", text: "Recently Archived" });
+  });
+
+  it("should skip unknown sort order keys", () => {
+    const opts = SortOrderOptions(["newest", "bogus", "similar"]);
+    expect(opts.map((o) => o.value)).toEqual(["newest", "similar"]);
+    expect(opts[1].text).toBe("Visual Similarity");
+  });
+});

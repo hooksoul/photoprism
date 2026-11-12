@@ -1,30 +1,32 @@
 package entity
 
 import (
+	"fmt"
 	"os"
 	"time"
 
-	"github.com/photoprism/photoprism/internal/migrate"
+	"github.com/photoprism/photoprism/internal/entity/migrate"
 	"github.com/photoprism/photoprism/pkg/clean"
+	"github.com/photoprism/photoprism/pkg/dsn"
+	"github.com/photoprism/photoprism/pkg/fs"
 )
 
-// onReady contains init functions to be called when the
-// initialization of the database is complete.
+// onReady stores callbacks to execute once database initialization finishes.
 var onReady []func()
 
-// ready executes init callbacks when the initialization of the
-// database is complete.
+// ready executes all registered callbacks after database initialization completes.
 func ready() {
 	for _, init := range onReady {
 		init()
 	}
 }
 
-// InitDb creates database tables and inserts default fixtures as needed.
-func InitDb(opt migrate.Options) {
+// InitDb creates database tables and inserts default fixtures as needed, and returns an error if the
+// schema could not be migrated.
+func InitDb(opt migrate.Options) (err error) {
 	if !HasDbProvider() {
 		log.Error("migrate: no database provider")
-		return
+		return fmt.Errorf("migrate: no database provider")
 	}
 
 	start := time.Now()
@@ -33,18 +35,29 @@ func InitDb(opt migrate.Options) {
 		DeprecatedTables.Drop(Db())
 	}
 
-	Entities.Migrate(Db(), opt)
-	Entities.WaitForMigration(Db())
+	err = Entities.Migrate(Db(), opt)
 
-	CreateDefaultFixtures()
+	// The error is returned, so the caller reports it.
+	if waitErr := Entities.WaitForMigration(Db()); waitErr != nil {
+		if err == nil {
+			err = waitErr
+		}
+	}
+
+	// After a failed migration, default fixtures are created only if their tables exist.
+	if err == nil || hasDefaultFixtureTables(Db()) {
+		CreateDefaultFixtures()
+	}
 
 	ready()
 
 	log.Debugf("migrate: completed in %s", time.Since(start))
+
+	return err
 }
 
 // InitTestDb connects to and completely initializes the test database incl fixtures.
-func InitTestDb(driver, dsn string) *DbConn {
+func InitTestDb(driver, dbDsn string) *DbConn {
 	if HasDbProvider() {
 		return nil
 	}
@@ -52,27 +65,31 @@ func InitTestDb(driver, dsn string) *DbConn {
 	start := time.Now()
 
 	// Set default test database driver.
-	if driver == "test" || driver == "sqlite" || driver == "" || dsn == "" {
-		driver = SQLite3
+	if driver == "test" || driver == "sqlite" || driver == "" || dbDsn == "" {
+		driver = dsn.DriverSQLite3
 	}
 
 	// Set default database DSN.
-	if driver == SQLite3 {
-		if dsn == "" {
-			dsn = SQLiteMemoryDSN
-		} else if dsn != SQLiteTestDB {
-			// Continue.
-		} else if err := os.Remove(dsn); err == nil {
-			log.Debugf("sqlite: test file %s removed", clean.Log(dsn))
+	if driver == dsn.DriverSQLite3 {
+		if dbDsn == "" || dbDsn == dsn.SQLiteTestDB {
+			dbDsn = dsn.SQLiteTestDB
+			if !fs.FileExists(dbDsn) {
+				log.Debugf("sqlite: test database %s does not already exist", clean.Log(dbDsn))
+			} else if err := os.Remove(dbDsn); err != nil {
+				log.Errorf("sqlite: failed to remove existing test database %s (%s)", clean.Log(dbDsn), err)
+			}
 		}
 	}
 
-	log.Infof("initializing %s test db in %s", driver, dsn)
+	// Give the package a database of its own, so that tests can run in parallel.
+	dbDsn = TestDbDSN(driver, dbDsn)
+
+	log.Infof("initializing %s test db in %s", driver, dsn.Mask(dbDsn))
 
 	// Create gorm.DB connection provider.
 	db := &DbConn{
 		Driver: driver,
-		Dsn:    dsn,
+		Dsn:    dbDsn,
 	}
 
 	// Insert test fixtures into the database.

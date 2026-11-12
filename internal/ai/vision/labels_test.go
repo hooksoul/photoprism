@@ -1,0 +1,452 @@
+package vision
+
+import (
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"sync"
+	"testing"
+
+	"github.com/sirupsen/logrus"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"github.com/photoprism/photoprism/internal/ai/classify"
+	"github.com/photoprism/photoprism/internal/ai/vision/ollama"
+	"github.com/photoprism/photoprism/internal/ai/vision/openai"
+	"github.com/photoprism/photoprism/internal/entity"
+	"github.com/photoprism/photoprism/pkg/http/scheme"
+	"github.com/photoprism/photoprism/pkg/media"
+)
+
+// TestGenerateLabels verifies local ONNX labeling and error handling.
+func TestGenerateLabels(t *testing.T) {
+	description := classify.DefaultModel()
+	if description == nil || !description.Installed(GetModelsPath()) {
+		t.Skip("classify: default ONNX model is not installed")
+	}
+
+	t.Run("Success", func(t *testing.T) {
+		result, err := GenerateLabels(Files{samplesPath + "/dog_orange.jpg"}, media.SrcLocal, entity.SrcAuto)
+
+		require.NoError(t, err)
+		assert.IsType(t, classify.Labels{}, result)
+		require.Len(t, result, 1)
+
+		t.Log(result)
+
+		assert.Equal(t, "dog", result[0].Name)
+	})
+	t.Run("Chameleon", func(t *testing.T) {
+		result, err := GenerateLabels(Files{samplesPath + "/chameleon_lime.jpg"}, media.SrcLocal, entity.SrcAuto)
+
+		require.NoError(t, err)
+		require.Len(t, result, 1)
+		assert.Equal(t, "chameleon", result[0].Name)
+	})
+	t.Run("Cat224", func(t *testing.T) {
+		result, err := GenerateLabels(Files{samplesPath + "/cat_224.jpeg"}, media.SrcLocal, entity.SrcAuto)
+
+		require.NoError(t, err)
+		assert.IsType(t, classify.Labels{}, result)
+		require.Len(t, result, 1)
+
+		t.Log(result)
+
+		assert.Equal(t, "cat", result[0].Name)
+		assert.InDelta(t, 21, result[0].Uncertainty, 10)
+		assert.InDelta(t, float32(0.79), result[0].Confidence(), 0.1)
+	})
+	t.Run("Cat720", func(t *testing.T) {
+		result, err := GenerateLabels(Files{samplesPath + "/cat_720.jpeg"}, media.SrcLocal, entity.SrcAuto)
+
+		require.NoError(t, err)
+		assert.IsType(t, classify.Labels{}, result)
+		require.Len(t, result, 1)
+
+		t.Log(result)
+
+		assert.Equal(t, "cat", result[0].Name)
+		assert.InDelta(t, 20, result[0].Uncertainty, 10)
+		assert.InDelta(t, float32(0.8), result[0].Confidence(), 0.1)
+	})
+	t.Run("CustomSourceLocal", func(t *testing.T) {
+		labels, err := GenerateLabels(Files{samplesPath + "/cat_224.jpeg"}, media.SrcLocal, entity.SrcManual)
+		if err != nil {
+			t.Fatalf("GenerateLabels error: %v", err)
+		}
+		for _, label := range labels {
+			if label.Source != entity.SrcManual {
+				t.Fatalf("expected custom source %q, got %q", entity.SrcManual, label.Source)
+			}
+		}
+	})
+	t.Run("InvalidFile", func(t *testing.T) {
+		_, err := GenerateLabels(Files{samplesPath + "/notexisting.jpg"}, media.SrcLocal, entity.SrcAuto)
+		assert.Error(t, err)
+	})
+}
+
+func TestGenerateLabelsRequestShapingForStructuredOutputIdea(t *testing.T) {
+	prevConfig := Config
+	t.Cleanup(func() {
+		Config = prevConfig
+	})
+	t.Run("OllamaUsesJsonFormatWithSchemaPromptInstructions", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			// Decode into a map because the serialized "think" value is a JSON boolean
+			// (the Ollama engine now disables reasoning by default), not the string form.
+			var req map[string]any
+			require.NoError(t, json.NewDecoder(r.Body).Decode(&req))
+
+			assert.Equal(t, FormatJSON, req["format"])
+			assert.Contains(t, req["prompt"], "Return JSON that matches this schema:")
+			assert.NotContains(t, req, "schema", "Ollama structured schema payload is not sent yet")
+			assert.Equal(t, false, req["think"], "reasoning is disabled by default for the Ollama engine")
+
+			require.NoError(t, json.NewEncoder(w).Encode(ollama.Response{
+				Model:    "gemma3:4b",
+				Response: `{"labels":[{"name":"cat","confidence":0.92,"topicality":0.88}]}`,
+			}))
+		}))
+		defer server.Close()
+
+		model := &Model{
+			Type:   ModelTypeLabels,
+			Name:   "gemma3:4b",
+			Engine: ollama.EngineName,
+			Service: Service{
+				Uri:            server.URL,
+				Method:         http.MethodPost,
+				RequestFormat:  ApiFormatOllama,
+				ResponseFormat: ApiFormatOllama,
+				FileScheme:     scheme.Base64,
+			},
+		}
+		model.ApplyEngineDefaults()
+
+		Config = &ConfigValues{
+			Models:     Models{model},
+			Thresholds: DefaultThresholds,
+		}
+
+		labels, err := GenerateLabels(Files{samplesPath + "/cat_224.jpeg"}, media.SrcLocal, entity.SrcAuto)
+		require.NoError(t, err)
+		require.Len(t, labels, 1)
+		assert.Equal(t, "Cat", labels[0].Name)
+		assert.Equal(t, entity.SrcOllama, labels[0].Source)
+	})
+	t.Run("OpenAIUsesStructuredOutputAndStillAppendsSchemaPrompt", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			var reqPayload openai.HTTPRequest
+			require.NoError(t, json.NewDecoder(r.Body).Decode(&reqPayload))
+
+			require.NotNil(t, reqPayload.Text)
+			require.NotNil(t, reqPayload.Text.Format)
+			assert.Equal(t, openai.ResponseFormatJSONSchema, reqPayload.Text.Format.Type)
+			assert.NotEmpty(t, reqPayload.Text.Format.Schema)
+
+			var promptText string
+			for i := range reqPayload.Input {
+				if reqPayload.Input[i].Role != "user" {
+					continue
+				}
+
+				for j := range reqPayload.Input[i].Content {
+					if reqPayload.Input[i].Content[j].Type == openai.ContentTypeText {
+						promptText = reqPayload.Input[i].Content[j].Text
+						break
+					}
+				}
+			}
+
+			if strings.TrimSpace(promptText) == "" {
+				t.Fatal("expected user text prompt in OpenAI request")
+			}
+
+			assert.Contains(t, promptText, "Return JSON that matches this schema:")
+
+			response := map[string]any{
+				"id":    "resp_5450",
+				"model": "gpt-5-mini",
+				"output": []any{
+					map[string]any{
+						"role": "assistant",
+						"content": []any{
+							map[string]any{
+								"type": "output_json",
+								"json": map[string]any{
+									"labels": []map[string]any{
+										{
+											"name":       "cat",
+											"confidence": 0.94,
+											"topicality": 0.89,
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			}
+
+			require.NoError(t, json.NewEncoder(w).Encode(response))
+		}))
+		defer server.Close()
+
+		model := &Model{
+			Type:   ModelTypeLabels,
+			Name:   "gpt-5-mini",
+			Engine: openai.EngineName,
+			Service: Service{
+				Uri:            server.URL,
+				Method:         http.MethodPost,
+				RequestFormat:  ApiFormatOpenAI,
+				ResponseFormat: ApiFormatOpenAI,
+				FileScheme:     scheme.Data,
+			},
+		}
+		model.ApplyEngineDefaults()
+
+		Config = &ConfigValues{
+			Models:     Models{model},
+			Thresholds: DefaultThresholds,
+		}
+
+		labels, err := GenerateLabels(Files{samplesPath + "/cat_224.jpeg"}, media.SrcLocal, entity.SrcAuto)
+		require.NoError(t, err)
+		require.Len(t, labels, 1)
+		assert.Equal(t, "Cat", labels[0].Name)
+		assert.Equal(t, entity.SrcOpenAI, labels[0].Source)
+	})
+}
+
+func TestGenerateLabelsNormalizeMode(t *testing.T) {
+	useSelfHostedOllamaDefaults(t)
+
+	prevConfig := Config
+	t.Cleanup(func() {
+		Config = prevConfig
+	})
+
+	// Serves one compound label and asserts that the mode never reaches the service.
+	newServer := func(t *testing.T) *httptest.Server {
+		t.Helper()
+
+		return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			var req map[string]any
+			require.NoError(t, json.NewDecoder(r.Body).Decode(&req))
+			assert.NotContains(t, req, "normalize", "the normalize mode must not be sent to the service")
+
+			require.NoError(t, json.NewEncoder(w).Encode(ollama.Response{
+				Model:    "gemma3:4b",
+				Response: `{"labels":[{"name":"ferris wheel","confidence":0.92,"topicality":0.88}]}`,
+			}))
+		}))
+	}
+
+	generate := func(t *testing.T, uri, normalize string) classify.Labels {
+		t.Helper()
+
+		model := &Model{
+			Type:      ModelTypeLabels,
+			Name:      "gemma3:4b",
+			Engine:    ollama.EngineName,
+			Normalize: normalize,
+			Service: Service{
+				Uri:            uri,
+				Method:         http.MethodPost,
+				RequestFormat:  ApiFormatOllama,
+				ResponseFormat: ApiFormatOllama,
+				FileScheme:     scheme.Base64,
+			},
+		}
+		model.ApplyEngineDefaults()
+
+		Config = &ConfigValues{Models: Models{model}, Thresholds: DefaultThresholds}
+
+		labels, err := GenerateLabels(Files{samplesPath + "/cat_224.jpeg"}, media.SrcLocal, entity.SrcAuto)
+		require.NoError(t, err)
+
+		return labels
+	}
+
+	cases := []struct {
+		name      string
+		normalize string
+		want      string
+	}{
+		{name: "Default", normalize: "", want: "Ferris"},
+		{name: "Phrase", normalize: "phrase", want: "Ferris Wheel"},
+		{name: "False", normalize: "false", want: "Ferris Wheel"},
+		{name: "InvalidFallsBackToDefault", normalize: "bogus", want: "Ferris"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			server := newServer(t)
+			defer server.Close()
+
+			labels := generate(t, server.URL, tc.normalize)
+			require.Len(t, labels, 1)
+			assert.Equal(t, tc.want, labels[0].Name)
+			assert.Equal(t, entity.SrcOllama, labels[0].Source)
+		})
+	}
+}
+
+func TestGenerateLabelsRefused(t *testing.T) {
+	prevConfig := Config
+	t.Cleanup(func() { Config = prevConfig })
+
+	// A service that refuses the request returns an error rather than an empty result.
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = w.Write([]byte(`{"code":403,"error":"Forbidden","result":{}}`))
+	}))
+	defer server.Close()
+
+	Config = &ConfigValues{Models: Models{{Type: ModelTypeLabels, Name: "nasnet", Service: Service{
+		Uri: server.URL, Method: http.MethodPost, RequestFormat: ApiFormatVision, ResponseFormat: ApiFormatVision, FileScheme: scheme.Data,
+	}}}, Thresholds: DefaultThresholds}
+
+	labels, err := GenerateLabels(Files{samplesPath + "/cat_224.jpeg"}, media.SrcLocal, entity.SrcAuto)
+	assert.EqualError(t, err, "vision service request failed (status 403)")
+	assert.Empty(t, labels)
+}
+
+// TestGenerateLabelsServiceKey checks which access token is sent to the shared service and to a model's own endpoint.
+func TestGenerateLabelsServiceKey(t *testing.T) {
+	prevConfig := Config
+	t.Cleanup(func() { Config = prevConfig })
+
+	type recorded struct {
+		auth string
+		hits int
+	}
+
+	// Records the Authorization header and answers in the format of the requesting model.
+	newServer := func(t *testing.T, rec *recorded) *httptest.Server {
+		t.Helper()
+
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			rec.auth = r.Header.Get("Authorization")
+			rec.hits++
+
+			if strings.HasSuffix(r.URL.Path, "/labels") {
+				require.NoError(t, json.NewEncoder(w).Encode(ApiResponse{
+					Code:   http.StatusOK,
+					Result: ApiResult{Labels: []LabelResult{{Name: "cat", Confidence: 0.92, Topicality: 0.88}}},
+				}))
+			} else {
+				require.NoError(t, json.NewEncoder(w).Encode(ollama.Response{
+					Model:    "gemma3:4b",
+					Response: `{"labels":[{"name":"cat","confidence":0.92,"topicality":0.88}]}`,
+				}))
+			}
+		}))
+		t.Cleanup(server.Close)
+
+		return server
+	}
+
+	// Returns an Ollama model that sends its requests to the specified endpoint.
+	ollamaModel := func(uri, key string) *Model {
+		model := &Model{
+			Type:   ModelTypeLabels,
+			Name:   "gemma3:4b",
+			Engine: ollama.EngineName,
+			Service: Service{
+				Uri:            uri,
+				Key:            key,
+				Method:         http.MethodPost,
+				RequestFormat:  ApiFormatOllama,
+				ResponseFormat: ApiFormatOllama,
+				FileScheme:     scheme.Base64,
+			},
+		}
+		model.ApplyEngineDefaults()
+
+		return model
+	}
+
+	generate := func(t *testing.T, model *Model) {
+		t.Helper()
+
+		Config = &ConfigValues{Models: Models{model}, Thresholds: DefaultThresholds}
+
+		labels, err := GenerateLabels(Files{samplesPath + "/cat_224.jpeg"}, media.SrcLocal, entity.SrcAuto)
+		require.NoError(t, err)
+		require.Len(t, labels, 1)
+		assert.True(t, strings.EqualFold("cat", labels[0].Name), labels[0].Name)
+	}
+
+	t.Run("SharedService", func(t *testing.T) {
+		var shared recorded
+		useSharedService(t, newServer(t, &shared).URL, "shared-vision-key")
+
+		generate(t, &Model{Type: ModelTypeLabels, Name: "nasnet"})
+		assert.Equal(t, 1, shared.hits)
+		assert.Equal(t, "Bearer shared-vision-key", shared.auth)
+	})
+	t.Run("OwnEndpoint", func(t *testing.T) {
+		var shared, own recorded
+		useSharedService(t, newServer(t, &shared).URL, "shared-vision-key")
+		clearEngineKeys(t)
+
+		generate(t, ollamaModel(newServer(t, &own).URL, ""))
+		assert.Equal(t, 0, shared.hits)
+		assert.Equal(t, 1, own.hits)
+		assert.Empty(t, own.auth)
+	})
+	t.Run("OwnEndpointOwnKey", func(t *testing.T) {
+		var shared, own recorded
+		useSharedService(t, newServer(t, &shared).URL, "shared-vision-key")
+		clearEngineKeys(t)
+
+		generate(t, ollamaModel(newServer(t, &own).URL, "own-key"))
+		assert.Equal(t, 0, shared.hits)
+		assert.Equal(t, 1, own.hits)
+		assert.Equal(t, "Bearer own-key", own.auth)
+	})
+}
+
+// TestGenerateLabelsMissingConcurrent verifies initialization failures never mutate shared disablement.
+func TestGenerateLabelsMissingConcurrent(t *testing.T) {
+	previous := ModelsPath
+	ModelsPath = t.TempDir()
+	t.Cleanup(func() { ModelsPath = previous })
+	model := NewLabelModel(classify.DefaultModelName())
+	withConfig(t, &ConfigValues{Models: Models{model}})
+	hook := captureVisionLog(t)
+	var workers sync.WaitGroup
+	for range 16 {
+		workers.Add(1)
+		go func() {
+			defer workers.Done()
+			for range 8 {
+				_, err := GenerateLabels(Files{"missing.jpg"}, media.SrcLocal, entity.SrcAuto)
+				assert.Error(t, err)
+			}
+		}()
+	}
+	workers.Wait()
+	assert.False(t, model.Disabled)
+	require.Error(t, model.classifyErr)
+	assert.Same(t, model, Config.Model(ModelTypeLabels))
+
+	// The model is initialized once; later calls return the cached error without retrying.
+	assert.Len(t, initWarnings(hook.AllEntries()), 1)
+}
+
+// initWarnings returns the logged model initialization failures.
+func initWarnings(entries []*logrus.Entry) (result []string) {
+	for _, message := range logMessages(entries, logrus.WarnLevel) {
+		if strings.Contains(message, "fix or install it") {
+			result = append(result, message)
+		}
+	}
+
+	return result
+}

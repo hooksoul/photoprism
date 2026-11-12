@@ -5,9 +5,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/photoprism/photoprism/internal/migrate"
+	"github.com/photoprism/photoprism/pkg/dsn"
 
-	"github.com/jinzhu/gorm"
+	"github.com/photoprism/photoprism/internal/entity/migrate"
 )
 
 func TestMySQL8(t *testing.T) {
@@ -17,12 +17,12 @@ func TestMySQL8(t *testing.T) {
 		t.Skip("skipping MySQL 8 test: PHOTOPRISM_TEST_DSN_MYSQL8 is not set")
 	}
 
-	dbDriver := MySQL
-	db, err := gorm.Open(dbDriver, dbDsn)
+	dbDriver := dsn.DriverMySQL
+	db, err := OpenDb(dbDriver, dbDsn)
 
 	if err != nil || db == nil {
 		for i := 1; i <= 5; i++ {
-			db, err = gorm.Open(dbDriver, dbDsn)
+			db, err = OpenDb(dbDriver, dbDsn)
 
 			if db != nil && err == nil {
 				break
@@ -36,22 +36,29 @@ func TestMySQL8(t *testing.T) {
 		}
 	}
 
-	defer db.Close()
-
-	db.LogMode(false)
+	defer CloseDb(db)
 
 	DeprecatedTables.Drop(db)
 	Entities.Drop(db)
 
 	// First migration.
 	Entities.Migrate(db, migrate.Opt(true, false, nil))
-	Entities.WaitForMigration(db)
+
+	if err = Entities.WaitForMigration(db); err != nil {
+		t.Fatal(err)
+	}
 
 	// Second migration.
 	Entities.Migrate(db, migrate.Opt(true, false, nil))
-	Entities.WaitForMigration(db)
+
+	if err = Entities.WaitForMigration(db); err != nil {
+		t.Fatal(err)
+	}
 
 	// Third migration with force flag.
 	Entities.Migrate(db, migrate.Opt(true, false, []string{"20211121-094727"}))
-	Entities.WaitForMigration(db)
+
+	if err = Entities.WaitForMigration(db); err != nil {
+		t.Fatal(err)
+	}
 }

@@ -3,15 +3,16 @@ package photoprism
 import (
 	"testing"
 
-	"github.com/photoprism/photoprism/internal/config"
 	"github.com/stretchr/testify/assert"
+
+	"github.com/photoprism/photoprism/internal/config"
 )
 
 func TestMediaFile_TimeZone(t *testing.T) {
-	t.Run("/elephants.jpg", func(t *testing.T) {
+	t.Run("ElephantsJpg", func(t *testing.T) {
 		conf := config.TestConfig()
 
-		img, err := NewMediaFile(conf.ExamplesPath() + "/elephants.jpg")
+		img, err := NewMediaFile(conf.SamplesPath() + "/elephants.jpg")
 
 		assert.Nil(t, err)
 

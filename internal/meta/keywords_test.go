@@ -7,8 +7,8 @@ import (
 )
 
 func TestData_AddKeywords(t *testing.T) {
-	t.Run("success", func(t *testing.T) {
-		data := New()
+	t.Run("Success", func(t *testing.T) {
+		data := NewData()
 
 		assert.Equal(t, "", data.Keywords.String())
 
@@ -20,9 +20,8 @@ func TestData_AddKeywords(t *testing.T) {
 
 		assert.Equal(t, "baz, foobar, pro", data.Keywords.String())
 	})
-
-	t.Run("ignore", func(t *testing.T) {
-		data := New()
+	t.Run("Ignore", func(t *testing.T) {
+		data := NewData()
 
 		assert.Equal(t, "", data.Keywords.String())
 
@@ -33,8 +32,8 @@ func TestData_AddKeywords(t *testing.T) {
 }
 
 func TestData_AutoAddKeywords(t *testing.T) {
-	t.Run("success", func(t *testing.T) {
-		data := New()
+	t.Run("Success", func(t *testing.T) {
+		data := NewData()
 
 		assert.Equal(t, "", data.Keywords.String())
 
@@ -42,9 +41,8 @@ func TestData_AutoAddKeywords(t *testing.T) {
 
 		assert.Equal(t, "burst", data.Keywords.String())
 	})
-
-	t.Run("ignore", func(t *testing.T) {
-		data := New()
+	t.Run("Ignore", func(t *testing.T) {
+		data := NewData()
 
 		assert.Equal(t, "", data.Keywords.String())
 
@@ -52,9 +50,8 @@ func TestData_AutoAddKeywords(t *testing.T) {
 
 		assert.Equal(t, "", data.Keywords.String())
 	})
-
-	t.Run("ignore because too short", func(t *testing.T) {
-		data := New()
+	t.Run("IgnoreBecauseTooShort", func(t *testing.T) {
+		data := NewData()
 
 		assert.Equal(t, "", data.Keywords.String())
 

@@ -3,7 +3,7 @@ package form
 import (
 	"github.com/ulule/deepcopier"
 
-	"github.com/photoprism/photoprism/internal/remote"
+	"github.com/photoprism/photoprism/internal/service"
 )
 
 // Service represents a remote service form for uploading, downloading or syncing media files.
@@ -16,7 +16,7 @@ type Service struct {
 	AccUser       string `json:"AccUser"`
 	AccPass       string `json:"AccPass"`
 	AccTimeout    string `json:"AccTimeout"` // Request timeout: default, high, medium, low, none
-	AccError      string `json:"AccError"`
+	AccError      string `json:"AccError"`   // Read only, except that an empty value clears it.
 	AccShare      bool   `json:"AccShare"`   // Manual upload enabled, see SharePath, ShareSize, and ShareExpires.
 	AccSync       bool   `json:"AccSync"`    // Background sync enabled, see SyncDownload and SyncUpload.
 	RetryLimit    int    `json:"RetryLimit"` // Maximum number of failed requests.
@@ -29,18 +29,19 @@ type Service struct {
 	SyncDownload  bool   `json:"SyncDownload"`
 	SyncFilenames bool   `json:"SyncFilenames"`
 	SyncRaw       bool   `json:"SyncRaw"`
+	SyncYaml      int    `json:"SyncYaml"` // YAML sidecar files: -1 disabled, 0 default (enabled), 1 enabled.
 }
 
 // NewService creates a new service form.
-func NewService(m interface{}) (f Service, err error) {
+func NewService(m any) (f Service, err error) {
 	err = deepcopier.Copy(m).To(&f)
 
 	return f, err
 }
 
 // Discovery performs automatic service discovery.
-func (f *Service) Discovery() error {
-	acc, err := remote.Discover(f.AccURL, f.AccUser, f.AccPass)
+func (f *Service) Discovery(servicesCIDR string) error {
+	acc, err := service.Discover(f.AccURL, f.AccUser, f.AccPass, servicesCIDR)
 
 	if err != nil {
 		return err

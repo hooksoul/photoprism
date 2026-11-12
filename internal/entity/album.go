@@ -1,24 +1,27 @@
 package entity
 
 import (
+	"errors"
 	"fmt"
-	"os"
+	"path"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
-	"github.com/jinzhu/gorm"
 	"github.com/ulule/deepcopier"
+	"gorm.io/gorm"
 
+	"github.com/photoprism/photoprism/internal/entity/sortby"
 	"github.com/photoprism/photoprism/internal/event"
 	"github.com/photoprism/photoprism/internal/form"
-	"github.com/photoprism/photoprism/internal/maps"
+	"github.com/photoprism/photoprism/internal/service/maps"
 	"github.com/photoprism/photoprism/pkg/clean"
 	"github.com/photoprism/photoprism/pkg/rnd"
-	"github.com/photoprism/photoprism/pkg/sortby"
 	"github.com/photoprism/photoprism/pkg/txt"
 )
 
+// Album types and the prefix that identifies a generated album UID.
 const (
 	AlbumUID    = byte('a')
 	AlbumManual = "album"
@@ -28,49 +31,74 @@ const (
 	AlbumState  = "state"
 )
 
-type Albums []Album
-
-// Album represents a photo album
-type Album struct {
-	ID               uint        `gorm:"primary_key" json:"ID" yaml:"-"`
-	AlbumUID         string      `gorm:"type:VARBINARY(42);unique_index;" json:"UID" yaml:"UID"`
-	ParentUID        string      `gorm:"type:VARBINARY(42);default:'';" json:"ParentUID,omitempty" yaml:"ParentUID,omitempty"`
-	AlbumSlug        string      `gorm:"type:VARBINARY(160);index;" json:"Slug" yaml:"Slug"`
-	AlbumPath        string      `gorm:"type:VARCHAR(1024);index;" json:"Path,omitempty" yaml:"Path,omitempty"`
-	AlbumType        string      `gorm:"type:VARBINARY(8);default:'album';" json:"Type" yaml:"Type,omitempty"`
-	AlbumTitle       string      `gorm:"type:VARCHAR(160);index;" json:"Title" yaml:"Title"`
-	AlbumLocation    string      `gorm:"type:VARCHAR(160);" json:"Location" yaml:"Location,omitempty"`
-	AlbumCategory    string      `gorm:"type:VARCHAR(100);index;" json:"Category" yaml:"Category,omitempty"`
-	AlbumCaption     string      `gorm:"type:VARCHAR(1024);" json:"Caption" yaml:"Caption,omitempty"`
-	AlbumDescription string      `gorm:"type:VARCHAR(2048);" json:"Description" yaml:"Description,omitempty"`
-	AlbumNotes       string      `gorm:"type:VARCHAR(1024);" json:"Notes" yaml:"Notes,omitempty"`
-	AlbumFilter      string      `gorm:"type:VARBINARY(2048);" json:"Filter" yaml:"Filter,omitempty"`
-	AlbumOrder       string      `gorm:"type:VARBINARY(32);" json:"Order" yaml:"Order,omitempty"`
-	AlbumTemplate    string      `gorm:"type:VARBINARY(255);" json:"Template" yaml:"Template,omitempty"`
-	AlbumState       string      `gorm:"type:VARCHAR(100);index;" json:"State" yaml:"State,omitempty"`
-	AlbumCountry     string      `gorm:"type:VARBINARY(2);index:idx_albums_country_year_month;default:'zz';" json:"Country" yaml:"Country,omitempty"`
-	AlbumYear        int         `gorm:"index:idx_albums_ymd;index:idx_albums_country_year_month;" json:"Year" yaml:"Year,omitempty"`
-	AlbumMonth       int         `gorm:"index:idx_albums_ymd;index:idx_albums_country_year_month;" json:"Month" yaml:"Month,omitempty"`
-	AlbumDay         int         `gorm:"index:idx_albums_ymd;" json:"Day" yaml:"Day,omitempty"`
-	AlbumFavorite    bool        `json:"Favorite" yaml:"Favorite,omitempty"`
-	AlbumPrivate     bool        `json:"Private" yaml:"Private,omitempty"`
-	Thumb            string      `gorm:"type:VARBINARY(128);index;default:'';" json:"Thumb" yaml:"Thumb,omitempty"`
-	ThumbSrc         string      `gorm:"type:VARBINARY(8);default:'';" json:"ThumbSrc,omitempty" yaml:"ThumbSrc,omitempty"`
-	CreatedBy        string      `gorm:"type:VARBINARY(42);index" json:"CreatedBy,omitempty" yaml:"CreatedBy,omitempty"`
-	CreatedAt        time.Time   `json:"CreatedAt" yaml:"CreatedAt,omitempty"`
-	UpdatedAt        time.Time   `json:"UpdatedAt" yaml:"UpdatedAt,omitempty"`
-	PublishedAt      *time.Time  `sql:"index" json:"PublishedAt,omitempty" yaml:"PublishedAt,omitempty"`
-	DeletedAt        *time.Time  `sql:"index" json:"DeletedAt" yaml:"DeletedAt,omitempty"`
-	Photos           PhotoAlbums `gorm:"foreignkey:AlbumUID;association_foreignkey:AlbumUID;" json:"-" yaml:"Photos,omitempty"`
+// IsAlbumType reports whether s is one of the album types above.
+func IsAlbumType(s string) bool {
+	switch s {
+	case AlbumManual, AlbumFolder, AlbumMoment, AlbumMonth, AlbumState:
+		return true
+	default:
+		return false
+	}
 }
 
-// AfterUpdate flushes the album cache.
+// Default sort orders, one per album type.
+var (
+	DefaultOrderAlbum  = sortby.Oldest
+	DefaultOrderFolder = sortby.Added
+	DefaultOrderMoment = sortby.Oldest
+	DefaultOrderState  = sortby.Newest
+	DefaultOrderMonth  = sortby.Oldest
+)
+
+var (
+	albumGlobalLock = sync.Mutex{}
+	albumLocks      sync.Map // map[string]*sync.Mutex keyed by UID or normalized title
+)
+
+// Albums is a helper slice type for working with groups of albums.
+type Albums []Album
+
+// Album represents a photo album and its metadata, including filter definitions for virtual albums.
+type Album struct {
+	ID               uint        `gorm:"primaryKey;size:32" json:"ID" yaml:"-"`
+	AlbumUID         string      `gorm:"type:bytes;size:42;uniqueIndex:uix_albums_album_uid;" json:"UID" yaml:"UID"`
+	ParentUID        string      `gorm:"type:bytes;size:42;default:'';" json:"ParentUID,omitempty" yaml:"ParentUID,omitempty"`
+	AlbumSlug        string      `gorm:"type:bytes;size:160;index;" json:"Slug" yaml:"Slug"`
+	AlbumPath        string      `gorm:"type:bytes;size:1024;index;" json:"Path,omitempty" yaml:"Path,omitempty"`
+	AlbumType        string      `gorm:"type:bytes;size:8;default:'album';" json:"Type" yaml:"Type,omitempty"`
+	AlbumTitle       string      `gorm:"size:160;index;" json:"Title" yaml:"Title"`
+	AlbumLocation    string      `gorm:"size:160;" json:"Location" yaml:"Location,omitempty"`
+	AlbumCategory    string      `gorm:"size:100;index;" json:"Category" yaml:"Category,omitempty"`
+	AlbumCaption     string      `gorm:"size:1024;" json:"Caption" yaml:"Caption,omitempty"`
+	AlbumDescription string      `gorm:"size:2048;" json:"Description" yaml:"Description,omitempty"`
+	AlbumNotes       string      `gorm:"size:1024;" json:"Notes" yaml:"Notes,omitempty"`
+	AlbumFilter      string      `gorm:"type:bytes;size:2048;default:'';" json:"Filter" yaml:"Filter,omitempty"`
+	AlbumOrder       string      `gorm:"type:bytes;size:32;" json:"Order" yaml:"Order,omitempty"`
+	AlbumTemplate    string      `gorm:"type:bytes;size:255;" json:"Template" yaml:"Template,omitempty"`
+	AlbumState       string      `gorm:"size:100;index;" json:"State" yaml:"State,omitempty"`
+	AlbumCountry     string      `gorm:"type:bytes;size:2;index:idx_albums_country_year_month;default:'zz';" json:"Country" yaml:"Country,omitempty"`
+	AlbumYear        int         `gorm:"index:idx_albums_country_year_month;size:32;" json:"Year" yaml:"Year,omitempty"`
+	AlbumMonth       int         `gorm:"index:idx_albums_country_year_month;size:32;" json:"Month" yaml:"Month,omitempty"`
+	AlbumDay         int         `gorm:"index:idx_albums_ymd;size:32;" json:"Day" yaml:"Day,omitempty"`
+	AlbumFavorite    bool        `json:"Favorite" yaml:"Favorite,omitempty"`
+	AlbumPrivate     bool        `json:"Private" yaml:"Private,omitempty"`
+	Thumb            string      `gorm:"type:bytes;size:128;index;default:'';" json:"Thumb" yaml:"Thumb,omitempty"`
+	ThumbSrc         string      `gorm:"type:bytes;size:8;default:'';" json:"ThumbSrc,omitempty" yaml:"ThumbSrc,omitempty"`
+	CreatedBy        string      `gorm:"type:bytes;size:42;index" json:"CreatedBy,omitempty" yaml:"CreatedBy,omitempty"`
+	CreatedAt        time.Time   `json:"CreatedAt" yaml:"CreatedAt,omitempty"`
+	UpdatedAt        time.Time   `json:"UpdatedAt" yaml:"UpdatedAt,omitempty"`
+	PublishedAt      *time.Time  `gorm:"index" json:"PublishedAt,omitempty" yaml:"PublishedAt,omitempty"`
+	DeletedAt        DeletedAt   `gorm:"index" json:"DeletedAt" yaml:"DeletedAt,omitempty"`
+	Photos           PhotoAlbums `gorm:"foreignKey:AlbumUID;references:AlbumUID;-:migration" json:"-" yaml:"Photos,omitempty"`
+}
+
+// AfterUpdate flushes the album cache when an album is updated.
 func (m *Album) AfterUpdate(tx *gorm.DB) (err error) {
 	FlushAlbumCache()
 	return
 }
 
-// AfterDelete flushes the album cache.
+// AfterDelete flushes the album cache when an album is deleted.
 func (m *Album) AfterDelete(tx *gorm.DB) (err error) {
 	FlushAlbumCache()
 	return
@@ -81,13 +109,24 @@ func (Album) TableName() string {
 	return "albums"
 }
 
-// AddPhotoToAlbums adds a photo UID to multiple albums and automatically creates them if needed.
-func AddPhotoToAlbums(uid string, albums []string) (err error) {
-	return AddPhotoToUserAlbums(uid, albums, OwnerUnknown)
+// UpdateAlbum updates album attributes directly in the database by UID.
+func UpdateAlbum(albumUID string, values any) (err error) {
+	if rnd.InvalidUID(albumUID, AlbumUID) {
+		return fmt.Errorf("album: invalid uid %s", clean.Log(albumUID))
+	} else if err = Db().Model(&Album{}).Where("album_uid = ?", albumUID).UpdateColumns(values).Error; err != nil {
+		return err
+	}
+
+	return nil
 }
 
-// AddPhotoToUserAlbums adds a photo UID to multiple albums and automatically creates them as a user if needed.
-func AddPhotoToUserAlbums(photoUid string, albums []string, userUid string) (err error) {
+// AddPhotoToAlbums adds a photo UID to multiple albums and automatically creates them with default ownership when required.
+func AddPhotoToAlbums(uid string, albums []string) (err error) {
+	return AddPhotoToUserAlbums(uid, albums, DefaultOrderAlbum, OwnerUnknown)
+}
+
+// AddPhotoToUserAlbums adds a photo UID to multiple albums while creating any missing albums for the given user.
+func AddPhotoToUserAlbums(photoUid string, albums []string, sortOrder, userUid string) (err error) {
 	if photoUid == "" || len(albums) == 0 {
 		// Do nothing.
 		return nil
@@ -98,56 +137,105 @@ func AddPhotoToUserAlbums(photoUid string, albums []string, userUid string) (err
 	}
 
 	for _, album := range albums {
-		var albumUid string
-
 		if album == "" {
 			log.Debugf("album: cannot add photo uid %s because album id was not specified", clean.Log(photoUid))
 			continue
 		}
 
-		if rnd.IsUID(album, AlbumUID) {
-			albumUid = album
-		} else {
-			a := NewUserAlbum(album, AlbumManual, userUid)
-
-			if found := a.Find(); found != nil {
-				albumUid = found.AlbumUID
-			} else if err = a.Create(); err == nil {
-				albumUid = a.AlbumUID
-			} else {
-				log.Errorf("album: %s (add photo %s to albums)", err.Error(), photoUid)
-			}
+		unlock := lockAlbumKey(album)
+		if lockErr := addPhotoToAlbumLocked(photoUid, album, sortOrder, userUid); lockErr != nil {
+			err = lockErr
 		}
+		unlock()
+	}
 
-		if albumUid != "" {
-			entry := PhotoAlbum{AlbumUID: albumUid, PhotoUID: photoUid, Hidden: false}
+	return err
+}
 
-			if err = entry.Save(); err != nil {
-				log.Errorf("album: %s (add photo %s to albums)", err.Error(), photoUid)
-			}
+// lockAlbumKey acquires a per-album mutex keyed by UID or normalized title to avoid
+// serializing unrelated album updates while still preventing duplicate creation when
+// multiple goroutines target the same album concurrently.
+func lockAlbumKey(album string) func() {
+	key := strings.TrimSpace(album)
+
+	if key == "" {
+		albumGlobalLock.Lock()
+		return albumGlobalLock.Unlock
+	}
+
+	if rnd.IsUID(key, AlbumUID) {
+		// keep UID as-is so existing albums share the same lock
+	} else {
+		key = strings.ToLower(key)
+	}
+
+	locker, _ := albumLocks.LoadOrStore(key, &sync.Mutex{})
+	mu := locker.(*sync.Mutex)
+	mu.Lock()
+
+	return mu.Unlock
+}
+
+// addPhotoToAlbumLocked performs the actual album lookup/creation and relation insert
+// while assuming the caller already holds the per-album mutex.
+func addPhotoToAlbumLocked(photoUid, album, sortOrder, userUid string) (err error) {
+	var albumUid string
+
+	if rnd.IsUID(album, AlbumUID) {
+		albumUid = album
+	} else {
+		a := NewUserAlbum(album, AlbumManual, sortOrder, userUid)
+
+		if found := a.Find(); found != nil {
+			albumUid = found.AlbumUID
+		} else if err = a.Create(); err == nil {
+			albumUid = a.AlbumUID
+		} else {
+			log.Errorf("album: %s (add photo %s to albums)", err.Error(), photoUid)
+		}
+	}
+
+	if albumUid == "" {
+		return err
+	}
+
+	entry := PhotoAlbum{AlbumUID: albumUid, PhotoUID: photoUid, Hidden: false}
+
+	if err = entry.Save(); err != nil {
+		log.Errorf("album: %s (add photo %s to albums)", err.Error(), photoUid)
+	}
+
+	if updateErr := UpdateAlbum(albumUid, Values{"updated_at": TimeStamp()}); updateErr != nil {
+		if err == nil {
+			err = updateErr
 		}
 	}
 
 	return err
 }
 
-// NewAlbum creates a new album of the given type.
+// NewAlbum creates a new album of the given type using default ownership.
 func NewAlbum(albumTitle, albumType string) *Album {
-	return NewUserAlbum(albumTitle, albumType, OwnerUnknown)
+	return NewUserAlbum(albumTitle, albumType, sortby.Oldest, OwnerUnknown)
 }
 
-// NewUserAlbum creates a new album owned by a user.
-func NewUserAlbum(albumTitle, albumType, userUid string) *Album {
-	now := TimeStamp()
+// NewUserAlbum creates a new album owned by a user and pre-fills timestamps/order defaults.
+func NewUserAlbum(albumTitle, albumType, sortOrder, userUid string) *Album {
+	now := Now()
 
 	// Set default type.
 	if albumType == "" {
 		albumType = AlbumManual
 	}
 
+	// Set default sort order.
+	if sortOrder == "" {
+		sortOrder = DefaultOrderAlbum
+	}
+
 	// Set default values.
 	result := &Album{
-		AlbumOrder: sortby.Oldest,
+		AlbumOrder: sortOrder,
 		AlbumType:  albumType,
 		CreatedAt:  now,
 		UpdatedAt:  now,
@@ -160,21 +248,21 @@ func NewUserAlbum(albumTitle, albumType, userUid string) *Album {
 	return result
 }
 
-// NewFolderAlbum creates a new folder album.
+// NewFolderAlbum creates a new album representing a filesystem folder.
 func NewFolderAlbum(albumTitle, albumPath, albumFilter string) *Album {
-	albumSlug := txt.Slug(albumPath)
+	albumSlug := txt.SlugUnique(albumPath)
 
 	if albumTitle == "" || albumSlug == "" || albumPath == "" || albumFilter == "" {
 		return nil
 	}
 
-	now := TimeStamp()
+	now := Now()
 
 	result := &Album{
-		AlbumOrder:  sortby.Added,
+		AlbumOrder:  DefaultOrderFolder,
 		AlbumType:   AlbumFolder,
 		AlbumSlug:   txt.Clip(albumSlug, txt.ClipSlug),
-		AlbumPath:   txt.Clip(albumPath, txt.ClipPath),
+		AlbumPath:   ClipPath(albumPath),
 		AlbumFilter: albumFilter,
 		CreatedAt:   now,
 		UpdatedAt:   now,
@@ -185,16 +273,16 @@ func NewFolderAlbum(albumTitle, albumPath, albumFilter string) *Album {
 	return result
 }
 
-// NewMomentsAlbum creates a new moment.
+// NewMomentsAlbum creates a new automatically generated moment album.
 func NewMomentsAlbum(albumTitle, albumSlug, albumFilter string) *Album {
 	if albumTitle == "" || albumSlug == "" || albumFilter == "" {
 		return nil
 	}
 
-	now := TimeStamp()
+	now := Now()
 
 	result := &Album{
-		AlbumOrder:  sortby.Oldest,
+		AlbumOrder:  DefaultOrderMoment,
 		AlbumType:   AlbumMoment,
 		AlbumSlug:   txt.Clip(albumSlug, txt.ClipSlug),
 		AlbumFilter: albumFilter,
@@ -207,7 +295,7 @@ func NewMomentsAlbum(albumTitle, albumSlug, albumFilter string) *Album {
 	return result
 }
 
-// NewStateAlbum creates a new moment.
+// NewStateAlbum creates an automatically generated album for a specific state or region.
 func NewStateAlbum(albumTitle, albumSlug, albumFilter string) *Album {
 	albumTitle = strings.TrimSpace(albumTitle)
 	albumSlug = strings.TrimSpace(albumSlug)
@@ -216,10 +304,10 @@ func NewStateAlbum(albumTitle, albumSlug, albumFilter string) *Album {
 		return nil
 	}
 
-	now := TimeStamp()
+	now := Now()
 
 	result := &Album{
-		AlbumOrder:  sortby.Newest,
+		AlbumOrder:  DefaultOrderState,
 		AlbumType:   AlbumState,
 		AlbumSlug:   txt.Clip(albumSlug, txt.ClipSlug),
 		AlbumFilter: albumFilter,
@@ -232,7 +320,7 @@ func NewStateAlbum(albumTitle, albumSlug, albumFilter string) *Album {
 	return result
 }
 
-// NewMonthAlbum creates a new month album.
+// NewMonthAlbum creates an automatically generated album for a specific month.
 func NewMonthAlbum(albumTitle, albumSlug string, year, month int) *Album {
 	albumTitle = strings.TrimSpace(albumTitle)
 	albumSlug = strings.TrimSpace(albumSlug)
@@ -247,10 +335,10 @@ func NewMonthAlbum(albumTitle, albumSlug string, year, month int) *Album {
 		Public: true,
 	}
 
-	now := TimeStamp()
+	now := Now()
 
 	result := &Album{
-		AlbumOrder:  sortby.Oldest,
+		AlbumOrder:  DefaultOrderMonth,
 		AlbumType:   AlbumMonth,
 		AlbumSlug:   albumSlug,
 		AlbumFilter: f.Serialize(),
@@ -265,7 +353,7 @@ func NewMonthAlbum(albumTitle, albumSlug string, year, month int) *Album {
 	return result
 }
 
-// FindMonthAlbum finds a matching month album or returns nil.
+// FindMonthAlbum returns the matching month album or nil if none exists.
 func FindMonthAlbum(year, month int) *Album {
 	m := Album{}
 
@@ -280,11 +368,11 @@ func FindMonthAlbum(year, month int) *Album {
 	return &m
 }
 
-// FindAlbumBySlug finds a matching album or returns nil.
+// FindAlbumBySlug returns the album with the given slug/type combination.
 func FindAlbumBySlug(albumSlug, albumType string) *Album {
 	m := Album{}
 
-	if albumSlug == "" {
+	if albumSlug == "" || albumSlug == UnknownSlug {
 		return nil
 	}
 
@@ -295,7 +383,7 @@ func FindAlbumBySlug(albumSlug, albumType string) *Album {
 	return &m
 }
 
-// FindAlbumByAttr finds an album by filters and slugs, or returns nil.
+// FindAlbumByAttr returns an album matching any of the provided slugs or filters.
 func FindAlbumByAttr(slugs, filters []string, albumType string) *Album {
 	m := Album{}
 
@@ -322,25 +410,78 @@ func FindAlbumByAttr(slugs, filters []string, albumType string) *Album {
 	return &m
 }
 
-// FindFolderAlbum finds a matching folder album or returns nil.
+// FindFolderAlbum looks up a folder album by its canonical path or slug.
 func FindFolderAlbum(albumPath string) *Album {
-	albumPath = strings.Trim(albumPath, string(os.PathSeparator))
-	albumSlug := txt.Slug(albumPath)
+	albumPath = clean.SlashPath(albumPath)
+	albumSlugs := folderAlbumSlugCandidates(albumPath)
 
-	if albumSlug == "" {
+	if len(albumSlugs) == 0 {
 		return nil
 	}
 
+	// Prefer an exact path match so emoji child folders do not collide with parent
+	// slugs (e.g. "ins/🍷" and "ins" both normalize to "ins").
+	if m := findFolderAlbumByPath(albumPath); m != nil {
+		return m
+	}
+
+	// Fallback for legacy rows created before album_path was persisted.
 	m := Album{}
+	stmt := UnscopedDb().Where("album_type = ? AND album_slug IN (?)", AlbumFolder, albumSlugs).
+		Where("(album_path IS NULL OR album_path = '')")
 
-	stmt := UnscopedDb().Where("album_type = ?", AlbumFolder).
-		Where("album_slug = ? OR album_path = ?", albumSlug, albumPath)
+	if stmt.First(&m).Error == nil {
+		return &m
+	}
 
-	if stmt.First(&m).Error != nil {
+	return nil
+}
+
+// findFolderAlbumByPath returns the folder album whose path matches byte-exact.
+// MariaDB's utf8mb4_unicode_ci collation gives most emoji the same weight, so the
+// "album_path = ?" query can also return a sibling folder that differs only by
+// emoji; each candidate row is therefore re-checked in Go before it is accepted.
+func findFolderAlbumByPath(albumPath string) *Album {
+	if albumPath == "" {
 		return nil
 	}
 
-	return &m
+	var matches Albums
+
+	if err := UnscopedDb().
+		Where("album_type = ? AND album_path = ?", AlbumFolder, albumPath).
+		Find(&matches).Error; err != nil {
+		return nil
+	}
+
+	for i := range matches {
+		if matches[i].AlbumPath == albumPath {
+			return &matches[i]
+		}
+	}
+
+	return nil
+}
+
+// AlbumSearch creates a new Album to be used as parameter for FindAlbum.
+func AlbumSearch(albumUid, albumTitle, albumType string) Album {
+	// Set default type.
+	if albumType == "" {
+		albumType = AlbumManual
+	}
+
+	// Set default values.
+	result := Album{
+		AlbumType: albumType,
+		AlbumUID:  albumUid,
+	}
+
+	// Set album title.
+	if albumTitle != "" {
+		result.SetTitle(albumTitle)
+	}
+
+	return result
 }
 
 // FindAlbum retrieves the matching record from the database and updates the entity.
@@ -366,19 +507,35 @@ func FindAlbum(find Album) *Album {
 	stmt := UnscopedDb().Where("album_type = ?", find.AlbumType)
 
 	// Search by slug and filter or title.
+	namedSlug := find.AlbumSlug != "" && find.AlbumSlug != UnknownSlug
+
 	if find.AlbumType != AlbumManual {
-		if find.AlbumFilter != "" {
+		switch {
+		case find.AlbumFilter != "" && namedSlug:
 			stmt = stmt.Where("album_slug = ? OR album_filter = ?", find.AlbumSlug, find.AlbumFilter)
-		} else {
+		case find.AlbumFilter != "":
+			stmt = stmt.Where("album_filter = ?", find.AlbumFilter)
+		case namedSlug:
 			stmt = stmt.Where("album_slug = ?", find.AlbumSlug)
+		default:
+			return nil
 		}
 	} else {
-		stmt = stmt.Where("album_slug = ? OR album_title LIKE ?", find.AlbumSlug, find.AlbumTitle)
+		switch {
+		case find.AlbumTitle != "" && namedSlug:
+			stmt = stmt.Where("album_slug = ? OR "+clean.SqlLikeCond(DbDialect(), false, "album_title"), find.AlbumSlug, clean.SqlLike(find.AlbumTitle))
+		case namedSlug:
+			stmt = stmt.Where("album_slug = ?", find.AlbumSlug)
+		case find.AlbumTitle != "":
+			stmt = stmt.Where(clean.SqlLikeCond(DbDialect(), false, "album_title"), clean.SqlLike(find.AlbumTitle))
+		default:
+			return nil
+		}
 	}
 
 	// Filter by creator if the album has not been published yet.
 	if find.CreatedBy != "" {
-		stmt = stmt.Where("published_at > ? OR created_by = ?", TimeStamp(), find.CreatedBy)
+		stmt = stmt.Where("published_at > ? OR created_by = ?", Now(), find.CreatedBy)
 	}
 
 	// Find first matching record.
@@ -396,6 +553,10 @@ func FindAlbum(find Album) *Album {
 
 // HasID tests if the album has a valid id and uid.
 func (m *Album) HasID() bool {
+	if m == nil {
+		return false
+	}
+
 	return m.ID > 0 && rnd.IsUID(m.AlbumUID, AlbumUID)
 }
 
@@ -405,19 +566,25 @@ func (m *Album) Find() *Album {
 }
 
 // BeforeCreate creates a random UID if needed before inserting a new row to the database.
-func (m *Album) BeforeCreate(scope *gorm.Scope) error {
+func (m *Album) BeforeCreate(tx *gorm.DB) error {
 	if rnd.IsUID(m.AlbumUID, AlbumUID) {
 		return nil
 	}
 
 	m.AlbumUID = rnd.GenerateUID(AlbumUID)
 
-	return scope.SetColumn("AlbumUID", m.AlbumUID)
+	tx.Statement.SetColumn("AlbumUID", m.AlbumUID)
+
+	return nil
 }
 
 // String returns the id or name as string.
 func (m *Album) String() string {
-	if m.AlbumSlug != "" {
+	if m == nil {
+		return "Album<nil>"
+	}
+
+	if m.AlbumSlug != "" && m.AlbumSlug != UnknownSlug {
 		return clean.Log(m.AlbumSlug)
 	}
 
@@ -429,7 +596,7 @@ func (m *Album) String() string {
 		return clean.Log(m.AlbumUID)
 	}
 
-	return "[unknown album]"
+	return "*Album"
 }
 
 // IsMoment tests if the album is of type moment.
@@ -449,7 +616,7 @@ func (m *Album) IsDefault() bool {
 
 // SetTitle changes the album name.
 func (m *Album) SetTitle(title string) *Album {
-	title = strings.Trim(title, "_&|{}<>: \n\r\t\\")
+	title = strings.Trim(clean.StripControl(title), "_&|{}<>: \n\r\t\\")
 	title = strings.ReplaceAll(title, "\"", "“")
 	title = txt.Shorten(title, txt.ClipDefault, txt.Ellipsis)
 
@@ -468,7 +635,7 @@ func (m *Album) SetTitle(title string) *Album {
 	}
 
 	if m.AlbumSlug == "" {
-		m.AlbumSlug = "-"
+		m.AlbumSlug = UnknownSlug
 	}
 
 	return m
@@ -476,7 +643,7 @@ func (m *Album) SetTitle(title string) *Album {
 
 // SetLocation sets a new album location.
 func (m *Album) SetLocation(location, state, country string) *Album {
-	if location != "" {
+	if location = clean.StripControl(location); location != "" {
 		m.AlbumLocation = txt.Shorten(location, txt.ClipDefault, txt.Ellipsis)
 	}
 
@@ -508,13 +675,11 @@ func (m *Album) UpdateTitleAndLocation(title, location, state, country, slug str
 		changed = true
 	}
 
-	if !changed && state == m.AlbumState && country == m.AlbumCountry {
+	if !changed && state == m.AlbumState && (country == m.AlbumCountry || country == "" && m.AlbumCountry == "zz") {
 		return nil
 	}
 
-	if title != "" {
-		m.SetTitle(title)
-	}
+	m.SetTitle(title)
 
 	// Skip location?
 	if location == "" && state == "" && (country == "" || country == "zz") {
@@ -575,21 +740,27 @@ func (m *Album) UpdateTitleAndState(title, slug, stateName, countryCode string) 
 		return nil
 	}
 
-	if title != "" {
-		m.SetTitle(title)
-	}
+	m.SetTitle(title)
 
 	return m.Updates(Values{"album_title": m.AlbumTitle, "album_slug": m.AlbumSlug, "album_location": m.AlbumLocation, "album_country": m.AlbumCountry, "album_state": m.AlbumState})
 }
 
 // SaveForm updates the entity using form data and stores it in the database.
-func (m *Album) SaveForm(f form.Album) error {
+func (m *Album) SaveForm(f *form.Album) error {
+	if m == nil {
+		return errors.New("album must not be nil - you may have found a bug")
+	} else if f == nil {
+		return fmt.Errorf("form is nil")
+	}
+
 	if err := deepcopier.Copy(m).From(f); err != nil {
 		return err
 	}
 
-	if f.AlbumCategory != "" {
-		m.AlbumCategory = txt.Clip(txt.Title(f.AlbumCategory), txt.ClipCategory)
+	m.normalizeText()
+
+	if m.AlbumCategory != "" {
+		m.AlbumCategory = txt.Clip(txt.Title(m.AlbumCategory), txt.ClipCategory)
 	}
 
 	if f.AlbumTitle != "" {
@@ -599,9 +770,25 @@ func (m *Album) SaveForm(f form.Album) error {
 	return m.Save()
 }
 
+// normalizeText removes control characters from the text values a form or backup file sets directly,
+// keeping line breaks in the caption, description and notes.
+func (m *Album) normalizeText() {
+	for _, s := range []*string{&m.ParentUID, &m.AlbumSlug, &m.AlbumType, &m.AlbumTitle, &m.AlbumLocation,
+		&m.AlbumCategory, &m.AlbumFilter, &m.AlbumOrder, &m.AlbumTemplate, &m.AlbumState, &m.AlbumCountry,
+		&m.Thumb, &m.ThumbSrc, &m.CreatedBy} {
+		*s = clean.StripControl(*s)
+	}
+
+	for _, s := range []*string{&m.AlbumCaption, &m.AlbumDescription, &m.AlbumNotes} {
+		*s = clean.Text(*s)
+	}
+}
+
 // Update sets a new value for a database column.
-func (m *Album) Update(attr string, value interface{}) error {
-	if !m.HasID() {
+func (m *Album) Update(attr string, value any) error {
+	if m == nil {
+		return errors.New("album must not be nil - you may have found a bug")
+	} else if !m.HasID() {
 		return fmt.Errorf("album does not exist")
 	}
 
@@ -609,58 +796,192 @@ func (m *Album) Update(attr string, value interface{}) error {
 }
 
 // Updates multiple columns in the database.
-func (m *Album) Updates(values interface{}) error {
-	if !m.HasID() {
+func (m *Album) Updates(values any) error {
+	if m == nil {
+		return errors.New("album must not be nil - you may have found a bug")
+	} else if !m.HasID() {
 		return fmt.Errorf("album does not exist")
 	}
 
 	return UnscopedDb().Model(m).Updates(values).Error
 }
 
-// UpdateFolder updates the path, filter and slug for a folder album.
-func (m *Album) UpdateFolder(albumPath, albumFilter string) error {
+// extractAlbumFilterPath extracts a normalized path value from a serialized search filter.
+func extractAlbumFilterPath(albumFilter string) string {
+	if strings.TrimSpace(albumFilter) == "" {
+		return ""
+	}
+
+	frm := form.SearchPhotos{Query: albumFilter}
+
+	if err := frm.ParseQueryString(); err != nil || frm.Path == "" {
+		return ""
+	}
+
+	return clean.SlashPath(frm.Path)
+}
+
+// shouldRepairFolderAlbumTitle reports whether a folder album title likely
+// still reflects a collision state and should be repaired.
+func shouldRepairFolderAlbumTitle(currentTitle, folderTitle, albumPath, albumFilter string) bool {
+	albumPath = clean.SlashPath(albumPath)
+	folderTitle = strings.TrimSpace(folderTitle)
+	currentTitle = strings.TrimSpace(currentTitle)
+
+	switch {
+	case folderTitle == "":
+		return false
+	case currentTitle == "":
+		return true
+	case currentTitle == folderTitle:
+		return false
+	}
+
+	parentPath := path.Dir(albumPath)
+
+	if parentPath == "" || parentPath == "." || parentPath == "/" {
+		return false
+	}
+
+	parentPath = clean.SlashPath(parentPath)
+
+	parentTitle := txt.Title(path.Base(parentPath))
+
+	if parentTitle == "" {
+		return false
+	}
+
+	if strings.EqualFold(currentTitle, parentTitle) && !strings.EqualFold(folderTitle, parentTitle) {
+		return true
+	}
+
+	filterPath := extractAlbumFilterPath(albumFilter)
+
+	if filterPath == "" || filterPath == albumPath {
+		return false
+	}
+
+	filterTitle := txt.Title(path.Base(filterPath))
+
+	if filterTitle == "" {
+		return false
+	}
+
+	return strings.EqualFold(currentTitle, filterTitle) && !strings.EqualFold(folderTitle, filterTitle)
+}
+
+// UpdateFolder updates the path, filter, slug, and repairable title for a folder album.
+func (m *Album) UpdateFolder(albumPath, albumFilter, albumTitle string) error {
 	if !m.HasID() {
 		return fmt.Errorf("album does not exist")
 	}
 
-	albumPath = strings.Trim(albumPath, string(os.PathSeparator))
-	albumSlug := txt.Slug(albumPath)
+	albumPath = ClipPath(clean.SlashPath(albumPath))
+	albumSlug := txt.SlugUnique(albumPath)
+	repairTitle := shouldRepairFolderAlbumTitle(m.AlbumTitle, albumTitle, albumPath, m.AlbumFilter)
 
 	if albumSlug == "" || albumPath == "" || albumFilter == "" || !m.HasID() {
 		return fmt.Errorf("folder album must have a path and filter")
+	} else if m.AlbumPath == albumPath && m.AlbumFilter == albumFilter && m.AlbumSlug == albumSlug && !repairTitle {
+		// Nothing changed.
+		return nil
 	}
 
-	if err := m.Updates(map[string]interface{}{
+	values := Values{
 		"AlbumPath":   albumPath,
 		"AlbumFilter": albumFilter,
 		"AlbumSlug":   albumSlug,
-	}); err != nil {
+	}
+
+	if repairTitle {
+		m.SetTitle(albumTitle)
+		values["AlbumTitle"] = m.AlbumTitle
+	}
+
+	if err := m.Updates(values); err != nil {
 		return err
-	} else if err = UnscopedDb().Exec("UPDATE albums SET album_path = NULL WHERE album_type = ? AND album_path = ? AND id <> ?", AlbumFolder, albumPath, m.ID).Error; err != nil {
+	} else if err = clearDuplicateFolderAlbumPaths(albumPath, m.ID); err != nil {
 		return err
 	}
 
 	return nil
 }
 
+// clearDuplicateFolderAlbumPaths nulls album_path on other folder albums that share
+// the exact same path so a single album owns it. The candidate query is collation-
+// fuzzy on MariaDB (see findFolderAlbumByPath), so each row is re-checked byte-exact
+// before its path is cleared to avoid wiping an emoji sibling's path.
+func clearDuplicateFolderAlbumPaths(albumPath string, keepID uint) error {
+	if albumPath == "" {
+		return nil
+	}
+
+	var matches Albums
+
+	if err := UnscopedDb().
+		Where("album_type = ? AND album_path = ? AND id <> ?", AlbumFolder, albumPath, keepID).
+		Find(&matches).Error; err != nil {
+		return err
+	}
+
+	duplicateIDs := make([]uint, 0, len(matches))
+
+	for i := range matches {
+		if matches[i].AlbumPath == albumPath {
+			duplicateIDs = append(duplicateIDs, matches[i].ID)
+		}
+	}
+
+	if len(duplicateIDs) == 0 {
+		return nil
+	}
+
+	return UnscopedDb().Exec("UPDATE albums SET album_path = NULL WHERE id IN (?)", duplicateIDs).Error
+}
+
 // Save updates the record in the database or inserts a new record if it does not already exist.
 func (m *Album) Save() error {
-	if err := Db().Save(m).Error; err != nil {
+	if err := Db().Transaction(func(tx *gorm.DB) error {
+		if err := tx.Save(m).Error; err != nil {
+			return err
+		}
+
+		return m.savePhotos(tx)
+	}); err != nil {
 		return err
 	} else {
-		event.PublishUserEntities("albums", event.EntityUpdated, []*Album{m}, m.CreatedBy)
+		event.PublishUserEntities("albums", event.EntityUpdated, []string{m.AlbumUID}, m.CreatedBy)
 		return nil
 	}
 }
 
 // Create inserts a new row to the database.
 func (m *Album) Create() error {
-	if err := Db().Create(m).Error; err != nil {
+	if err := Db().Transaction(func(tx *gorm.DB) error {
+		if err := tx.Create(m).Error; err != nil {
+			return err
+		}
+
+		return m.savePhotos(tx)
+	}); err != nil {
 		return err
 	}
 
 	m.PublishCountChange(1)
-	event.PublishUserEntities("albums", event.EntityCreated, []*Album{m}, m.CreatedBy)
+	event.PublishUserEntities("albums", event.EntityCreated, []string{m.AlbumUID}, m.CreatedBy)
+
+	return nil
+}
+
+// savePhotos saves the picture references of the album, e.g. those restored from a backup file.
+func (m *Album) savePhotos(tx *gorm.DB) error {
+	for i := range m.Photos {
+		m.Photos[i].AlbumUID = m.AlbumUID
+
+		if err := tx.Save(&m.Photos[i]).Error; err != nil {
+			return err
+		}
+	}
 
 	return nil
 }
@@ -691,8 +1012,14 @@ func (m *Album) Delete() error {
 		return nil
 	}
 
-	if err := Db().Delete(m).Error; err != nil {
+	now := Now()
+
+	if err := UnscopedDb().Model(m).UpdateColumns(Values{"updated_at": now, "deleted_at": now}).Error; err != nil {
 		return err
+	} else {
+		m.UpdatedAt = now
+		m.DeletedAt = DeletedAtTime(now)
+		FlushAlbumCache()
 	}
 
 	m.PublishCountChange(-1)
@@ -713,6 +1040,11 @@ func (m *Album) DeletePermanently() error {
 		return err
 	}
 
+	// Remove the photo links only once the album row is gone, so a failed delete keeps them.
+	if err := UnscopedDb().Where("album_uid = ?", m.AlbumUID).Delete(&PhotoAlbum{}).Error; err != nil {
+		log.Warnf("album: %s (remove photo links of %s)", clean.Error(err), clean.Log(m.AlbumUID))
+	}
+
 	if !wasDeleted {
 		m.PublishCountChange(-1)
 		event.EntitiesDeleted("albums", []string{m.AlbumUID})
@@ -723,11 +1055,11 @@ func (m *Album) DeletePermanently() error {
 
 // Deleted tests if the entity is deleted.
 func (m *Album) Deleted() bool {
-	if m.DeletedAt == nil {
+	if !m.DeletedAt.Valid {
 		return false
 	}
 
-	return !m.DeletedAt.IsZero()
+	return !m.DeletedAt.Time.IsZero()
 }
 
 // Restore restores the entity in the database.
@@ -744,10 +1076,10 @@ func (m *Album) Restore() error {
 		return err
 	}
 
-	m.DeletedAt = nil
+	m.DeletedAt = DeletedAt{}
 
 	m.PublishCountChange(1)
-	event.PublishUserEntities("albums", event.EntityCreated, []*Album{m}, m.CreatedBy)
+	event.PublishUserEntities("albums", event.EntityCreated, []string{m.AlbumUID}, m.CreatedBy)
 
 	return nil
 }
@@ -769,18 +1101,21 @@ func (m *Album) ZipName() string {
 }
 
 // AddPhotos adds photos to an existing album.
-func (m *Album) AddPhotos(UIDs []string) (added PhotoAlbums) {
+func (m *Album) AddPhotos(photos PhotosInterface) (added PhotoAlbums) {
 	if !m.HasID() {
 		return added
 	}
 
-	for _, uid := range UIDs {
-		if !rnd.IsUID(uid, PhotoUID) {
+	// Add album entries.
+	for _, photoUid := range photos.UIDs() {
+		if !rnd.IsUID(photoUid, PhotoUID) {
 			continue
 		}
 
-		entry := PhotoAlbum{AlbumUID: m.AlbumUID, PhotoUID: uid, Hidden: false}
+		// Add photo to album.
+		entry := PhotoAlbum{AlbumUID: m.AlbumUID, PhotoUID: photoUid, Hidden: false}
 
+		// Save album entry.
 		if err := entry.Save(); err != nil {
 			log.Errorf("album: %s (add to album %s)", err.Error(), m)
 		} else {
@@ -788,16 +1123,21 @@ func (m *Album) AddPhotos(UIDs []string) (added PhotoAlbums) {
 		}
 	}
 
+	// Refresh updated timestamp.
+	if err := UpdateAlbum(m.AlbumUID, Values{"updated_at": TimeStamp()}); err != nil {
+		log.Errorf("album: %s (update %s)", err.Error(), m)
+	}
+
 	return added
 }
 
 // RemovePhotos removes photos from an album.
-func (m *Album) RemovePhotos(UIDs []string) (removed PhotoAlbums) {
+func (m *Album) RemovePhotos(uids []string) (removed PhotoAlbums) {
 	if !m.HasID() {
 		return removed
 	}
 
-	for _, uid := range UIDs {
+	for _, uid := range uids {
 		if !rnd.IsUID(uid, PhotoUID) {
 			continue
 		}
@@ -809,6 +1149,11 @@ func (m *Album) RemovePhotos(UIDs []string) (removed PhotoAlbums) {
 		} else {
 			removed = append(removed, entry)
 		}
+	}
+
+	// Refresh updated timestamp.
+	if err := UpdateAlbum(m.AlbumUID, Values{"updated_at": TimeStamp()}); err != nil {
+		log.Errorf("album: %s (update %s)", err.Error(), m)
 	}
 
 	return removed

@@ -1,0 +1,301 @@
+package jwt
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	gojwt "github.com/golang-jwt/jwt/v5"
+
+	"github.com/photoprism/photoprism/pkg/rnd"
+)
+
+func TestVerifierPrimeAndVerify(t *testing.T) {
+	portalCfg := newTestConfig(t)
+	clusterUUID := rnd.UUIDv7()
+	portalCfg.Options().ClusterUUID = clusterUUID
+
+	mgr, err := NewManager(portalCfg)
+	require.NoError(t, err)
+	mgr.now = func() time.Time { return time.Date(2025, 9, 24, 10, 30, 0, 0, time.UTC) }
+	_, err = mgr.EnsureActiveKey()
+	require.NoError(t, err)
+
+	jwksBytes, err := json.Marshal(mgr.JWKS())
+	require.NoError(t, err)
+
+	etag := `"v1"`
+	var requestCount int
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestCount++
+		if r.Header.Get("If-None-Match") == etag {
+			w.WriteHeader(http.StatusNotModified)
+			return
+		}
+		w.Header().Set("ETag", etag)
+		w.Header().Set("Cache-Control", "max-age=300")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(jwksBytes)
+	}))
+	defer server.Close()
+
+	nodeCfg := newTestConfig(t)
+	nodeCfg.SetJWKSUrl(server.URL + "/.well-known/jwks.json")
+	nodeCfg.Options().ClusterUUID = clusterUUID
+	nodeUUID := nodeCfg.NodeUUID()
+
+	issuer := NewIssuer(mgr)
+	issuer.now = func() time.Time { return time.Now().UTC() }
+
+	spec := ClaimsSpec{
+		Issuer:   fmt.Sprintf("portal:%s", clusterUUID),
+		Subject:  "portal:client-test",
+		Audience: fmt.Sprintf("node:%s", nodeUUID),
+		Scope:    []string{"cluster", "vision"},
+	}
+
+	token, err := issuer.Issue(spec)
+	require.NoError(t, err)
+
+	verifier := NewVerifier(nodeCfg)
+	ctx := context.Background()
+	require.NoError(t, verifier.Prime(ctx, nodeCfg.JWKSUrl()))
+	require.Equal(t, 1, requestCount)
+
+	claims, err := verifier.VerifyToken(ctx, token, ExpectedClaims{
+		Issuer:   spec.Issuer,
+		Audience: spec.Audience,
+		Scope:    []string{"cluster"},
+		JWKSURL:  nodeCfg.JWKSUrl(),
+	})
+	require.NoError(t, err)
+	require.Equal(t, spec.Subject, claims.Subject)
+	require.Contains(t, claims.Scope, "cluster")
+
+	// Force cache refresh by expiring entry and verify 304 handling.
+	verifier.mu.Lock()
+	verifier.cache.FetchedAt -= 1000
+	verifier.mu.Unlock()
+
+	_, err = verifier.VerifyToken(ctx, token, ExpectedClaims{
+		Issuer:   spec.Issuer,
+		Audience: spec.Audience,
+		Scope:    []string{"cluster"},
+		JWKSURL:  nodeCfg.JWKSUrl(),
+	})
+	require.NoError(t, err)
+	require.Equal(t, 2, requestCount)
+
+	// Missing scope should fail.
+	_, err = verifier.VerifyToken(ctx, token, ExpectedClaims{
+		Issuer:   spec.Issuer,
+		Audience: spec.Audience,
+		Scope:    []string{"cluster", "unknown"},
+		JWKSURL:  nodeCfg.JWKSUrl(),
+	})
+	require.Error(t, err)
+}
+
+func TestVerifyTokenWithKeys(t *testing.T) {
+	portalCfg := newTestConfig(t)
+	clusterUUID := rnd.UUIDv7()
+	portalCfg.Options().ClusterUUID = clusterUUID
+
+	mgr, err := NewManager(portalCfg)
+	require.NoError(t, err)
+	mgr.now = func() time.Time { return time.Date(2025, 9, 24, 10, 30, 0, 0, time.UTC) }
+	_, err = mgr.EnsureActiveKey()
+	require.NoError(t, err)
+
+	issuer := NewIssuer(mgr)
+	issuer.now = func() time.Time { return time.Now().UTC() }
+
+	spec := ClaimsSpec{
+		Issuer:   fmt.Sprintf("portal:%s", clusterUUID),
+		Subject:  "portal:client-test",
+		Audience: "node:1234",
+		Scope:    []string{"cluster"},
+	}
+
+	token, err := issuer.Issue(spec)
+	require.NoError(t, err)
+
+	keys := mgr.JWKS().Keys
+	claims, err := VerifyTokenWithKeys(token, ExpectedClaims{
+		Issuer:   spec.Issuer,
+		Audience: spec.Audience,
+		Scope:    []string{"cluster"},
+	}, keys, 60*time.Second)
+	require.NoError(t, err)
+	require.Equal(t, spec.Subject, claims.Subject)
+
+	// Ensure scope filtering is honored when expected scope is empty.
+	claims, err = VerifyTokenWithKeys(token, ExpectedClaims{
+		Issuer:   spec.Issuer,
+		Audience: spec.Audience,
+	}, keys, 60*time.Second)
+	require.NoError(t, err)
+	require.Equal(t, spec.Subject, claims.Subject)
+
+	// Missing scope should fail when explicitly required.
+	_, err = VerifyTokenWithKeys(token, ExpectedClaims{
+		Issuer:   spec.Issuer,
+		Audience: spec.Audience,
+		Scope:    []string{"vision"},
+	}, keys, 60*time.Second)
+	require.Error(t, err)
+}
+
+func TestIssuerClampTTL(t *testing.T) {
+	portalCfg := newTestConfig(t)
+	mgr, err := NewManager(portalCfg)
+	require.NoError(t, err)
+	mgr.now = func() time.Time { return time.Unix(0, 0) }
+	_, err = mgr.EnsureActiveKey()
+	require.NoError(t, err)
+
+	issuer := NewIssuer(mgr)
+	issuer.now = func() time.Time { return time.Unix(1000, 0) }
+
+	spec := ClaimsSpec{
+		Issuer:   "portal:test",
+		Subject:  "portal:client",
+		Audience: "node:test",
+		Scope:    []string{"cluster"},
+		TTL:      7200 * time.Second,
+	}
+
+	token, err := issuer.Issue(spec)
+	require.NoError(t, err)
+
+	parsed := &Claims{}
+	parser := gojwt.NewParser(gojwt.WithValidMethods([]string{gojwt.SigningMethodEdDSA.Alg()}), gojwt.WithoutClaimsValidation())
+	_, err = parser.ParseWithClaims(token, parsed, func(token *gojwt.Token) (any, error) {
+		key, _ := mgr.ActiveKey()
+		return key.PublicKey, nil
+	})
+	require.NoError(t, err)
+	ttl := parsed.ExpiresAt.Sub(parsed.IssuedAt.Time)
+	require.Equal(t, MaxTokenTTL, ttl)
+}
+
+func TestBackoffDuration(t *testing.T) {
+	origRand := randInt63n
+	randInt63n = func(n int64) int64 {
+		if n <= 0 {
+			return 0
+		}
+		return n - 1
+	}
+	t.Cleanup(func() { randInt63n = origRand })
+
+	tests := []struct {
+		name    string
+		attempt int
+		expect  time.Duration
+	}{
+		{"Attempt1", 1, 300 * time.Millisecond},
+		{"Attempt2", 2, 600 * time.Millisecond},
+		{"Attempt3", 3, 1200 * time.Millisecond},
+		{"Attempt4", 4, 2400 * time.Millisecond},
+		{"Attempt5", 5, 3 * time.Second},
+		{"AttemptZero", 0, 300 * time.Millisecond},
+	}
+
+	for _, tt := range tests {
+		if got := backoffDuration(tt.attempt); got != tt.expect {
+			t.Errorf("%s: expected %s, got %s", tt.name, tt.expect, got)
+		}
+	}
+}
+
+func TestVerifierRejectsOversizedJWKS(t *testing.T) {
+	portalCfg := newTestConfig(t)
+	clusterUUID := rnd.UUIDv7()
+	portalCfg.Options().ClusterUUID = clusterUUID
+
+	mgr, err := NewManager(portalCfg)
+	require.NoError(t, err)
+	mgr.now = func() time.Time { return time.Date(2025, 9, 24, 10, 30, 0, 0, time.UTC) }
+	_, err = mgr.EnsureActiveKey()
+	require.NoError(t, err)
+
+	jwksBytes, err := json.Marshal(mgr.JWKS())
+	require.NoError(t, err)
+	require.Greater(t, len(jwksBytes), 2)
+
+	// Build a JSON-valid but oversized JWKS by appending a large ignored field, so
+	// a successful decode would require reading past maxJWKSResponseBytes. With the
+	// cap in place the response is truncated mid-value and the decode fails.
+	pad := strings.Repeat("a", maxJWKSResponseBytes)
+	oversized := string(jwksBytes[:len(jwksBytes)-1]) + `,"pad":"` + pad + `"}`
+	require.Greater(t, len(oversized), maxJWKSResponseBytes)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(oversized))
+	}))
+	defer server.Close()
+
+	nodeCfg := newTestConfig(t)
+	nodeCfg.SetJWKSUrl(server.URL + "/.well-known/jwks.json")
+	nodeCfg.Options().ClusterUUID = clusterUUID
+
+	verifier := NewVerifier(nodeCfg)
+	err = verifier.Prime(context.Background(), nodeCfg.JWKSUrl())
+	require.Error(t, err)
+}
+
+// TestUnverified checks which verification errors show that a token's signature could not be verified.
+func TestUnverified(t *testing.T) {
+	// Wraps the cause the way the parser does for an error returned by the key function.
+	keyFuncErr := func(cause error) error {
+		return fmt.Errorf("%w: error while executing keyfunc: %w", gojwt.ErrTokenUnverifiable, cause)
+	}
+
+	for _, tc := range []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{name: "Nil", err: nil, want: false},
+		{name: "Malformed", err: fmt.Errorf("%w: token contains an invalid number of segments", gojwt.ErrTokenMalformed), want: true},
+		{name: "SignatureInvalid", err: fmt.Errorf("%w: signature is invalid", gojwt.ErrTokenSignatureInvalid), want: true},
+		{name: "UnknownKey", err: keyFuncErr(errKeyNotFound), want: true},
+		{name: "MissingKid", err: keyFuncErr(errMissingKid), want: true},
+		{name: "CriticalHeader", err: keyFuncErr(errCriticalHeader), want: true},
+		{name: "KeysUnavailable", err: keyFuncErr(errors.New("jwt: jwks fetch failed: 503 Service Unavailable")), want: false},
+		{name: "RefreshThrottled", err: keyFuncErr(errRefreshThrottled), want: false},
+		{name: "Expired", err: fmt.Errorf("%w: token is expired", gojwt.ErrTokenExpired), want: false},
+		{name: "WrongAudience", err: fmt.Errorf("%w: token has invalid audience", gojwt.ErrTokenInvalidAudience), want: false},
+		{name: "MissingScope", err: errors.New("jwt: missing scope vision"), want: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.want, Unverified(tc.err))
+		})
+	}
+}
+
+// TestSignatureFailed checks which verification errors occur before a token's claims are checked.
+func TestSignatureFailed(t *testing.T) {
+	t.Run("Success", func(t *testing.T) {
+		assert.True(t, SignatureFailed(fmt.Errorf("%w: token contains an invalid number of segments", gojwt.ErrTokenMalformed)))
+		assert.True(t, SignatureFailed(fmt.Errorf("%w: signature is invalid", gojwt.ErrTokenSignatureInvalid)))
+		assert.True(t, SignatureFailed(fmt.Errorf("%w: error while executing keyfunc: %w", gojwt.ErrTokenUnverifiable, errRefreshThrottled)))
+	})
+	t.Run("ClaimErrors", func(t *testing.T) {
+		assert.False(t, SignatureFailed(nil))
+		assert.False(t, SignatureFailed(fmt.Errorf("%w: token has invalid issuer", gojwt.ErrTokenInvalidIssuer)))
+		assert.False(t, SignatureFailed(errors.New("jwt: missing scope vision")))
+	})
+}

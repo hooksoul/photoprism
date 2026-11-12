@@ -1,9 +1,12 @@
 package clean
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+
+	"github.com/photoprism/photoprism/pkg/txt"
 )
 
 func TestName(t *testing.T) {
@@ -28,6 +31,30 @@ func TestName(t *testing.T) {
 	t.Run("Chinese", func(t *testing.T) {
 		assert.Equal(t, "陈 赵", Name(" 陈  赵"))
 	})
+	t.Run("ControlCharacter", func(t *testing.T) {
+		assert.Equal(t, "William Henry Gates III", Name("William Henry Gates III"+string(rune(1))))
+	})
+	t.Run("Space", func(t *testing.T) {
+		assert.Equal(t, "", Name("        "))
+	})
+	t.Run("LongName", func(t *testing.T) {
+		got := Name(strings.Repeat("a", txt.ClipDefault+50))
+		assert.Equal(t, txt.ClipDefault, len(got))
+		assert.Equal(t, strings.Repeat("a", txt.ClipDefault), got)
+	})
+	t.Run("LongMultiByte", func(t *testing.T) {
+		// CJK characters are 3 bytes each in UTF-8. The output is capped
+		// by rune count (so it fits a character-counted VARCHAR(160));
+		// callers that need a byte cap must clip on their own side.
+		got := Name(strings.Repeat("陈", txt.ClipDefault+50))
+		assert.Equal(t, txt.ClipDefault, len([]rune(got)))
+		// Result is valid UTF-8 (no broken trailing rune).
+		assert.Equal(t, got, string([]rune(got)))
+	})
+	t.Run("Injection", func(t *testing.T) {
+		assert.Equal(t, "", Name("hello ${jndi:ldap://example.com/x}"))
+		assert.Equal(t, "", Name("ldap://attacker.example/"))
+	})
 }
 
 func TestNameCapitalized(t *testing.T) {
@@ -51,5 +78,35 @@ func TestNameCapitalized(t *testing.T) {
 	})
 	t.Run("Chinese", func(t *testing.T) {
 		assert.Equal(t, "陈 赵", NameCapitalized(" 陈  赵"))
+	})
+}
+
+func TestDlName(t *testing.T) {
+	t.Run("Empty", func(t *testing.T) {
+		assert.Equal(t, "", DlName(""))
+	})
+	t.Run("BillGates", func(t *testing.T) {
+		assert.Equal(t, "William Henry Gates III", DlName("William Henry Gates III"))
+	})
+	t.Run("Quotes", func(t *testing.T) {
+		assert.Equal(t, "william HenRy gates'", DlName("william \"HenRy\" gates' "))
+	})
+	t.Run("Ellipsis", func(t *testing.T) {
+		assert.Equal(t, "Test - Say goodbye to your adobe subscription 📹 We are better…", DlName("Test - Say goodbye to your adobe subscription 📹 We are better…"))
+	})
+	t.Run("SpecialCharacters", func(t *testing.T) {
+		assert.Equal(t,
+			"'', '', '~', '', '', '', '', '&', '', '+', '=', '', Foo '@', '!', '', '', '', '', '', McBar '', ''",
+			DlName("'\"', '`', '~', '\\\\', '/', '*', '%', '&', '|', '+', '=', '$', Foo '@', '!', '?', ':', ';', '<', '>', McBar '{', '}'"),
+		)
+	})
+	t.Run("Chinese", func(t *testing.T) {
+		assert.Equal(t, "陈 赵", DlName(" 陈  赵"))
+	})
+	t.Run("ControlCharacter", func(t *testing.T) {
+		assert.Equal(t, "William Henry Gates III", DlName("William Henry Gates III"+string(rune(1))))
+	})
+	t.Run("Space", func(t *testing.T) {
+		assert.Equal(t, "", DlName("        "))
 	})
 }

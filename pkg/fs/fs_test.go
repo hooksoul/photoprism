@@ -2,26 +2,91 @@ package fs
 
 import (
 	"fmt"
+	"net"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/user"
+	"path/filepath"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
+// TestMain executes runTestMain returning it's results.  It is done this way so that defer can be used to cleanup.
 func TestMain(m *testing.M) {
+	os.Exit(runTestMain(m))
+}
+
+func runTestMain(m *testing.M) int {
 	if insensitive, err := CaseInsensitive(os.TempDir()); err != nil {
 		fmt.Println(err)
 	} else if insensitive {
 		IgnoreCase()
 	}
 
-	code := m.Run()
+	return m.Run()
+}
 
-	os.Exit(code)
+// newTestServer creates an HTTP test server and registers cleanup.
+func newTestServer(t *testing.T, handler http.HandlerFunc) *httptest.Server {
+	t.Helper()
+
+	ts := httptest.NewServer(handler)
+	t.Cleanup(ts.Close)
+
+	return ts
+}
+
+// cleanupSocket registers listener/socket cleanup for socket tests.
+func cleanupSocket(t *testing.T, ln net.Listener, sock string) {
+	t.Helper()
+
+	t.Cleanup(func() {
+		assert.NoError(t, ln.Close())
+		if err := os.Remove(sock); err != nil && !os.IsNotExist(err) {
+			assert.NoError(t, err)
+		}
+	})
+}
+
+func TestExists(t *testing.T) {
+	assert.True(t, Exists("./testdata"))
+	assert.True(t, Exists("./testdata/"))
+	assert.True(t, Exists("./testdata/test.jpg"))
+	assert.True(t, Exists("./testdata/test.jpg"))
+	assert.True(t, Exists("./testdata/empty.jpg"))
+	assert.False(t, Exists("./foo.jpg"))
+	assert.False(t, Exists(""))
+}
+
+func TestIsSymlink(t *testing.T) {
+	dir := t.TempDir()
+
+	target := filepath.Join(dir, "target.jpg")
+	require.NoError(t, os.WriteFile(target, []byte("x"), ModeFile))
+
+	live := filepath.Join(dir, "live.jpg")
+	require.NoError(t, os.Symlink(target, live))
+
+	dangling := filepath.Join(dir, "dangling.jpg")
+	require.NoError(t, os.Symlink(filepath.Join(dir, "absent.jpg"), dangling))
+
+	assert.True(t, IsSymlink(live))
+	assert.True(t, IsSymlink(dangling), "a link with no target is still a link")
+	assert.False(t, IsSymlink(target))
+	assert.False(t, IsSymlink(dir))
+	assert.False(t, IsSymlink(filepath.Join(dir, "absent.jpg")))
+	assert.False(t, IsSymlink(""))
+
+	// The distinction the name exists for: a resolving check cannot see a dropped target.
+	assert.False(t, Exists(dangling), "Exists resolves the name and so misses it")
 }
 
 func TestFileExists(t *testing.T) {
+	assert.False(t, FileExists("./testdata"))
+	assert.False(t, FileExists("./testdata/"))
 	assert.True(t, FileExists("./testdata/test.jpg"))
 	assert.True(t, FileExists("./testdata/test.jpg"))
 	assert.True(t, FileExists("./testdata/empty.jpg"))
@@ -30,6 +95,8 @@ func TestFileExists(t *testing.T) {
 }
 
 func TestFileExistsNotEmpty(t *testing.T) {
+	assert.False(t, FileExistsNotEmpty("./testdata"))
+	assert.False(t, FileExistsNotEmpty("./testdata/"))
 	assert.True(t, FileExistsNotEmpty("./testdata/test.jpg"))
 	assert.True(t, FileExistsNotEmpty("./testdata/test.jpg"))
 	assert.False(t, FileExistsNotEmpty("./testdata/empty.jpg"))
@@ -37,43 +104,62 @@ func TestFileExistsNotEmpty(t *testing.T) {
 	assert.False(t, FileExistsNotEmpty(""))
 }
 
+func TestFileExistsIsEmpty(t *testing.T) {
+	assert.False(t, FileExistsIsEmpty("./testdata"))
+	assert.False(t, FileExistsIsEmpty("./testdata/"))
+	assert.False(t, FileExistsIsEmpty("./testdata/test.jpg"))
+	assert.False(t, FileExistsIsEmpty("./testdata/test.jpg"))
+	assert.True(t, FileExistsIsEmpty("./testdata/empty.jpg"))
+	assert.False(t, FileExistsIsEmpty("./foo.jpg"))
+	assert.False(t, FileExistsIsEmpty(""))
+}
+
+func TestFileSize(t *testing.T) {
+	assert.Equal(t, 10990, int(FileSize("./testdata/test.jpg")))
+	assert.Equal(t, 10990, int(FileSize("./testdata/test.jpg")))
+	assert.Equal(t, 0, int(FileSize("./testdata/empty.jpg")))
+	assert.Equal(t, -1, int(FileSize("./foo.jpg")))
+	assert.Equal(t, -1, int(FileSize("")))
+}
+
 func TestPathExists(t *testing.T) {
 	assert.True(t, PathExists("./testdata"))
 	assert.False(t, PathExists("./testdata/test.jpg"))
 	assert.False(t, PathExists("./testdata3ggdtgdg"))
+	assert.False(t, PathExists(""))
+}
+
+func TestDeviceExists(t *testing.T) {
+	assert.True(t, DeviceExists("/dev/null"))
+	DeviceExists("/dev/nvidia0")
+	assert.False(t, DeviceExists(""))
 }
 
 func TestPathWritable(t *testing.T) {
-	assert.True(t, PathExists("./testdata"))
-	assert.False(t, PathExists("./testdata/test.jpg"))
-	assert.False(t, PathExists("./testdata3ggdtgdg"))
+	assert.True(t, PathWritable("./testdata"))
+	assert.False(t, PathWritable("./testdata/test.jpg"))
+	assert.False(t, PathWritable("./testdata3ggdtgdg"))
+	assert.False(t, PathWritable(""))
 }
 
-func TestOverwrite(t *testing.T) {
-	data := make([]byte, 3)
-	data[1] = 3
-	data[2] = 8
-	tmpPath := "./testdata/_tmp"
-	os.Mkdir(tmpPath, 0777)
-
-	defer os.RemoveAll(tmpPath)
-	result := Overwrite("./testdata/_tmp/notyetexisting.jpg", data)
-	assert.FileExists(t, "./testdata/_tmp/notyetexisting.jpg")
-	assert.True(t, result)
+func TestWritable(t *testing.T) {
+	assert.True(t, Writable("./testdata"))
+	assert.False(t, Writable("./testdata3ggdtgdg"))
+	assert.False(t, Writable(""))
 }
 
 func TestExpandedFilename(t *testing.T) {
-	t.Run("test.jpg", func(t *testing.T) {
+	t.Run("TestJpg", func(t *testing.T) {
 		filename := Abs("./testdata/test.jpg")
 		assert.Contains(t, filename, "/testdata/test.jpg")
 		assert.IsType(t, "", filename)
 	})
-	t.Run("empty filename", func(t *testing.T) {
+	t.Run("EmptyFilename", func(t *testing.T) {
 		filename := Abs("")
 		assert.Equal(t, "", filename)
 		assert.IsType(t, "", filename)
 	})
-	t.Run("~ in filename", func(t *testing.T) {
+	t.Run("InFilename", func(t *testing.T) {
 		usr, _ := user.Current()
 		expected := usr.HomeDir + "/test.jpg"
 		filename := Abs("~/test.jpg")
@@ -93,10 +179,59 @@ func TestDirIsEmpty(t *testing.T) {
 		assert.Equal(t, false, DirIsEmpty("./xxx"))
 	})
 	t.Run("EmptyDir", func(t *testing.T) {
-		if err := os.Mkdir("./testdata/emptyDir", 0777); err != nil {
+		if err := os.Mkdir("./testdata/emptyDir", 0o750); err != nil {
 			t.Fatal(err)
 		}
-		defer os.RemoveAll("./testdata/emptyDir")
+		t.Cleanup(func() {
+			assert.NoError(t, os.RemoveAll("./testdata/emptyDir"))
+		})
 		assert.Equal(t, true, DirIsEmpty("./testdata/emptyDir"))
 	})
+}
+
+func TestSocketExists(t *testing.T) {
+	dir := t.TempDir()
+	sock := filepath.Join(dir, "test.sock")
+
+	ln, err := net.Listen("unix", sock)
+	if err != nil {
+		t.Skipf("unix sockets not supported: %v", err)
+	}
+	cleanupSocket(t, ln, sock)
+
+	assert.True(t, SocketExists(sock))
+	assert.False(t, SocketExists(filepath.Join(dir, "missing.sock")))
+}
+
+func TestDownload_SuccessAndErrors(t *testing.T) {
+	// Serve known content
+	tsOK := newTestServer(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("hello world"))
+	})
+
+	// Serve a failure status
+	tsFail := newTestServer(t, func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "nope", http.StatusBadRequest)
+	})
+
+	dir := t.TempDir()
+	goodPath := filepath.Join(dir, "sub", "file.txt")
+	badPath := "file.txt" // invalid path according to Download
+
+	// Success
+	err := Download(goodPath, tsOK.URL)
+	assert.NoError(t, err)
+	b, rerr := os.ReadFile(goodPath) //nolint:gosec // test helper reads temp file
+	assert.NoError(t, rerr)
+	assert.Equal(t, "hello world", string(b))
+
+	// Invalid target path
+	err = Download(badPath, tsOK.URL)
+	assert.Error(t, err)
+
+	// Server error status
+	anotherPath := filepath.Join(dir, "b", "x.txt")
+	err = Download(anotherPath, tsFail.URL)
+	assert.Error(t, err)
 }

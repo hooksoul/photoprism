@@ -1,6 +1,6 @@
 /*
 
-Copyright (c) 2018 - 2023 PhotoPrism UG. All rights reserved.
+Copyright (c) 2018 - 2026 PhotoPrism UG. All rights reserved.
 
     This program is free software: you can redistribute it and/or modify
     it under Version 3 of the GNU Affero General Public License (the "AGPL"):
@@ -13,7 +13,7 @@ Copyright (c) 2018 - 2023 PhotoPrism UG. All rights reserved.
 
     The AGPL is supplemented by our Trademark and Brand Guidelines,
     which describe how our Brand Assets may be used:
-    <https://www.photoprism.app/trademark>
+    <https://www.photoprism.app/trademark/>
 
 Feel free to send an email to hello@photoprism.app if you have questions,
 want to support our work, or just want to say hello.
@@ -24,33 +24,51 @@ Additional information can be found in our Developer Guide:
 */
 
 import Sockette from "sockette";
-import Event from "pubsub-js";
-import { config } from "app/session";
+import $event from "common/event";
+import { $config } from "app/session";
 
 const host = window.location.host;
-const prot = "https:" === document.location.protocol ? "wss://" : "ws://";
+const protocol = "https:" === document.location.protocol ? "wss://" : "ws://";
 const apiUri = window.__CONFIG__ ? window.__CONFIG__.apiUri : "/api/v1";
-const url = prot + host + apiUri + "/ws";
+const socketUrl = protocol + host + apiUri + "/ws";
 
-const Socket = new Sockette(url, {
-  timeout: 5e3,
+// Reconnect delay in milliseconds, and its maximum while the server reports too many failed authentications.
+export const reconnectTimeout = 5e3;
+export const maxReconnectTimeout = 60e3;
+
+// nextReconnectTimeout returns the reconnect delay after a server message, doubling it up to the maximum
+// while the server reports too many failed authentications and restoring the default otherwise.
+export function nextReconnectTimeout(current, event) {
+  if (event === "websocket.rate-limited") {
+    return Math.min(Math.max(current, reconnectTimeout) * 2, maxReconnectTimeout);
+  }
+
+  return reconnectTimeout;
+}
+
+// Sockette reads the timeout when it schedules a reconnect, so updating it here changes the next delay.
+const options = {
+  timeout: reconnectTimeout,
   onopen: (e) => {
     console.log("websocket: connected");
-    config.disconnected = false;
+    $config.disconnected.value = false;
     document.body.classList.remove("disconnected");
-    Event.publish("websocket.connected", e);
+    $event.publish("websocket.connected", e);
   },
   onmessage: (e) => {
     const m = JSON.parse(e.data);
-    Event.publish(m.event, m.data);
+    options.timeout = nextReconnectTimeout(options.timeout, m.event);
+    $event.publish(m.event, m.data);
   },
   onreconnect: () => console.log("websocket: reconnecting"),
   onmaximum: () => console.warn("websocket: hit max reconnect limit"),
   onclose: () => {
     console.warn("websocket: disconnected");
-    config.disconnected = true;
+    $config.disconnected.value = true;
     document.body.classList.add("disconnected");
   },
-});
+};
+
+const Socket = new Sockette(socketUrl, options);
 
 export default Socket;

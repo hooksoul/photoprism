@@ -1,16 +1,8 @@
 package fs
 
+// Required file format decoders and encoders.
 import (
-	_ "image/gif" // Import for image.
-	_ "image/jpeg"
-	_ "image/png"
-)
-
-type FileCodec string
-
-const (
-	CodecAVC  FileCodec = "avc1"
-	CodecHEVC FileCodec = "hvc1"
-	CodecAV1  FileCodec = "av01"
-	CodecJpeg FileCodec = "jpeg"
+	_ "image/gif"  // register GIF decoder
+	_ "image/jpeg" // register JPEG decoder
+	_ "image/png"  // register PNG decoder
 )

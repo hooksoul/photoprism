@@ -1,7 +1,7 @@
 /*
 Package thumb provides JPEG resampling and thumbnail generation.
 
-Copyright (c) 2018 - 2023 PhotoPrism UG. All rights reserved.
+Copyright (c) 2018 - 2026 PhotoPrism UG. All rights reserved.
 
 	This program is free software: you can redistribute it and/or modify
 	it under Version 3 of the GNU Affero General Public License (the "AGPL"):
@@ -14,7 +14,7 @@ Copyright (c) 2018 - 2023 PhotoPrism UG. All rights reserved.
 
 	The AGPL is supplemented by our Trademark and Brand Guidelines,
 	which describe how our Brand Assets may be used:
-	<https://www.photoprism.app/trademark>
+	<https://www.photoprism.app/trademark/>
 
 Feel free to send an email to hello@photoprism.app if you have questions,
 want to support our work, or just want to say hello.
@@ -26,15 +26,13 @@ package thumb
 
 import (
 	"fmt"
+	_ "image/gif"  // register GIF decoder for thumbnail generation
+	_ "image/jpeg" // register JPEG decoder for thumbnail generation
+	_ "image/png"  // register PNG decoder for thumbnail generation
 	"math"
 
-	_ "image/gif"
-	_ "image/jpeg"
-	_ "image/png"
-
-	_ "golang.org/x/image/bmp"
-	_ "golang.org/x/image/tiff"
-	_ "golang.org/x/image/webp"
+	_ "golang.org/x/image/bmp"  // register BMP decoder for thumbnail generation
+	_ "golang.org/x/image/webp" // register WEBP decoder for thumbnail generation
 
 	"github.com/photoprism/photoprism/internal/event"
 )
@@ -54,10 +52,10 @@ type Thumb struct {
 }
 
 // New creates a new photo thumbnail.
-func New(w, h int, hash string, s Size, contentUri, previewToken string) Thumb {
+func New(w, h int, hash string, s Size, contentUri, previewToken string) *Thumb {
 	if s.Width >= w && s.Height >= h {
 		// Smaller
-		return Thumb{W: w, H: h, Src: Url(hash, s.Name.String(), contentUri, previewToken)}
+		return &Thumb{W: w, H: h, Src: Url(hash, s.Name.String(), contentUri, previewToken)}
 	}
 
 	srcAspectRatio := float64(w) / float64(h)
@@ -67,11 +65,11 @@ func New(w, h int, hash string, s Size, contentUri, previewToken string) Thumb {
 
 	if srcAspectRatio > maxAspectRatio {
 		newW = s.Width
-		newH = int(math.Round(float64(newW) / srcAspectRatio))
+		newH = int(math.Ceil(float64(newW) / srcAspectRatio))
 	} else {
 		newH = s.Height
-		newW = int(math.Round(float64(newH) * srcAspectRatio))
+		newW = int(math.Ceil(float64(newH) * srcAspectRatio))
 	}
 
-	return Thumb{W: newW, H: newH, Src: Url(hash, s.Name.String(), contentUri, previewToken)}
+	return &Thumb{W: newW, H: newH, Src: Url(hash, s.Name.String(), contentUri, previewToken)}
 }

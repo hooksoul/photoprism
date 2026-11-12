@@ -8,9 +8,98 @@ import (
 	"github.com/photoprism/photoprism/pkg/txt"
 )
 
-var EmailRegexp = regexp.MustCompile("^[a-zA-Z0-9.!#$%&'*+/=?^_`{|}~-]+@[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(?:\\.[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)*$")
+// EmailRegexp validates RFC 5322-like email addresses used by the app.
+var EmailRegexp = regexp.MustCompile(`^[a-zA-Z0-9.!#$%&'*+/=?^_` +
+	"`" + `{|}~-]+@[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)*$`)
 
-// Handle returns the sanitized username with trimmed whitespace and in lowercase.
+// DomainRegexp validates hostnames for authentication inputs.
+var DomainRegexp = regexp.MustCompile(`^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9][a-z0-9-]{0,61}[a-z0-9]$`)
+
+// AuthMaxRunes is the maximum number of characters Auth keeps.
+const AuthMaxRunes = 255
+
+// AuthMaxBytes is the maximum input length of Auth in bytes; longer input returns an empty string.
+const AuthMaxBytes = 510
+
+// GroupIDMaxBytes is the maximum length of a group ID returned by GroupID in bytes.
+const GroupIDMaxBytes = AuthMaxBytes
+
+// Auth returns the sanitized authentication identifier trimmed to a maximum length of 255 characters.
+func Auth(s string) string {
+	if s == "" || len(s) > AuthMaxBytes {
+		return ""
+	}
+
+	i := 0
+
+	// Remove unwanted characters and limit string length
+	s = strings.Map(func(r rune) rune {
+		if i == 0 && r == 32 || r < 32 || r == 127 {
+			return -1
+		}
+
+		switch r {
+		case '<', '>':
+			return -1
+		}
+
+		i++
+
+		if i > AuthMaxRunes {
+			return -1
+		}
+
+		return r
+	}, s)
+
+	s = strings.TrimRight(s, " ")
+
+	return s
+}
+
+// AuthRunes returns the number of characters Auth keeps from s, without its length limits,
+// so that a result longer than AuthMaxRunes shows that Auth would cut s.
+func AuthRunes(s string) int {
+	n, trailing := 0, 0
+
+	for _, r := range s {
+		if n == 0 && r == 32 || r < 32 || r == 127 || r == '<' || r == '>' {
+			continue
+		}
+
+		n++
+
+		if r == 32 {
+			trailing++
+		} else {
+			trailing = 0
+		}
+	}
+
+	return n - trailing
+}
+
+// GroupID returns the sanitized group identifier (GUID or name) in lowercase, or an empty string
+// if it is empty or GroupIDTooLong reports it.
+func GroupID(s string) string {
+	if GroupIDTooLong(s) {
+		return ""
+	}
+
+	return strings.ToLower(Auth(s))
+}
+
+// GroupIDTooLong reports whether GroupID refuses s because Auth would cut or drop it, or because
+// its lowercase form exceeds GroupIDMaxBytes and so would not survive a second pass.
+func GroupIDTooLong(s string) bool {
+	n := AuthRunes(s)
+
+	return n > AuthMaxRunes || n > 0 && len(s) > AuthMaxBytes || len(strings.ToLower(Auth(s))) > GroupIDMaxBytes
+}
+
+// Handle returns the sanitized username with trimmed whitespace and in lowercase. It folds the
+// characters that render as a space and removes those that render as nothing, so a handle cannot
+// carry a character a reader will not see. A handle that would start with a dot is empty.
 func Handle(s string) string {
 	s, _, _ = strings.Cut(s, "@")
 
@@ -24,39 +113,55 @@ func Handle(s string) string {
 
 	// Remove unwanted characters.
 	s = strings.Map(func(r rune) rune {
-		if r <= 31 || r == 127 {
+		switch {
+		case unsafeDropRune(r):
+			return -1
+		case unsafeSpaceRune(r):
+			return '.'
+		case unsafeRune(r):
 			return -1
 		}
 		switch r {
-		case ' ', '"', '\'', '(', ')', '#', '&', '$', ',', '+', '=', '`', '~', '?', '|', '*', '/', '\\', ':', ';', '<', '>', '{', '}':
+		case ' ', '"', '\'', '(', ')', '#', '&', '$', ',', '+', '=', '`', '~', '?', '|', '*', '/', '\\', ':', ';', '<', '>', '{', '}', FieldSep:
 			return '.'
 		}
 		return r
 	}, s)
 
-	// Empty or too long?
-	if s == "" || reject(s, txt.ClipUserName) {
+	// Empty, too long, or starting with a dot?
+	if s == "" || strings.HasPrefix(s, ".") || reject(s, txt.ClipUsername) {
 		return ""
 	}
 
 	return strings.ToLower(s)
 }
 
-// Username returns the sanitized distinguished name (Username) with trimmed whitespace and in lowercase.
+// Username returns the sanitized distinguished name (Username) with trimmed whitespace and in
+// lowercase. It folds the characters that render as a space and removes those that render as
+// nothing, so a name cannot carry a character a reader will not see.
 func Username(s string) string {
 	s = strings.TrimSpace(s)
 
 	// Remove unwanted characters.
 	s = strings.Map(func(r rune) rune {
-		if r <= 31 || r == 127 {
+		switch {
+		case unsafeDropRune(r):
+			return -1
+		case unsafeSpaceRune(r):
+			return ' '
+		case unsafeRune(r):
 			return -1
 		}
 		switch r {
-		case '"', '\'', '(', ')', '#', '&', '$', ',', '+', '=', '`', '~', '?', '|', '*', '/', ':', ';', '<', '>', '{', '}':
+		case '"', '\'', '(', ')', '#', '&', '$', ',', '+', '=', '`', '~', '?', '|', '*', '/', ':', ';', '<', '>', '{', '}', FieldSep:
 			return -1
 		}
 		return r
 	}, s)
+
+	// Trimmed again, because folding a lookalike space next to a removed character puts an
+	// ordinary one at the edge, and a name that is not its own sanitized form fails validation.
+	s = strings.TrimSpace(s)
 
 	// Empty or too long?
 	if s == "" || reject(s, txt.ClipEmail) {
@@ -67,6 +172,8 @@ func Username(s string) string {
 }
 
 // Email returns the sanitized email with trimmed whitespace and in lowercase.
+// It accepts common mailbox patterns such as plus addressing and single-label domains
+// while rejecting inputs that do not match the backend validation regex.
 func Email(s string) string {
 	// Empty or too long?
 	if s == "" || reject(s, txt.ClipEmail) {
@@ -76,6 +183,22 @@ func Email(s string) string {
 	s = strings.ToLower(strings.TrimSpace(s))
 
 	if EmailRegexp.MatchString(s) {
+		return s
+	}
+
+	return ""
+}
+
+// Domain returns the normalized domain name with trimmed whitespace and in lowercase.
+func Domain(s string) string {
+	// Empty or too long?
+	if s == "" || reject(s, txt.ClipName) {
+		return ""
+	}
+
+	s = strings.ToLower(strings.TrimSpace(s))
+
+	if DomainRegexp.MatchString(s) {
 		return s
 	}
 
@@ -109,13 +232,27 @@ func Attr(s string) string {
 	return list.ParseAttr(s).String()
 }
 
-// Password returns the sanitized password string with trimmed whitespace.
+// Password returns the password string with all leading and trailing white space removed.
 func Password(s string) string {
-	s = strings.TrimSpace(s)
+	return strings.TrimSpace(s)
+}
 
-	if s == "" || reject(s, txt.ClipPassword) {
+// Passcode sanitizes a passcode and returns it in lowercase with all whitespace removed.
+func Passcode(s string) string {
+	if s == "" || reject(s, txt.ClipPasscode) {
+		return ""
+	} else if s = strings.ToLower(strings.TrimSpace(s)); s == "" {
 		return ""
 	}
+
+	// Remove unwanted characters.
+	s = strings.Map(func(r rune) rune {
+		if (r < '0' || r > '9') && (r < 'a' || r > 'z') {
+			return -1
+		}
+
+		return r
+	}, s)
 
 	return s
 }

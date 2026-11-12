@@ -3,120 +3,131 @@ import testcafeconfig from "../../testcafeconfig.json";
 import Menu from "../page-model/menu";
 import Toolbar from "../page-model/toolbar";
 import ContextMenu from "../page-model/context-menu";
+import Page from "../page-model/page";
 import Photo from "../page-model/photo";
 import PhotoEdit from "../page-model/photo-edit";
 import Album from "../page-model/album";
 import Subject from "../page-model/subject";
 import Label from "../page-model/label";
+import { helperBeforeFixture, helperBeforeEach, helperAfterEach } from "../page-model/helpers";
 
-fixture`Test photos archive and private functionalities`.page`${testcafeconfig.url}`;
+fixture`Test photos archive and private functionalities`
+.page`${testcafeconfig.url}`
+.beforeEach(async t => {
+  await helperBeforeEach(t);
+})
+.afterEach(async t => {
+  await helperAfterEach(t);
+})
+.before(async ctx => {
+  await helperBeforeFixture(ctx);
+});
 
 const menu = new Menu();
 const toolbar = new Toolbar();
 const contextmenu = new ContextMenu();
+const page = new Page();
 const photo = new Photo();
 const photoedit = new PhotoEdit();
 const album = new Album();
 const label = new Label();
 const subject = new Subject();
 
+//TODO add test for list view again as soon as we have the new menu implemented
 test.meta("testID", "photos-archive-private-001").meta({ type: "short", mode: "public" })(
-  "Common: Private/unprivate photo/video using clipboard and list",
+  "Common: Private/unprivate photo/video using clipboard",
   async (t) => {
-    await toolbar.setFilter("view", "Mosaic");
+    await toolbar.triggerToolbarAction("view-mosaic");
     const FirstPhotoUid = await photo.getNthPhotoUid("image", 0);
-    const SecondPhotoUid = await photo.getNthPhotoUid("image", 1);
+    //const SecondPhotoUid = await photo.getNthPhotoUid("image", 1);
     const ThirdPhotoUid = await photo.getNthPhotoUid("image", 2);
     const FirstVideoUid = await photo.getNthPhotoUid("video", 0);
-    const SecondVideoUid = await photo.getNthPhotoUid("video", 1);
+    //const SecondVideoUid = await photo.getNthPhotoUid("video", 1);
     const ThirdVideoUid = await photo.getNthPhotoUid("video", 2);
     await menu.openPage("private");
 
     await photo.checkPhotoVisibility(FirstPhotoUid, false);
-    await photo.checkPhotoVisibility(SecondPhotoUid, false);
+    //await photo.checkPhotoVisibility(SecondPhotoUid, false);
     await photo.checkPhotoVisibility(ThirdPhotoUid, false);
     await photo.checkPhotoVisibility(FirstVideoUid, false);
-    await photo.checkPhotoVisibility(SecondVideoUid, false);
+    //await photo.checkPhotoVisibility(SecondVideoUid, false);
     await photo.checkPhotoVisibility(ThirdVideoUid, false);
 
     await menu.openPage("browse");
     await photo.triggerHoverAction("uid", FirstPhotoUid, "select");
     await photo.triggerHoverAction("uid", FirstVideoUid, "select");
     await contextmenu.triggerContextMenuAction("private", "");
-    await toolbar.setFilter("view", "List");
+    /*await toolbar.setFilter("view", "List");
     await photo.triggerListViewActions("uid", SecondPhotoUid, "private");
-    await photo.triggerListViewActions("uid", SecondVideoUid, "private");
-    await toolbar.setFilter("view", "Cards");
-    await photo.triggerHoverAction("uid", ThirdPhotoUid, "select");
-    await photo.triggerHoverAction("uid", ThirdVideoUid, "select");
-    await contextmenu.triggerContextMenuAction("edit", "");
+    await photo.triggerListViewActions("uid", SecondVideoUid, "private");*/
+    await t.click(toolbar.cardsViewAction);
+    await page.clickCardTitleOfUID(ThirdPhotoUid);
     await photoedit.turnSwitchOn("private");
-    await t.click(photoedit.dialogNext);
+    await t.click(photoedit.dialogClose);
+    await page.clickCardTitleOfUID(ThirdVideoUid);
     await photoedit.turnSwitchOn("private");
     await t.click(photoedit.dialogClose);
     if (t.browser.platform === "mobile") {
       await t.eval(() => location.reload());
     } else {
-      await toolbar.triggerToolbarAction("reload");
+      await toolbar.triggerToolbarAction("refresh");
     }
-
     await photo.checkPhotoVisibility(FirstPhotoUid, false);
-    await photo.checkPhotoVisibility(SecondPhotoUid, false);
+    // await photo.checkPhotoVisibility(SecondPhotoUid, false);
     await photo.checkPhotoVisibility(ThirdPhotoUid, false);
     await photo.checkPhotoVisibility(FirstVideoUid, false);
-    await photo.checkPhotoVisibility(SecondVideoUid, false);
+    //await photo.checkPhotoVisibility(SecondVideoUid, false);
     await photo.checkPhotoVisibility(ThirdVideoUid, false);
 
     await menu.openPage("video");
 
     await photo.checkPhotoVisibility(FirstVideoUid, false);
-    await photo.checkPhotoVisibility(SecondVideoUid, false);
+    //await photo.checkPhotoVisibility(SecondVideoUid, false);
     await photo.checkPhotoVisibility(ThirdVideoUid, false);
 
     await menu.openPage("private");
     if (t.browser.platform === "mobile") {
       await t.eval(() => location.reload());
     } else {
-      await toolbar.triggerToolbarAction("reload");
+      await toolbar.triggerToolbarAction("refresh");
     }
     await photo.checkPhotoVisibility(FirstPhotoUid, true);
-    await photo.checkPhotoVisibility(SecondPhotoUid, true);
+    //await photo.checkPhotoVisibility(SecondPhotoUid, true);
     await photo.checkPhotoVisibility(ThirdPhotoUid, true);
     await photo.checkPhotoVisibility(FirstVideoUid, true);
-    await photo.checkPhotoVisibility(SecondVideoUid, true);
+    //await photo.checkPhotoVisibility(SecondVideoUid, true);
     await photo.checkPhotoVisibility(ThirdVideoUid, true);
 
-    await contextmenu.clearSelection();
     await photo.triggerHoverAction("uid", FirstPhotoUid, "select");
-    await photo.triggerHoverAction("uid", SecondPhotoUid, "select");
+    //await photo.triggerHoverAction("uid", SecondPhotoUid, "select");
     await photo.triggerHoverAction("uid", ThirdPhotoUid, "select");
     await photo.triggerHoverAction("uid", FirstVideoUid, "select");
-    await photo.triggerHoverAction("uid", SecondVideoUid, "select");
+    //await photo.triggerHoverAction("uid", SecondVideoUid, "select");
     await photo.triggerHoverAction("uid", ThirdVideoUid, "select");
-    await contextmenu.checkContextMenuCount("6");
+    await contextmenu.checkContextMenuCount("4");
     await contextmenu.triggerContextMenuAction("private", "");
     if (t.browser.platform === "mobile") {
       await t.eval(() => location.reload());
     } else {
-      await toolbar.triggerToolbarAction("reload");
+      await toolbar.triggerToolbarAction("refresh");
     }
     await photo.checkPhotoVisibility(FirstPhotoUid, false);
-    await photo.checkPhotoVisibility(SecondPhotoUid, false);
+    //await photo.checkPhotoVisibility(SecondPhotoUid, false);
     await photo.checkPhotoVisibility(ThirdPhotoUid, false);
     await photo.checkPhotoVisibility(FirstVideoUid, false);
-    await photo.checkPhotoVisibility(SecondVideoUid, false);
+    //await photo.checkPhotoVisibility(SecondVideoUid, false);
     await photo.checkPhotoVisibility(ThirdVideoUid, false);
 
     await menu.openPage("browse");
     await toolbar.search("photo:true");
 
     await photo.checkPhotoVisibility(FirstPhotoUid, true);
-    await photo.checkPhotoVisibility(SecondPhotoUid, true);
+    //await photo.checkPhotoVisibility(SecondPhotoUid, true);
     await photo.checkPhotoVisibility(ThirdPhotoUid, true);
     await toolbar.search("video:true");
 
     await photo.checkPhotoVisibility(FirstVideoUid, true);
-    await photo.checkPhotoVisibility(SecondVideoUid, true);
+    //await photo.checkPhotoVisibility(SecondVideoUid, true);
     await photo.checkPhotoVisibility(ThirdVideoUid, true);
   }
 );
@@ -124,7 +135,7 @@ test.meta("testID", "photos-archive-private-001").meta({ type: "short", mode: "p
 test.meta("testID", "photos-archive-private-002").meta({ type: "short", mode: "public" })(
   "Common: Archive/restore video, photos, private photos and review photos using clipboard",
   async (t) => {
-    await toolbar.setFilter("view", "Mosaic");
+    await toolbar.triggerToolbarAction("view-mosaic");
     const FirstPhotoUid = await photo.getNthPhotoUid("image", 0);
     const SecondPhotoUid = await photo.getNthPhotoUid("image", 1);
     const FirstVideoUid = await photo.getNthPhotoUid("video", 0);
@@ -148,7 +159,7 @@ test.meta("testID", "photos-archive-private-002").meta({ type: "short", mode: "p
     if (t.browser.platform === "mobile") {
       await t.eval(() => location.reload());
     } else {
-      await toolbar.triggerToolbarAction("reload");
+      await toolbar.triggerToolbarAction("refresh");
     }
 
     await photo.checkPhotoVisibility(FirstPhotoUid, false);
@@ -163,7 +174,7 @@ test.meta("testID", "photos-archive-private-002").meta({ type: "short", mode: "p
     if (t.browser.platform === "mobile") {
       await t.eval(() => location.reload());
     } else {
-      await toolbar.triggerToolbarAction("reload");
+      await toolbar.triggerToolbarAction("refresh");
     }
 
     await photo.checkPhotoVisibility(FirstReviewPhotoUid, false);
@@ -174,7 +185,7 @@ test.meta("testID", "photos-archive-private-002").meta({ type: "short", mode: "p
     if (t.browser.platform === "mobile") {
       await t.eval(() => location.reload());
     } else {
-      await toolbar.triggerToolbarAction("reload");
+      await toolbar.triggerToolbarAction("refresh");
     }
 
     await photo.checkPhotoVisibility(FirstPrivatePhotoUid, false);
@@ -196,7 +207,7 @@ test.meta("testID", "photos-archive-private-002").meta({ type: "short", mode: "p
     if (t.browser.platform === "mobile") {
       await t.eval(() => location.reload());
     } else {
-      await toolbar.triggerToolbarAction("reload");
+      await toolbar.triggerToolbarAction("refresh");
     }
 
     await photo.checkPhotoVisibility(FirstPhotoUid, false);
@@ -230,7 +241,7 @@ test.meta("testID", "photos-archive-private-003").meta({ mode: "public" })(
       console.log("Skipped on mobile");
     } else {
       await menu.openPage("archive");
-      await toolbar.setFilter("view", "Mosaic");
+      await toolbar.triggerToolbarAction("view-mosaic");
       const InitialPhotoCountInArchive = await photo.getPhotoCount("all");
       await menu.openPage("monochrome");
       const MonochromePhoto = await photo.getNthPhotoUid("all", 0);
@@ -290,9 +301,9 @@ test.meta("testID", "photos-archive-private-003").meta({ mode: "public" })(
       if (t.browser.platform === "mobile") {
         await t.eval(() => location.reload());
       } else {
-        await toolbar.triggerToolbarAction("reload");
+        await toolbar.triggerToolbarAction("refresh");
       }
-      await toolbar.setFilter("view", "Mosaic");
+      await t.click(toolbar.mosaicViewAction);
 
       const PhotoCountInArchiveAfterArchive = await photo.getPhotoCount("all");
       await t.expect(PhotoCountInArchiveAfterArchive).eql(InitialPhotoCountInArchive + 14);
@@ -330,7 +341,7 @@ test.meta("testID", "photos-archive-private-003").meta({ mode: "public" })(
       await photo.checkPhotoVisibility(FolderPhoto, false);
 
       await menu.openPage("archive");
-      await toolbar.setFilter("view", "Mosaic");
+      await t.click(toolbar.mosaicViewAction);
 
       await photo.triggerHoverAction("uid", MonochromePhoto, "select");
       await photo.triggerHoverAction("uid", PanoramaPhoto, "select");
@@ -348,7 +359,8 @@ test.meta("testID", "photos-archive-private-003").meta({ mode: "public" })(
       await photo.triggerHoverAction("uid", FolderPhoto, "select");
       await contextmenu.checkContextMenuCount("14");
       await contextmenu.triggerContextMenuAction("restore", "");
-      await toolbar.setFilter("view", "Mosaic");
+
+      await t.click(toolbar.mosaicViewAction);
 
       const PhotoCountInArchiveAfterRestore = await photo.getPhotoCount("all");
       await t.expect(PhotoCountInArchiveAfterRestore).eql(InitialPhotoCountInArchive);
@@ -365,7 +377,7 @@ test.meta("testID", "photos-archive-private-004").meta({ type: "short", mode: "p
       console.log("Skipped on mobile");
     } else {
       await menu.openPage("private");
-      await toolbar.setFilter("view", "Mosaic");
+      await toolbar.triggerToolbarAction("view-mosaic");
 
       const InitialPhotoCountInPrivate = await photo.getPhotoCount("all");
       await menu.openPage("monochrome");
@@ -428,10 +440,9 @@ test.meta("testID", "photos-archive-private-004").meta({ type: "short", mode: "p
       if (t.browser.platform === "mobile") {
         await t.eval(() => location.reload());
       } else {
-        await toolbar.triggerToolbarAction("reload");
+        await toolbar.triggerToolbarAction("refresh");
       }
-      await toolbar.setFilter("view", "Mosaic");
-
+      await t.click(toolbar.mosaicViewAction);
       const PhotoCountInPrivateAfterArchive = await photo.getPhotoCount("all");
 
       await t.expect(PhotoCountInPrivateAfterArchive).eql(InitialPhotoCountInPrivate + 14);
@@ -469,7 +480,7 @@ test.meta("testID", "photos-archive-private-004").meta({ type: "short", mode: "p
       await photo.checkPhotoVisibility(FolderPhoto, false);
 
       await menu.openPage("private");
-      await toolbar.setFilter("view", "Mosaic");
+      await t.click(toolbar.mosaicViewAction);
 
       await photo.triggerHoverAction("uid", MonochromePhoto, "select");
       await photo.triggerHoverAction("uid", PanoramaPhoto, "select");
@@ -490,9 +501,9 @@ test.meta("testID", "photos-archive-private-004").meta({ type: "short", mode: "p
       if (t.browser.platform === "mobile") {
         await t.eval(() => location.reload());
       } else {
-        await toolbar.triggerToolbarAction("reload");
+        await toolbar.triggerToolbarAction("refresh");
       }
-      await toolbar.setFilter("view", "Mosaic");
+      await toolbar.triggerToolbarAction("view-mosaic");
 
       const PhotoCountInPrivateAfterRestore = await photo.getPhotoCount("all");
 
@@ -531,5 +542,15 @@ test.meta("testID", "photos-archive-private-004").meta({ type: "short", mode: "p
       await t.navigateTo("/library/folders/aqnah1321mgkt1w2/archive");
       await photo.checkPhotoVisibility(FolderPhoto, true);
     }
+  }
+);
+
+test.meta("testID", "photos-archive-private-005").meta({ type: "short", mode: "public" })(
+  "Common: Check delete all dialog",
+  async (t) => {
+    await menu.openPage("archive");
+    await toolbar.triggerToolbarAction("delete-all");
+    await t.expect(Selector("div.text-subtitle-1").withText("Delete all?").visible).ok();
+    await t.click(Selector("button.action-cancel"));
   }
 );

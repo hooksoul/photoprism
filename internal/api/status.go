@@ -6,9 +6,14 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-// GetStatus reports if the server is operational.
+// GetStatus responds with status code 200 if the server is operational.
 //
-// GET /api/v1/status
+//	@Summary	responds with status code 200 if the server is operational
+//	@Id			GetStatus
+//	@Tags		Debug
+//	@Produce	json
+//	@Success	200	{object}	gin.H
+//	@Router		/api/v1/status [get]
 func GetStatus(router *gin.RouterGroup) {
 	router.GET("/status", func(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{"status": "operational"})

@@ -1,0 +1,169 @@
+package backup
+
+import (
+	"fmt"
+	"path/filepath"
+	"time"
+
+	"github.com/photoprism/photoprism/internal/entity"
+	"github.com/photoprism/photoprism/internal/entity/query"
+	"github.com/photoprism/photoprism/internal/event"
+	"github.com/photoprism/photoprism/internal/photoprism/get"
+	"github.com/photoprism/photoprism/pkg/clean"
+	"github.com/photoprism/photoprism/pkg/fs"
+	"github.com/photoprism/photoprism/pkg/log/status"
+)
+
+// Albums creates a YAML file backup of all albums.
+func Albums(backupPath string, force bool) (count int, err error) {
+	// Make sure only one backup/restore operation is running at a time.
+	backupAlbumsMutex.Lock()
+	defer backupAlbumsMutex.Unlock()
+
+	// Get albums from database.
+	albums, queryErr := query.Albums(0, 1000000)
+
+	if queryErr != nil {
+		return count, queryErr
+	}
+
+	c := get.Config()
+
+	if !fs.PathExists(backupPath) {
+		backupPath = c.BackupAlbumsPath()
+	}
+
+	log.Debugf("backup: album backups will be stored in %s", clean.Log(backupPath))
+	log.Infof("backup: saving album metadata in YAML backup files")
+
+	var latest time.Time
+
+	// Ignore the last modification timestamp if the force flag is set.
+	if !force {
+		latest = backupAlbumsTime
+	}
+
+	// Save albums to YAML backup files.
+	for _, a := range albums {
+		// Album modification timestamp.
+		changed := a.UpdatedAt
+
+		// Skip albums that have already been saved to YAML backup files.
+		if !force && !backupAlbumsTime.IsZero() && !changed.IsZero() && !backupAlbumsTime.Before(changed) {
+			continue
+		}
+
+		// Remember the latest modification timestamp.
+		if changed.After(latest) {
+			latest = changed
+		}
+
+		// An album whose backup file name cannot be built, e.g. of an unknown type, is skipped.
+		if _, _, nameErr := a.YamlFileName(backupPath); nameErr != nil {
+			log.Warnf("backup: skipped album %s (%s)", clean.Log(a.AlbumUID), clean.Error(nameErr))
+			continue
+		}
+
+		// Stop writing new backups if storage is over quota or critically low on free disk space.
+		// The disk-free cache rate-limits this to one actual probe per CacheTTL.
+		if c.InsufficientStorage() {
+			err = status.ErrInsufficientStorage
+			break
+		}
+
+		// Write album metadata to YAML backup file.
+		if saveErr := a.SaveBackupYaml(backupPath); saveErr != nil {
+			err = saveErr
+		} else {
+			count++
+		}
+	}
+
+	// Set backupAlbumsTime to latest modification timestamp, so that already saved albums
+	// can be skipped next time; after an error, the next run retries them.
+	if err == nil {
+		backupAlbumsTime = latest
+	}
+
+	return count, err
+}
+
+// RestoreAlbums restores all album YAML file backups.
+func RestoreAlbums(backupPath string, force bool) (count int, result error) {
+	// Make sure only one backup/restore operation is running at a time.
+	backupAlbumsMutex.Lock()
+	defer backupAlbumsMutex.Unlock()
+
+	// Recover from panics so a corrupt backup file cannot abort server startup.
+	defer func() {
+		if r := recover(); r != nil {
+			event.LogPanic(r)
+			result = fmt.Errorf("recovered from panic while restoring album backups")
+		}
+	}()
+
+	c := get.Config()
+
+	if !c.BackupAlbums() && !force {
+		log.Debugf("albums: metadata backup files are disabled")
+		return count, nil
+	}
+
+	existing, err := query.Albums(0, 1)
+
+	if err != nil {
+		return count, err
+	}
+
+	if len(existing) > 0 && !force {
+		log.Debugf("albums: skipped restoring backups because albums already exist")
+		return count, nil
+	}
+
+	// The path is resolved once, so the existence check and the file search refer to the same directory.
+	if backupPath != "" {
+		if absPath, absErr := filepath.Abs(backupPath); absErr == nil {
+			backupPath = absPath
+		}
+	}
+
+	if !fs.PathExists(backupPath) {
+		backupPath = c.BackupAlbumsPath()
+	}
+
+	albums, err := globIn(backupPath, "**/*.yml")
+
+	if oAlbums, oErr := globIn(c.OriginalsAlbumsPath(), "**/*.yml"); oErr == nil {
+		err = nil
+		albums = append(albums, oAlbums...)
+	}
+
+	if err != nil {
+		return count, err
+	}
+
+	if len(albums) == 0 {
+		return count, nil
+	}
+
+	for _, fileName := range albums {
+		a := entity.Album{}
+
+		if err = a.LoadFromYaml(fileName); err != nil {
+			log.Errorf("albums: %s in %s (restore)", err, clean.Log(filepath.Base(fileName)))
+			result = err
+		} else if !entity.IsAlbumType(a.AlbumType) {
+			log.Warnf("albums: skipped %s with unknown type (restore)", clean.Log(filepath.Base(fileName)))
+		} else if len(a.Photos) == 0 && a.AlbumFilter == "" {
+			log.Debugf("albums: skipped %s (restore)", clean.Log(filepath.Base(fileName)))
+		} else if found := a.Find(); found != nil {
+			log.Infof("%s: %s already exists (restore)", found.AlbumType, clean.Log(found.AlbumTitle))
+		} else if err = a.Create(); err != nil {
+			log.Errorf("%s: %s in %s (restore)", a.AlbumType, err, clean.Log(filepath.Base(fileName)))
+		} else {
+			count++
+		}
+	}
+
+	return count, result
+}

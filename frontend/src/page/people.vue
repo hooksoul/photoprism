@@ -1,44 +1,32 @@
 <template>
-  <div class="p-page p-page-people" :class="$config.aclClasses('people')">
-    <v-tabs
-        v-model="active"
-        flat
-        grow
-        touchless
-        color="secondary"
-        slider-color="secondary-dark"
-        :height="$vuetify.breakpoint.smAndDown ? 48 : 64"
-    >
-      <v-tab v-for="(item, index) in tabs" :id="'tab-' + item.name" :key="index" :class="item.class"
-             ripple @click.stop.prevent="changePath(item.path)">
-        <v-icon v-if="$vuetify.breakpoint.smAndDown" :title="item.label">{{ item.icon }}</v-icon>
+  <div ref="page" tabindex="-1" class="p-page p-page-people" :class="$config.aclClasses('people')">
+    <v-tabs v-model="active" elevation="0" grow bg-color="secondary" :height="$vuetify.display.smAndDown ? 48 : 64" class="bg-transparent p-page__navigation">
+      <v-tab v-for="t in tabs" :id="'tab-' + t.name" :key="t.name" :class="t.class" ripple @click.stop.prevent="changePath(t.path)">
+        <v-icon v-if="$vuetify.display.smAndDown" :title="t.label">{{ t.icon }}</v-icon>
         <template v-else>
-          <v-icon :size="18" :left="!rtl" :right="rtl">{{ item.icon }}</v-icon>
-          <v-badge color="secondary-dark" :left="rtl" :right="!rtl">
-            <template #badge>
-              <span v-if="item.count">{{ item.count }}</span>
-            </template>
-            {{ item.label }}
-          </v-badge>
+          <v-icon :size="18" start>{{ t.icon }}</v-icon>
+          {{ t.label }}
         </template>
+        <v-badge v-if="t.count" color="surface-variant" inline :content="t.count"></v-badge>
       </v-tab>
-
-      <v-tabs-items touchless>
-        <v-tab-item v-for="(item, index) in tabs" :key="index" lazy>
-          <component :is="item.component" :static-filter="item.filter" :active="active === index"
-                     @updateFaceCount="onUpdateFaceCount"></component>
-        </v-tab-item>
-      </v-tabs-items>
     </v-tabs>
+
+    <v-tabs-window v-model="active">
+      <v-tabs-window-item v-for="(t, index) in tabs" :key="t.name" eager>
+        <component :is="t.component" :static-filter="t.filter" :active="active === index" @update-face-count="onUpdateFaceCount"></component>
+      </v-tabs-window-item>
+    </v-tabs-window>
   </div>
 </template>
 
 <script>
 import Recognized from "page/people/recognized.vue";
 import NewFaces from "page/people/new.vue";
+import { markRaw } from "vue";
 
 export default {
-  name: 'PPagePeople',
+  name: "PPagePeople",
+  expose: ["onShortCut"],
   data() {
     const config = this.$config.values;
     const isDemo = this.$config.get("demo");
@@ -47,32 +35,33 @@ export default {
 
     const tabs = [
       {
-        'name': 'people',
-        'component': Recognized,
-        'filter': {files: 1, type: "person"},
-        'label': this.$gettext('Recognized'),
-        'class': '',
-        'path': '/people',
-        'icon': 'people_alt',
+        name: "people",
+        component: markRaw(Recognized),
+        filter: { files: 1, type: "person" },
+        label: this.$gettext("Recognized"),
+        class: "",
+        path: "/people",
+        icon: "mdi-account-multiple",
+        count: 0,
       },
     ];
 
     if (this.$config.allow("people", "manage")) {
       tabs.push({
-        'name': 'people_faces',
-        'component': NewFaces,
-        'filter': {markers: true, unknown: true},
-        'label': this.$gettext('New'),
-        'class': '',
-        'path': '/people/new',
-        'icon': 'person_add',
-        'count': 0,
+        name: "people_faces",
+        component: markRaw(NewFaces),
+        filter: { markers: true, unknown: true },
+        label: this.$gettext("New"),
+        class: "",
+        path: "/people/new",
+        icon: "mdi-account-plus",
+        count: 0,
       });
     }
 
     let active = 0;
 
-    if (typeof this.$route.name === 'string' && this.$route.name !== '') {
+    if (typeof this.$route.name === "string" && this.$route.name !== "") {
       active = tabs.findIndex((t) => t.name === this.$route.name);
     }
 
@@ -87,18 +76,35 @@ export default {
       config: config,
       readonly: isReadOnly,
       active: active,
-      rtl: this.$rtl,
+      rtl: this.$isRtl,
     };
   },
   watch: {
-    '$route'() {
+    $route() {
+      if (!this.$view.isActive(this)) {
+        return;
+      }
+
+      this.$view.focus(this.$refs?.page);
+
       this.openTab();
-    }
+    },
   },
-  created() {
+  mounted() {
+    this.$view.enter(this, this.$refs?.page);
     this.openTab();
   },
+  unmounted() {
+    this.$view.leave(this);
+  },
   methods: {
+    onShortCut(ev) {
+      switch (ev.code) {
+        case "KeyF":
+          this.$view.focus(this.$refs?.page, ".v-window-item--active .input-search input", true);
+          return true;
+      }
+    },
     openTab() {
       const activeTab = this.tabs.findIndex((t) => t.name === this.$route.name);
 
@@ -113,7 +119,7 @@ export default {
       if (this.$route.path !== path) {
         this.$router.replace(path);
       }
-    }
-  }
+    },
+  },
 };
 </script>

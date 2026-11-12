@@ -1,7 +1,7 @@
 /*
 Package fs provides filesystem related constants and functions.
 
-Copyright (c) 2018 - 2023 PhotoPrism UG. All rights reserved.
+Copyright (c) 2018 - 2026 PhotoPrism UG. All rights reserved.
 
 	This program is free software: you can redistribute it and/or modify
 	it under Version 3 of the GNU Affero General Public License (the "AGPL"):
@@ -14,7 +14,7 @@ Copyright (c) 2018 - 2023 PhotoPrism UG. All rights reserved.
 
 	The AGPL is supplemented by our Trademark and Brand Guidelines,
 	which describe how our Brand Assets may be used:
-	<https://www.photoprism.app/trademark>
+	<https://www.photoprism.app/trademark/>
 
 Feel free to send an email to hello@photoprism.app if you have questions,
 want to support our work, or just want to say hello.
@@ -25,45 +25,142 @@ Additional information can be found in our Developer Guide:
 package fs
 
 import (
-	"archive/zip"
 	"fmt"
 	"io"
-	"net/http"
 	"os"
 	"os/user"
 	"path/filepath"
-	"strings"
 	"syscall"
+
+	"github.com/photoprism/photoprism/pkg/http/safe"
 )
 
 var ignoreCase bool
 
-const IgnoreFile = ".ppignore"
-const HiddenPath = ".photoprism"
-const PathSeparator = string(filepath.Separator)
-const Home = "~"
-const HomePath = Home + PathSeparator
+const (
+	// PathSeparator is the filesystem path separator for the current OS.
+	PathSeparator = string(filepath.Separator)
+	// Home represents the tilde shorthand for the user's home directory.
+	Home = "~"
+	// HomePath expands Home with a trailing separator.
+	HomePath = Home + PathSeparator
+)
 
-// FileExists returns true if file exists and is not a directory.
-func FileExists(fileName string) bool {
-	if fileName == "" {
+// Stat returns the os.FileInfo for the given file path, or an error if it does not exist.
+func Stat(filePath string) (os.FileInfo, error) {
+	if filePath == "" {
+		return nil, fmt.Errorf("empty filepath")
+	}
+
+	return os.Stat(filePath)
+}
+
+// StatFile returns file info for regular files and errors on directories.
+func StatFile(filePath string) (os.FileInfo, error) {
+	info, err := Stat(filePath)
+	if err != nil {
+		return nil, err
+	}
+	if info.IsDir() {
+		return nil, fmt.Errorf("%s is a directory", filePath)
+	}
+
+	return info, nil
+}
+
+// SocketExists returns true if the specified socket exists and is not a regular file or directory.
+func SocketExists(socketName string) bool {
+	if socketName == "" {
 		return false
 	}
 
-	info, err := os.Stat(fileName)
+	// Check if path exists and is a socket.
+	if info, err := os.Stat(socketName); err != nil {
+		return false
+	} else if mode := info.Mode(); info.IsDir() || mode.IsRegular() || mode.Type() != os.ModeSocket {
+		return false
+	}
+
+	return true
+}
+
+// Exists returns true if the specified file system path exists and resolves,
+// whether it is a file, a directory, or a link to one. A link with no target
+// resolves to nothing, so use IsSymlink to test the name itself.
+func Exists(fsPath string) bool {
+	if fsPath == "" {
+		return false
+	}
+
+	_, err := os.Stat(fsPath)
+
+	return err == nil
+}
+
+// OpenNoFollow refuses an open whose final path element is a symbolic link,
+// so the call carries the rule rather than only the check before it.
+const OpenNoFollow = syscall.O_NOFOLLOW
+
+// IsSymlink returns true if a symbolic link exists under the specified name,
+// whether or not it resolves.
+func IsSymlink(fsPath string) bool {
+	if fsPath == "" {
+		return false
+	}
+
+	info, err := os.Lstat(fsPath)
+
+	return err == nil && info.Mode()&os.ModeSymlink != 0
+}
+
+// FileExists returns true if a file exists at the specified path.
+func FileExists(filePath string) bool {
+	if filePath == "" {
+		return false
+	}
+
+	info, err := os.Stat(filePath)
 
 	return err == nil && !info.IsDir()
 }
 
 // FileExistsNotEmpty returns true if file exists, is not a directory, and not empty.
-func FileExistsNotEmpty(fileName string) bool {
-	if fileName == "" {
+func FileExistsNotEmpty(filePath string) bool {
+	if filePath == "" {
 		return false
 	}
 
-	info, err := os.Stat(fileName)
+	info, err := os.Stat(filePath)
 
 	return err == nil && !info.IsDir() && info.Size() > 0
+}
+
+// FileExistsIsEmpty returns true if the file exists, but is empty.
+func FileExistsIsEmpty(filePath string) bool {
+	if filePath == "" {
+		return false
+	}
+
+	info, err := os.Stat(filePath)
+
+	return err == nil && !info.IsDir() && info.Size() == 0
+}
+
+// FileSize returns the size of a file in bytes or -1 in case of an error.
+func FileSize(filePath string) int64 {
+	if filePath == "" {
+		return -1
+	}
+
+	info, err := os.Stat(filePath)
+
+	if err != nil || info == nil {
+		return -1
+	} else if info.IsDir() {
+		return -1
+	}
+
+	return info.Size()
 }
 
 // PathExists tests if a path exists, and is a directory or symlink.
@@ -83,32 +180,41 @@ func PathExists(path string) bool {
 	return m&os.ModeDir != 0 || m&os.ModeSymlink != 0
 }
 
+// DeviceExists tests if a path exists, and is a device.
+func DeviceExists(path string) bool {
+	if path == "" {
+		return false
+	}
+
+	info, err := os.Stat(path)
+
+	if err != nil {
+		return false
+	}
+
+	m := info.Mode()
+
+	return m&os.ModeDevice != 0 || m&os.ModeCharDevice != 0
+}
+
 // Writable checks if the path is accessible for reading and writing.
 func Writable(path string) bool {
 	if path == "" {
 		return false
 	}
+
 	return syscall.Access(path, syscall.O_RDWR) == nil
 }
 
 // PathWritable tests if a path exists and is writable.
 func PathWritable(path string) bool {
-	if !PathExists(path) {
+	if path == "" {
+		return false
+	} else if !PathExists(path) {
 		return false
 	}
 
 	return Writable(path)
-}
-
-// Overwrite overwrites the file with data. Creates file if not present.
-func Overwrite(fileName string, data []byte) bool {
-	f, err := os.Create(fileName)
-	if err != nil {
-		return false
-	}
-
-	_, err = f.Write(data)
-	return err == nil
 }
 
 // Abs returns the full path of a file or directory, "~" is replaced with home.
@@ -132,100 +238,25 @@ func Abs(name string) string {
 	return result
 }
 
-// copyToFile copies the zip file to destination
-// if the zip file is a directory, a directory is created at the destination.
-func copyToFile(f *zip.File, dest string) (fileName string, err error) {
-	rc, err := f.Open()
-	if err != nil {
-		return fileName, err
-	}
-
-	defer rc.Close()
-
-	// Store filename/path for returning and using later on
-	fileName = filepath.Join(dest, f.Name)
-
-	if f.FileInfo().IsDir() {
-		// Make Folder
-		return fileName, os.MkdirAll(fileName, ModeDir)
-	}
-
-	// Make File
-	var fdir string
-
-	if lastIndex := strings.LastIndex(fileName, string(os.PathSeparator)); lastIndex > -1 {
-		fdir = fileName[:lastIndex]
-	}
-
-	err = os.MkdirAll(fdir, ModeDir)
-	if err != nil {
-		return fileName, err
-	}
-
-	fd, err := os.OpenFile(fileName, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, f.Mode())
-	if err != nil {
-		return fileName, err
-	}
-
-	defer fd.Close()
-
-	_, err = io.Copy(fd, rc)
-	if err != nil {
-		return fileName, err
-	}
-
-	return fileName, nil
-}
-
 // Download downloads a file from a URL.
-func Download(filepath string, url string) error {
-	os.MkdirAll("/tmp/photoprism", ModeDir)
-
-	// Create the file
-	out, err := os.Create(filepath)
-	if err != nil {
-		return err
-	}
-
-	defer out.Close()
-
-	// Get the data
-	resp, err := http.Get(url)
-	if err != nil {
-		return err
-	}
-
-	defer resp.Body.Close()
-
-	// Check server response
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("bad status: %s", resp.Status)
-	}
-
-	// Writer the body to file
-	_, err = io.Copy(out, resp.Body)
-	if err != nil {
-		return err
-	}
-
-	return nil
+func Download(fileName string, url string) error {
+	// Preserve existing semantics but with safer network behavior.
+	// Allow private IPs by default to avoid breaking intended internal downloads.
+	return safe.Download(fileName, url, &safe.Options{AllowPrivate: true})
 }
 
 // DirIsEmpty returns true if a directory is empty.
 func DirIsEmpty(path string) bool {
-	f, err := os.Open(path)
+	f, err := os.Open(path) //nolint:gosec // path provided by caller; intended to access filesystem
 
 	if err != nil {
 		return false
 	}
 
-	defer f.Close()
+	defer func() {
+		_ = f.Close()
+	}()
 
 	_, err = f.Readdirnames(1)
-
-	if err == io.EOF {
-		return true
-	}
-
-	return false
+	return err == io.EOF
 }

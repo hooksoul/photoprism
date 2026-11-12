@@ -25,11 +25,20 @@ func Output(f func()) string {
 		os.Stderr = stderr
 	}()
 
-	f()
-	w.Close()
-
+	// Drain the pipe while f runs, since writing more than the pipe buffer holds would
+	// otherwise block forever waiting for a reader that only starts afterwards.
 	var buf bytes.Buffer
-	io.Copy(&buf, r)
+	done := make(chan struct{})
+
+	go func() {
+		defer close(done)
+		_, _ = io.Copy(&buf, r)
+	}()
+
+	f()
+	_ = w.Close()
+	<-done
+	_ = r.Close()
 
 	return buf.String()
 }

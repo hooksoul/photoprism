@@ -2,27 +2,29 @@ package thumb
 
 import (
 	"image"
-
-	"github.com/disintegration/imaging"
 )
 
 // Resample downscales an image and returns it.
 func Resample(img image.Image, width, height int, opts ...ResampleOption) image.Image {
-	var resImg image.Image
-
 	method, filter, _ := ResampleOptions(opts...)
 
-	if method == ResampleFit {
-		resImg = imaging.Fit(img, width, height, filter)
-	} else if method == ResampleFillCenter {
-		resImg = imaging.Fill(img, width, height, imaging.Center, filter)
-	} else if method == ResampleFillTopLeft {
-		resImg = imaging.Fill(img, width, height, imaging.TopLeft, filter)
-	} else if method == ResampleFillBottomRight {
-		resImg = imaging.Fill(img, width, height, imaging.BottomRight, filter)
-	} else if method == ResampleResize {
-		resImg = imaging.Resize(img, width, height, filter)
-	}
+	return ResampleWithFilter(img, width, height, method, filter)
+}
 
-	return resImg
+// ResampleWithFilter resizes an image with an explicit method and interpolation filter.
+func ResampleWithFilter(img image.Image, width, height int, method ResampleOption, filter ResampleFilter) image.Image {
+	switch method {
+	case ResampleFit:
+		return fitImage(img, width, height, filter)
+	case ResampleFillCenter:
+		return fillImage(img, width, height, filter, cropAnchorCenter)
+	case ResampleFillTopLeft:
+		return fillImage(img, width, height, filter, cropAnchorTopLeft)
+	case ResampleFillBottomRight:
+		return fillImage(img, width, height, filter, cropAnchorBottomRight)
+	case ResampleResize:
+		return resizeImage(img, width, height, filter)
+	default:
+		return cloneImage(img)
+	}
 }

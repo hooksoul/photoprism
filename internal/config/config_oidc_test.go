@@ -1,0 +1,358 @@
+package config
+
+import (
+	"net/url"
+	"strings"
+	"testing"
+
+	"github.com/stretchr/testify/assert"
+
+	"github.com/photoprism/photoprism/internal/auth/acl"
+	"github.com/photoprism/photoprism/pkg/authn"
+)
+
+func TestConfig_OIDCEnabled(t *testing.T) {
+	t.Run("DisableForHTTP", func(t *testing.T) {
+		c := NewConfig(CliTestContext())
+		c.options.SiteUrl = "http://photos.myphotos.com"
+		assert.False(t, c.OIDCEnabled())
+	})
+	t.Run("OIDCDisabled", func(t *testing.T) {
+		c := NewConfig(CliTestContext())
+		c.options.DisableOIDC = true
+		assert.False(t, c.OIDCEnabled())
+	})
+	t.Run("InvalidOIDCUri", func(t *testing.T) {
+		c := NewConfig(CliTestContext())
+		c.options.SiteUrl = "https://photos.myphotos.com"
+		assert.True(t, c.SiteHttps())
+		c.options.OIDCUri = "http://example.com"
+		assert.False(t, c.OIDCEnabled())
+	})
+	t.Run("Enabled", func(t *testing.T) {
+		c := NewConfig(CliTestContext())
+		c.options.SiteUrl = "https://photos.myphotos.com"
+		assert.True(t, c.SiteHttps())
+		c.options.OIDCUri = "https://example.com"
+		c.options.OIDCClient = "test"
+		c.options.OIDCSecret = "test123467"
+		assert.True(t, c.OIDCEnabled())
+	})
+}
+
+func TestConfig_OIDCUri(t *testing.T) {
+	c := NewConfig(CliTestContext())
+
+	assert.IsType(t, &url.URL{}, c.OIDCUri())
+	assert.Equal(t, "", c.OIDCUri().Path)
+
+	c.options.OIDCUri = "test"
+	assert.Equal(t, "", c.OIDCUri().String())
+	assert.Equal(t, "", c.OIDCUri().Path)
+
+	c.options.OIDCUri = "http://test/"
+	assert.Equal(t, "", c.OIDCUri().String())
+	assert.Equal(t, "", c.OIDCUri().Path)
+
+	c.options.OIDCUri = "https://test/"
+	assert.Equal(t, "https://test/", c.OIDCUri().String())
+	assert.Equal(t, "/", c.OIDCUri().Path)
+
+	c.options.OIDCUri = ""
+	assert.IsType(t, &url.URL{}, c.OIDCUri())
+	assert.Equal(t, "", c.OIDCUri().String())
+}
+
+func TestConfig_OIDCClient(t *testing.T) {
+	c := NewConfig(CliTestContext())
+
+	assert.Equal(t, "", c.OIDCClient())
+}
+
+func TestConfig_SetOIDCClient(t *testing.T) {
+	c := NewConfig(CliTestContext())
+	c.SetOIDCClient("  cs5cpu17n6gj2qo5  ")
+	assert.Equal(t, "cs5cpu17n6gj2qo5", c.OIDCClient())
+	c.SetOIDCClient("")
+	assert.Equal(t, "", c.OIDCClient())
+}
+
+func TestConfig_SetOIDCSecret(t *testing.T) {
+	c := NewConfig(CliTestContext())
+	c.SetOIDCSecret("topsecret123456")
+	assert.Equal(t, "topsecret123456", c.OIDCSecret())
+	c.SetOIDCSecret("")
+	assert.Equal(t, "", c.OIDCSecret())
+}
+
+func TestConfig_SetOIDCUri(t *testing.T) {
+	c := NewConfig(CliTestContext())
+	c.SetOIDCUri("  https://app.localssl.dev/  ")
+	assert.Equal(t, "https://app.localssl.dev/", c.OIDCUri().String())
+	c.SetOIDCUri("")
+	assert.Equal(t, "", c.OIDCUri().String())
+}
+
+func TestConfig_ClusterOIDC(t *testing.T) {
+	c := NewConfig(CliTestContext())
+	assert.False(t, c.ClusterOIDC())
+	c.options.ClusterOIDC = true
+	assert.True(t, c.ClusterOIDC())
+}
+
+func TestConfig_OIDCIssuerOnSiteDomain(t *testing.T) {
+	t.Run("SharedDomainMatch", func(t *testing.T) {
+		// Instance under /i/pro-1 with the Portal OP at the shared-domain root.
+		c := NewConfig(CliTestContext())
+		c.options.SiteUrl = "https://app.localssl.dev/i/pro-1/"
+		c.options.OIDCUri = "https://app.localssl.dev/"
+		assert.True(t, c.OIDCIssuerOnSiteDomain())
+	})
+	t.Run("SubdomainIsolatedIssuerDiffers", func(t *testing.T) {
+		c := NewConfig(CliTestContext())
+		c.options.SiteUrl = "https://node1.example.com/"
+		c.options.OIDCUri = "https://portal.example.com/"
+		assert.False(t, c.OIDCIssuerOnSiteDomain())
+	})
+	t.Run("ExternalIdP", func(t *testing.T) {
+		c := NewConfig(CliTestContext())
+		c.options.SiteUrl = "https://app.localssl.dev/i/pro-1/"
+		c.options.OIDCUri = "https://keycloak.example.com/realms/main"
+		assert.False(t, c.OIDCIssuerOnSiteDomain())
+	})
+	t.Run("NoIssuer", func(t *testing.T) {
+		c := NewConfig(CliTestContext())
+		c.options.SiteUrl = "https://app.localssl.dev/i/pro-1/"
+		assert.False(t, c.OIDCIssuerOnSiteDomain())
+	})
+}
+
+func TestConfig_OIDCSecret(t *testing.T) {
+	c := NewConfig(CliTestContext())
+
+	assert.Equal(t, "", c.OIDCSecret())
+}
+
+func TestConfig_OIDCScopes(t *testing.T) {
+	c := NewConfig(CliTestContext())
+
+	assert.Equal(t, authn.OidcDefaultScopes, c.OIDCScopes())
+
+	c.options.OIDCScopes = ""
+
+	assert.Equal(t, authn.OidcDefaultScopes, c.OIDCScopes())
+}
+
+func TestConfig_OIDCProvider(t *testing.T) {
+	c := NewConfig(CliTestContext())
+
+	assert.Equal(t, "OpenID", c.OIDCProvider())
+
+	c.options.OIDCProvider = "test"
+
+	assert.Equal(t, "test", c.OIDCProvider())
+}
+
+func TestConfig_OIDCIcon(t *testing.T) {
+	c := NewConfig(CliTestContext())
+
+	assert.Equal(t, "/static/img/oidc.svg", c.OIDCIcon())
+
+	c.options.OIDCIcon = "./test.svg"
+
+	assert.Equal(t, "./test.svg", c.OIDCIcon())
+}
+
+func TestConfig_OIDCRedirect(t *testing.T) {
+	c := NewConfig(CliTestContext())
+
+	assert.False(t, c.OIDCRedirect())
+}
+
+func TestConfig_OIDCPrompt(t *testing.T) {
+	c := NewConfig(CliTestContext())
+
+	assert.Equal(t, "", c.OIDCPrompt())
+
+	c.options.OIDCPrompt = "  select_account  "
+
+	assert.Equal(t, "select_account", c.OIDCPrompt())
+}
+
+func TestConfig_OIDCUsername(t *testing.T) {
+	c := NewConfig(CliTestContext())
+
+	assert.Equal(t, authn.OidcClaimPreferredUsername, c.OIDCUsername())
+
+	c.options.OIDCUsername = "name"
+
+	assert.Equal(t, authn.OidcClaimName, c.OIDCUsername())
+
+	c.options.OIDCUsername = "nickname"
+
+	assert.Equal(t, authn.OidcClaimNickname, c.OIDCUsername())
+
+	c.options.OIDCUsername = "email"
+
+	assert.Equal(t, authn.OidcClaimEmail, c.OIDCUsername())
+
+	c.options.OIDCUsername = ""
+
+	assert.Equal(t, authn.OidcClaimPreferredUsername, c.OIDCUsername())
+}
+
+func TestConfig_OIDCGroupClaim(t *testing.T) {
+	c := NewConfig(CliTestContext())
+
+	assert.Equal(t, "groups", c.OIDCGroupClaim())
+
+	c.options.OIDCGroupClaim = " roles "
+
+	assert.Equal(t, "roles", c.OIDCGroupClaim())
+}
+
+func TestConfig_OIDCGroup(t *testing.T) {
+	c := NewConfig(CliTestContext())
+
+	assert.Nil(t, c.OIDCGroup())
+
+	c.options.OIDCGroup = []string{"ABC-123", "  DEF-456  ", "", strings.Repeat("a", 256)}
+
+	assert.Equal(t, []string{"abc-123", "def-456"}, c.OIDCGroup())
+}
+
+func TestConfig_OIDCGroupSet(t *testing.T) {
+	c := NewConfig(CliTestContext())
+
+	assert.False(t, c.OIDCGroupSet())
+
+	c.options.OIDCGroup = []string{"", " "}
+	assert.False(t, c.OIDCGroupSet())
+
+	c.options.OIDCGroup = []string{strings.Repeat("a", 256)}
+	assert.True(t, c.OIDCGroupSet())
+	assert.Empty(t, c.OIDCGroup())
+
+	c.options.OIDCGroup = []string{"Staff", strings.Repeat("a", 256)}
+	assert.Equal(t, []string{"staff"}, c.OIDCGroup())
+}
+
+func TestNormalizeGroupID(t *testing.T) {
+	assert.Equal(t, "photo admins", normalizeGroupID(" Photo Admins "))
+	assert.Equal(t, strings.Repeat("a", 255), normalizeGroupID(strings.Repeat("A", 255)))
+	assert.Equal(t, "", normalizeGroupID(strings.Repeat("a", 253)+"  users"))
+}
+
+func TestConfig_OIDCGroupRoles(t *testing.T) {
+	c := NewConfig(CliTestContext())
+
+	c.options.OIDCGroupRole = []string{
+		"ABC-123=admin",
+		"def-456:guest",
+		"invalid",
+		"=none",
+		"ghi-789=visitor",
+	}
+
+	roles := c.OIDCGroupRoles()
+
+	assert.Equal(t, acl.RoleAdmin, roles["abc-123"])
+	assert.Equal(t, acl.RoleGuest, roles["def-456"])
+	// A mapping to a non-federatable role (visitor, like cluster_admin) is
+	// dropped so a compromised IdP cannot assign it via group membership.
+	assert.NotContains(t, roles, "ghi-789")
+	assert.Len(t, roles, 2)
+
+	// A single env value with whitespace-separated pairs (StringSlice env only
+	// splits on commas) must still resolve every pair.
+	c.options.OIDCGroupRole = []string{"abc-123=admin def-456=guest"}
+	roles = c.OIDCGroupRoles()
+	assert.Equal(t, acl.RoleAdmin, roles["abc-123"])
+	assert.Equal(t, acl.RoleGuest, roles["def-456"])
+	assert.Len(t, roles, 2)
+}
+
+func TestConfig_OIDCDomain(t *testing.T) {
+	c := NewConfig(CliTestContext())
+
+	assert.Equal(t, "", c.OIDCDomain())
+
+	c.options.OIDCDomain = "example.com"
+
+	assert.Equal(t, "example.com", c.OIDCDomain())
+
+	c.options.OIDCDomain = "foo"
+
+	assert.Equal(t, "", c.OIDCDomain())
+
+	c.options.OIDCDomain = ""
+
+	assert.Equal(t, "", c.OIDCDomain())
+}
+
+func TestConfig_OIDCRegister(t *testing.T) {
+	c := NewConfig(CliTestContext())
+
+	assert.False(t, c.OIDCRegister())
+}
+
+func TestConfig_OIDCLogout(t *testing.T) {
+	c := NewConfig(CliTestContext())
+
+	assert.False(t, c.OIDCLogout())
+
+	c.options.OIDCLogout = true
+
+	assert.True(t, c.OIDCLogout())
+}
+
+func TestConfig_OIDCRole(t *testing.T) {
+	c := NewConfig(CliTestContext())
+
+	assert.Equal(t, acl.RoleGuest, c.OIDCRole())
+
+	c.options.OIDCRole = "invalid"
+
+	assert.Equal(t, acl.RoleNone, c.OIDCRole())
+
+	c.options.OIDCRole = "admin"
+
+	assert.Equal(t, acl.RoleAdmin, c.OIDCRole())
+
+	// A non-federatable default role (visitor, like cluster_admin) is ignored so
+	// new OIDC accounts are never provisioned as an operator or anonymous role.
+	c.options.OIDCRole = "visitor"
+
+	assert.Equal(t, acl.RoleNone, c.OIDCRole())
+}
+
+func TestConfig_OIDCWebDAV(t *testing.T) {
+	c := NewConfig(CliTestContext())
+
+	assert.False(t, c.OIDCWebDAV())
+}
+
+func TestConfig_DisableOIDC(t *testing.T) {
+	c := NewConfig(CliTestContext())
+
+	assert.False(t, c.DisableOIDC())
+}
+
+func TestConfig_OIDCLoginUri(t *testing.T) {
+	c := NewConfig(CliTestContext())
+
+	assert.Equal(t, "/api/v1/oidc/login", c.OIDCLoginUri())
+}
+
+func TestConfig_OIDCRedirectUri(t *testing.T) {
+	c := NewConfig(CliTestContext())
+
+	assert.Equal(t, "/api/v1/oidc/redirect", c.OIDCRedirectUri())
+}
+
+func TestConfig_OIDCReport(t *testing.T) {
+	c := NewConfig(CliTestContext())
+
+	r, _ := c.OIDCReport()
+	assert.GreaterOrEqual(t, len(r), 6)
+}
